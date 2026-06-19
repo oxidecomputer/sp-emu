@@ -457,6 +457,68 @@ pub struct Spi5 {
     last_gen: u32,
     fpga: std::collections::HashMap<u16, u8>, // FPGA user-design register file (byte-addressed)
 }
+/// Seed the FPGA ignition-controller register block so the emulated sidecar SP
+/// answers MGS `ignition`. The sidecar is the rack's ignition hub: MGS issues
+/// GET /ignition as step 1 of SP enumeration, so without a populated controller
+/// no SPs — and therefore no switches or switch-ports — are ever discovered
+/// (the symptom downstream is rack-init failing on `qsfp0 not found`).
+///
+/// Register layout (drv-sidecar-mainboard-controller / drv-ignition-api):
+///   IGNITION_CONTROLLERS_COUNT @ 0x300  u8   port count (35)
+///   IGNITION_TARGETS_PRESENT0  @ 0x301  u64  presence bitmap (LE), bit per port
+///   per-port PortState         @ 0x400 + 0x100*port  u64 (LE byte fields):
+///     [0] CONTROLLER_STATE      TARGET_PRESENT(0x01)
+///     [1] CONTROLLER_LINK_STATUS RECEIVER_ALIGNED|RECEIVER_LOCKED (0x03)
+///     [2] TARGET_SYSTEM_TYPE     RFD-141 id (gimlet 0x11, sidecar 0x12, psc 0x13, cosmo 0x04)
+///     [3] TARGET_SYSTEM_STATUS   CONTROLLER0_DETECTED(0x01)|SYSTEM_POWER_ENABLED(0x04) → On
+///     [5] TARGET_REQUEST_STATUS  0 (no power transition in progress)
+///     [6] TARGET_LINK0_STATUS / [7] TARGET_LINK1_STATUS  aligned|locked (0x03)
+///
+/// Topology is rack-specific, so it's env-configurable via SP_EMU_IGNITION as a
+/// comma-separated `port:type` list, e.g. "0:gimlet,1:sidecar,2:gimlet,3:gimlet".
+/// Listed ports read present/powered-on/link-locked; all others read absent.
+/// Default is the 3-sled a4x2 reference rack.
+fn seed_ignition(fpga: &mut std::collections::HashMap<u16, u8>) {
+    const CONTROLLERS_COUNT: u16 = 0x300;
+    const TARGETS_PRESENT0: u16 = 0x301;
+    const PORT_BASE: u16 = 0x400;
+    const PORT_STRIDE: u16 = 0x100;
+    const NUM_PORTS: u8 = 35;
+
+    let spec = std::env::var("SP_EMU_IGNITION")
+        .unwrap_or_else(|_| "0:gimlet,1:sidecar,2:gimlet,3:gimlet".to_string());
+
+    fpga.insert(CONTROLLERS_COUNT, NUM_PORTS);
+
+    let mut present: u64 = 0;
+    for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (port_s, type_s) = match entry.split_once(':') {
+            Some(x) => x,
+            None => { eprintln!("[sp-emu] SP_EMU_IGNITION: ignoring malformed entry {:?}", entry); continue; }
+        };
+        let port: u8 = match port_s.trim().parse() {
+            Ok(p) if p < NUM_PORTS => p,
+            _ => { eprintln!("[sp-emu] SP_EMU_IGNITION: ignoring out-of-range port {:?}", port_s); continue; }
+        };
+        let sys_type: u8 = match type_s.trim().to_ascii_lowercase().as_str() {
+            "gimlet" => 0x11,
+            "sidecar" => 0x12,
+            "psc" => 0x13,
+            "cosmo" => 0x04,
+            other => { eprintln!("[sp-emu] SP_EMU_IGNITION: unknown type {:?}, defaulting to gimlet", other); 0x11 }
+        };
+        present |= 1u64 << port;
+        let bytes = [0x01u8, 0x03, sys_type, 0x05, 0x00, 0x00, 0x03, 0x03];
+        let base = PORT_BASE + PORT_STRIDE * port as u16;
+        for (i, b) in bytes.iter().enumerate() {
+            fpga.insert(base + i as u16, *b);
+        }
+    }
+    for i in 0..8u16 {
+        fpga.insert(TARGETS_PRESENT0 + i, ((present >> (i * 8)) & 0xFF) as u8);
+    }
+}
+
 impl Spi5 {
     pub fn new(cs: Spi5Cs) -> Self {
         let mut fpga = std::collections::HashMap::new();
@@ -487,6 +549,7 @@ impl Spi5 {
     {
             fpga.insert(a, v);
         }
+        seed_ignition(&mut fpga);
         Spi5 { regs: std::collections::HashMap::new(), rx: Vec::new(), idx: 0, op: 0, addr: 0, dpos: 0, xfer_cnt: 0, dbg_n: 0, cs, last_gen: 0, fpga }
     }
     /// Reset per-command state on the CS deasserted→asserted edge — a command
@@ -514,11 +577,18 @@ impl Spi5 {
             1 => { self.addr = (b as u16) << 8; self.idx += 1; 0 }
             2 => { self.addr |= b as u16; self.idx += 1; 0 }
             _ => {
-                if self.op == 1 || self.op == 6 { self.next_data() } // Read
-                else { // Write/BitSet/BitClear (approx: store)
-                    let a = self.addr.wrapping_add(self.dpos as u16);
+                if self.op == 1 || self.op == 6 { self.next_data() } // Read / ReadNoAddrIncr
+                else { // Write(0) / BitSet(2) / BitClear(3) / WriteNoAddrIncr(5)
+                    let incr = self.op != 5; // only WriteNoAddrIncr holds the address
+                    let a = self.addr.wrapping_add(if incr { self.dpos } else { 0 } as u16);
                     self.dpos += 1;
-                    self.fpga.insert(a, b);
+                    let cur = *self.fpga.get(&a).unwrap_or(&0);
+                    let nv = match self.op {
+                        2 => cur | b,  // BitSet: read-modify-write OR
+                        3 => cur & !b, // BitClear: read-modify-write AND-NOT
+                        _ => b,        // Write / WriteNoAddrIncr: overwrite
+                    };
+                    self.fpga.insert(a, nv);
                     0
                 }
             }
