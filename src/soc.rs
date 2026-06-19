@@ -372,7 +372,7 @@ impl Spi2 {
         // asserting the chip-select GPIO, so CS isn't valid until data flows.
         if pos == 0 { self.target = self.cs.get(); self.dbg_txn = self.dbg_txn.wrapping_add(1); }
         let r = self.xfer_inner(b, pos);
-        if std::env::var("SP_EMU_SPIDBG").is_ok() && self.dbg_txn < 6 && pos <= 6 {
+        if crate::dbg::spi() && self.dbg_txn < 6 && pos <= 6 {
             eprintln!("[spi2x] txn={} tgt={} cs={} pos={} in={:#04x} out={:#04x} cmd={} addr={:#x}",
                 self.dbg_txn, self.target, self.cs.get(), pos, b, r, self.seq_cmd, self.seq_addr);
         }
@@ -593,7 +593,7 @@ impl Spi5 {
                 }
             }
         };
-        if std::env::var("SP_EMU_SPIDBG").is_ok() && self.dbg_n < 120 {
+        if crate::dbg::spi() && self.dbg_n < 120 {
             self.dbg_n += 1;
             eprintln!("[spi5] idx={} op={} addr={:#x} dpos={} in={:#04x} out={:#04x}",
                 self.idx, self.op, self.addr, self.dpos, b, out);
@@ -628,9 +628,9 @@ impl Mmio for Spi5 {
         match off & !3 {
             0x20 => { let rx = self.xfer(val as u8); self.rx.push(rx); } // TXDR
             0x04 => { self.xfer_cnt = 0; self.regs.insert(0x04, val); // CR2.TSIZE: new transfer → reset EOT count
-                if std::env::var("SP_EMU_SPIDBG").is_ok() && self.dbg_n < 120 { eprintln!("[spi5] CR2/TSIZE <- {:#x} (xfer_cnt reset)", val); } }
+                if crate::dbg::spi() && self.dbg_n < 120 { eprintln!("[spi5] CR2/TSIZE <- {:#x} (xfer_cnt reset)", val); } }
             o => {
-                if std::env::var("SP_EMU_SPIDBG").is_ok() && self.dbg_n < 120 && (o == 0x00) { eprintln!("[spi5] CR1 <- {:#x}", val); }
+                if crate::dbg::spi() && self.dbg_n < 120 && (o == 0x00) { eprintln!("[spi5] CR1 <- {:#x}", val); }
                 self.regs.insert(o, val);
             }
         }
@@ -874,7 +874,7 @@ impl Mmio for I2c {
         match off & !3 {
             0x18 => (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6), // ISR: TXE|TXIS|RXNE|TC
             0x24 => { // RXDR: serve the modeled device register / EEPROM byte
-                if std::env::var("SP_EMU_VPDDBG").is_ok() {
+                if crate::dbg::vpd() {
                     eprintln!("[i2c{:#x}] RD RXDR addr={:#04x} ptr={} ridx={}", self.ev_irq, self.addr, self.reg_ptr, self.read_idx);
                 }
                 // AT24CSW080 (0x50..0x53): the EEPROM folds address bits A9:A8 into
@@ -886,7 +886,7 @@ impl Mmio for I2c {
                     let off = ((self.addr as u16 & 3) << 8) | self.reg_ptr as u16;
                     let idx = (off.wrapping_add(self.read_idx) & 0x3FF) as usize;
                     let byte = self.eeprom[idx];
-                    if std::env::var("SP_EMU_VPDDBG").is_ok() {
+                    if crate::dbg::vpd() {
                         eprintln!("[vpd] rd addr={:#04x} ptr={} ridx={} off={} -> {:#04x}",
                             self.addr, self.reg_ptr, self.read_idx, idx, byte);
                     }
@@ -902,7 +902,7 @@ impl Mmio for I2c {
         }
     }
     fn write(&mut self, off: u32, val: u32) {
-        if std::env::var("SP_EMU_VPDDBG").is_ok() && self.ev_irq == 95 {
+        if crate::dbg::vpd() && self.ev_irq == 95 {
             eprintln!("[i2c4] WR off={:#05x} val={:#010x}", off & !3, val);
         }
         if off & !3 == 0x28 { // TXDR: first byte of a write phase is the register pointer
@@ -920,7 +920,7 @@ impl Mmio for I2c {
                     self.writing = true;
                     self.wrote_ptr = false;
                 }
-                if std::env::var("SP_EMU_VPDDBG").is_ok() {
+                if crate::dbg::vpd() {
                     eprintln!("[i2c{:#x}] START addr={:#04x} rd={} nbytes={}", self.ev_irq, self.addr,
                         (val >> 10) & 1, (val >> 16) & 0xFF);
                 }
@@ -1034,7 +1034,7 @@ impl Mmio for Qspi {
                     self.mode_read = false;
                     self.tcf = true;
                 }
-                if std::env::var("SP_EMU_ETHDBG").is_ok() {
+                if crate::dbg::eth() {
                     eprintln!("[qspi] CCR instr={:#04x} fmode={:#b} dlr={}", instruction, fmode, self.dlr);
                 }
             }

@@ -44,6 +44,11 @@ pub struct Bus {
     /// Set when the most recent access hit an MMIO device (for the differential
     /// harness, which can't mirror peripheral semantics). Reset by the caller.
     pub mmio_hit: bool,
+    /// Set whenever a peripheral device is accessed; lets `collect_irqs` skip the
+    /// all-device IRQ poll on the (vast majority of) instructions that touch no
+    /// device. Sound because every modeled device raises its IRQ only in response
+    /// to an MMIO access (TIM16 arming, I2C/SPI transactions) — none autonomously.
+    dev_touched: bool,
     /// When true, record every memory write (for the differential harness to
     /// replay into the reference model, incl. writes from skipped instructions).
     pub rec: bool,
@@ -107,7 +112,7 @@ impl Bus {
             .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
         Bus { rams: Vec::new(), devs: Vec::new(), unmapped_reads: 0, unmapped_writes: 0, log_unmapped: true, watch, cur_pc: 0, cur_cyc: 0, mmio_hit: false, rec: false, writes: Vec::new(),
             nvic_en: [0; 8], nvic_pend: [0; 8], nvic_prio: [0; 256], pend_pendsv: false,
-            eth: EthDma::default() }
+            dev_touched: false, eth: EthDma::default() }
     }
 
     /// Consume a pending PendSV (the deferred context-switch request).
@@ -131,7 +136,7 @@ impl Bus {
 
     fn eth_read(&mut self, off: u32) -> u32 {
         let v = self.eth_reg(off);
-        if off & !3 == DMACSR && std::env::var("SP_EMU_ETHDBG").is_ok() {
+        if off & !3 == DMACSR && crate::dbg::eth() {
             eprintln!("[eth] DMACSR read = {:#x} (net on_interrupt)", v);
         }
         match off & !3 {
@@ -168,7 +173,7 @@ impl Bus {
             let (goc, rda) = ((val >> 2) & 3, ((val >> 16) & 0x1F) as u8);
             if goc == 0b11 { // read → latch the result into MACMDIODR
                 let v = self.phy_read(self.eth.mdio_page, rda);
-                if std::env::var("SP_EMU_MDIODBG").is_ok() {
+                if crate::dbg::mdio() {
                     eprintln!("[mdio] RD page={} reg={} -> {:#06x}", self.eth.mdio_page, rda, v);
                 }
                 self.eth.regs.insert(MACMDIODR, v as u32);
@@ -176,7 +181,7 @@ impl Bus {
                 let data = self.eth_reg(MACMDIODR) as u16;
                 if rda == 31 { self.eth.mdio_page = data; } // PAGE select
                 else {
-                    if std::env::var("SP_EMU_MDIODBG").is_ok() {
+                    if crate::dbg::mdio() {
                         eprintln!("[mdio] WR page={} reg={} <- {:#06x}", self.eth.mdio_page, rda, data);
                     }
                     self.eth.regs.insert(0x1_0000 | (self.eth.mdio_page as u32) << 8 | rda as u32, data as u32);
@@ -279,7 +284,7 @@ impl Bus {
         let base = self.eth_reg(DMACRXDLAR);
         if base == 0 { return false; }
         let ring_len = (self.eth_reg(DMACRXRLR) & 0xFFFF) + 1;
-        let ring_dbg = std::env::var("SP_EMU_RXDBG").is_ok();
+        let ring_dbg = crate::dbg::rx();
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
         let rdes3 = self.read32(d + 12);
         if rdes3 & (1 << 31) == 0 { // driver still owns it → ring full (DMA can't write)
@@ -302,7 +307,7 @@ impl Bus {
             untagged = [&frame[..12], &frame[16..]].concat();
             &untagged
         } else { frame };
-        if std::env::var("SP_EMU_ETHDBG").is_ok() {
+        if crate::dbg::eth() {
             eprintln!("[eth-rx] inject {} bytes vid={:#x} cyc={} d={:#x} untagged={}",
                 data.len(), vid, self.cur_cyc, d, data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
         }
@@ -361,15 +366,21 @@ impl Bus {
 
     /// Poll every device for a raised interrupt and set it pending in the NVIC.
     pub fn collect_irqs(&mut self) {
-        let mut raised = [0u16; 8];
-        let mut n = 0;
-        for d in self.devs.iter_mut() {
-            if let Some(irq) = d.dev.take_irq() {
-                if n < raised.len() { raised[n] = irq; n += 1; }
+        // Poll devices only if one was accessed since the last collect — no modeled
+        // device raises an IRQ without an MMIO access, so this is exact, not lossy,
+        // and skips ~15-20 virtual take_irq() calls on every compute-only instruction.
+        if self.dev_touched {
+            self.dev_touched = false;
+            let mut raised = [0u16; 8];
+            let mut n = 0;
+            for d in self.devs.iter_mut() {
+                if let Some(irq) = d.dev.take_irq() {
+                    if n < raised.len() { raised[n] = irq; n += 1; }
+                }
             }
-        }
-        for &irq in &raised[..n] {
-            self.nvic_pend[(irq / 32) as usize] |= 1 << (irq % 32);
+            for &irq in &raised[..n] {
+                self.nvic_pend[(irq / 32) as usize] |= 1 << (irq % 32);
+            }
         }
         // The Ethernet DMA (modeled in the Bus) raises its IRQ on TX/RX completion.
         if self.eth.irq {
@@ -419,6 +430,7 @@ impl Bus {
             let (base, size) = (self.devs[i].base, self.devs[i].size);
             if addr >= base && addr < base.wrapping_add(size) {
                 self.mmio_hit = true;
+                self.dev_touched = true;
                 return Some((&mut self.devs[i], addr - base));
             }
         }

@@ -18,6 +18,7 @@
 
 mod bridge;
 mod cpu;
+mod dbg;
 mod flash;
 mod gdb;
 mod host;

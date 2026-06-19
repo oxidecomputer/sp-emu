@@ -247,6 +247,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, host: &mut dyn HostIo, preboot: u64) ->
     let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
     // Only pay the per-instruction disasm-formatting cost if the windowed trace is on.
     cpu.record_disasm = twin_from.is_some();
+    let preboot_start = std::time::Instant::now();
     for _ in 0..preboot {
         let pc = cpu.pc;
         if cpu.step(&mut bus, host).is_err() { break; }
@@ -260,7 +261,9 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, host: &mut dyn HostIo, preboot: u64) ->
         cpu.maybe_tick(&mut bus);
         cpu.maybe_interrupt(&mut bus);
     }
-    eprintln!("[gdb] booted to {} instructions (pc={:#010x})", cpu.cycles, cpu.pc);
+    let secs = preboot_start.elapsed().as_secs_f64();
+    eprintln!("[gdb] booted to {} instructions (pc={:#010x}) in {:.2}s = {:.1}M instr/s",
+        cpu.cycles, cpu.pc, secs, cpu.cycles as f64 / secs / 1e6);
 
     // Post-preboot: enable the WFI idle-throttle so an idle SP sleeps the host
     // instead of pegging a core (preboot ran with it off, at full spin speed).

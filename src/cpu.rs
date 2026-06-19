@@ -8,6 +8,7 @@
 
 use crate::host::HostIo;
 use crate::mem::Bus;
+use std::rc::Rc;
 use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
 use yaxpeax_arm::armv7::{
     ConditionCode, InstDecoder, Opcode, Operand, RegShiftStyle, ShiftStyle,
@@ -55,10 +56,29 @@ pub struct Cpu {
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
     pub last_disasm: String,
     decoder: InstDecoder,
+    /// PC-keyed decode cache. Hubris executes in place from immutable flash, so
+    /// the decode of an instruction at a given flash PC never changes — caching it
+    /// removes the per-instruction fetch (two RAM reads) + yaxpeax decode, the
+    /// dominant cost in the hot loop. Only flash-window PCs are cached (the running
+    /// image is never self-modified; the flash-update path writes the OTHER slot).
+    dcache: std::collections::HashMap<u32, Rc<Decoded>>,
+    syst_csr: u32, // cached SYST_CSR (refreshed periodically in maybe_tick)
+    syst_rvr: u32, // cached SYST_RVR reload value (>=1)
+}
+
+/// A cached fetch+decode for one instruction at a fixed flash PC.
+struct Decoded {
+    raw: u32,            // the 32-bit little-endian instruction word (operands re-read from this)
+    buf: [u8; 4],        // the raw bytes (for Trap reporting)
+    len: u32,            // encoded length (2 or 4)
+    inst: Option<yaxpeax_arm::armv7::Instruction>, // None => yaxpeax Err (VFP / try_vfp on raw)
 }
 
 const SP: usize = 13;
 const LR: usize = 14;
+/// Flash window (2 MB). PCs here are XIP and immutable → safe to cache decodes.
+const FLASH_LO: u32 = 0x0800_0000;
+const FLASH_HI: u32 = 0x0a00_0000;
 
 impl Cpu {
     pub fn new() -> Self {
@@ -69,6 +89,8 @@ impl Cpu {
             ipsr: 0, msp: 0, psp: 0, sp_is_psp: false, itstate: 0, s: [0; 32], fpscr: 0, cur_insn: 0,
             cycles: 0, entered_task: false, bad_ret_dumps: 0, last_vfp: false, last_it: false, last_sys: false, cur_in_it: false, cur_setflags: false, systick: 0, wfi_throttle: false, idle_skip: 0, record_disasm: false, last_disasm: String::new(),
             decoder: InstDecoder::default_thumb(),
+            dcache: std::collections::HashMap::new(),
+            syst_csr: 0, syst_rvr: 1,
         }
     }
 
@@ -130,13 +152,17 @@ impl Cpu {
         bus.cur_pc = pc; bus.cur_cyc = self.cycles;
         self.last_vfp = false;
         self.last_sys = false;
-        let mut buf = [0u8; 4];
-        buf[0..2].copy_from_slice(&bus.read16(pc).to_le_bytes());
-        buf[2..4].copy_from_slice(&bus.read16(pc.wrapping_add(2)).to_le_bytes());
-        let raw = u32::from_le_bytes(buf);
-
-        let mut reader = U8Reader::new(&buf);
-        let decoded = self.decoder.decode(&mut reader);
+        // Fetch + decode, via the PC-keyed cache for flash code (the common case).
+        let dec: Rc<Decoded> = if (FLASH_LO..FLASH_HI).contains(&pc) {
+            match self.dcache.get(&pc) {
+                Some(d) => d.clone(), // Rc bump — cheap; decouples from the &mut self execute below
+                None => { let d = Rc::new(self.fetch_decode(pc, bus)); self.dcache.insert(pc, d.clone()); d }
+            }
+        } else {
+            Rc::new(self.fetch_decode(pc, bus))
+        };
+        let raw = dec.raw;
+        let buf = dec.buf;
 
         // IT-block gating applies to BOTH normally-decoded instructions AND VFP
         // instructions (which yaxpeax can't decode, so they land in the Err
@@ -146,7 +172,7 @@ impl Cpu {
         // ran `try_vfp` unconditionally and returned early, bypassing both the
         // condition check and `it_advance`, which corrupted FP-heavy IT code
         // (thermal's sensor math → garbage memmove args → runaway copy).
-        let is_it_insn = matches!(&decoded, Ok(i) if i.opcode == Opcode::IT);
+        let is_it_insn = matches!(&dec.inst, Some(i) if i.opcode == Opcode::IT);
         let in_it = (self.itstate & 0xF) != 0;
         self.cur_in_it = in_it;
         self.last_it = in_it || is_it_insn;
@@ -158,22 +184,22 @@ impl Cpu {
         let advance_it = in_it && !is_it_insn;
 
         self.cycles += 1;
-        let res = match decoded {
-            Ok(inst) => {
-                let len = inst.len().to_const() as u32;
+        let res = match &dec.inst {
+            Some(inst) => {
+                let len = dec.len;
                 // Formatting the disassembly is a heap alloc per instruction — only
                 // do it when something actually reads last_disasm (trace/diff). In
                 // production this is the single biggest per-instruction cost removed.
                 if self.record_disasm { self.last_disasm = format!("{}", inst); }
                 self.pc = pc.wrapping_add(len);
                 if cond_ok {
-                    self.execute(&inst, pc, len, raw, bus, host)
+                    self.execute(inst, pc, len, raw, bus, host)
                         .map_err(|_| Trap::Unimplemented { pc, bytes: buf, len, disasm: format!("{}", inst) })
                 } else {
                     Ok(()) // condition false: skip the instruction
                 }
             }
-            Err(_) => {
+            None => {
                 // VFP (or genuinely unimplemented). Thumb VFP encodings are 4 bytes.
                 if cond_ok {
                     if self.try_vfp(raw, pc, bus) { Ok(()) }
@@ -188,6 +214,22 @@ impl Cpu {
         if advance_it { self.it_advance(); }
 
         res
+    }
+
+    /// Fetch the instruction at `pc` and decode it (the work the dcache memoizes).
+    fn fetch_decode(&self, pc: u32, bus: &mut Bus) -> Decoded {
+        let mut buf = [0u8; 4];
+        buf[0..2].copy_from_slice(&bus.read16(pc).to_le_bytes());
+        buf[2..4].copy_from_slice(&bus.read16(pc.wrapping_add(2)).to_le_bytes());
+        let raw = u32::from_le_bytes(buf);
+        let mut reader = U8Reader::new(&buf);
+        match self.decoder.decode(&mut reader) {
+            Ok(inst) => {
+                let len = inst.len().to_const() as u32;
+                Decoded { raw, buf, len, inst: Some(inst) }
+            }
+            Err(_) => Decoded { raw, buf, len: 4, inst: None },
+        }
     }
 
     fn execute(
@@ -796,15 +838,22 @@ impl Cpu {
     /// at the lowest priority, so it never preempts a handler). Returns whether
     /// it fired (so the caller can record the stacked frame in diff mode).
     pub fn maybe_tick(&mut self, bus: &mut Bus) {
-        let csr = bus.read32(0xE000_E010); // SYST_CSR
-        if csr & 1 == 0 { return; }        // counter disabled
-        if self.systick == 0 {
-            self.systick = bus.read32(0xE000_E014).max(1); // reload from SYST_RVR
+        // SYST_CSR (enable/tickint) and SYST_RVR (reload) are configured once at
+        // boot and ~never change, yet reading them through the full bus dispatch
+        // (RAM-region scan + device scan to reach the SCS) every instruction was a
+        // top per-instruction cost. Refresh the cached copies only periodically;
+        // a sub-256-instruction lag in noticing a CSR/RVR change is immaterial
+        // (the SysTick period is millions of instructions).
+        if self.cycles & 0xFF == 0 {
+            self.syst_csr = bus.read32(0xE000_E010);
+            self.syst_rvr = bus.read32(0xE000_E014).max(1);
         }
+        if self.syst_csr & 1 == 0 { return; } // counter disabled
+        if self.systick == 0 { self.systick = self.syst_rvr; }
         self.systick -= 1;
         if self.systick == 0 {
-            self.systick = bus.read32(0xE000_E014).max(1);
-            if csr & 2 != 0 && self.mode == Mode::Thread && !self.primask {
+            self.systick = self.syst_rvr;
+            if self.syst_csr & 2 != 0 && self.mode == Mode::Thread && !self.primask {
                 self.exception_entry(15, bus); // SysTick exception
             }
         }
@@ -821,7 +870,7 @@ impl Cpu {
             // BASEPRI masks interrupts whose priority is numerically >= basepri
             // (0 = disabled). Priorities live in the high bits of the byte.
             if self.basepri == 0 || (bus.irq_prio(irq) as u32) < self.basepri {
-                if (irq == 61 || matches!(irq, 31 | 33 | 72 | 92 | 95)) && std::env::var("SP_EMU_ETHDBG").is_ok() {
+                if (irq == 61 || matches!(irq, 31 | 33 | 72 | 92 | 95)) && crate::dbg::eth() {
                     eprintln!("[irq] delivering IRQ {} at cyc {}", irq, self.cycles);
                 }
                 bus.clear_pending(irq);
@@ -838,7 +887,7 @@ impl Cpu {
 
     fn exception_entry(&mut self, vecnum: u32, bus: &mut Bus) {
         // Catch task panics (SVC with Sysnum::Panic=8 in r11; msg ptr/len in r4/r5).
-        if vecnum == 11 && self.r[11] == 8 && std::env::var("SP_EMU_PANICDBG").is_ok() {
+        if vecnum == 11 && self.r[11] == 8 && crate::dbg::panic() {
             let (ptr, len) = (self.r[4], self.r[5].min(120));
             let mut msg = String::new();
             for i in 0..len { msg.push(bus.read8(ptr.wrapping_add(i)) as char); }
@@ -860,7 +909,7 @@ impl Cpu {
         // so we can see the bogus buffer pointer it hands the kernel. r11=sysnum;
         // for Recv the args are r4=buf r5=len r6=notif r7=sender; for Send/Reply
         // they're in r4-r7 too. Gated by SP_EMU_SVCDBG.
-        if vecnum == 11 && std::env::var("SP_EMU_SVCDBG").is_ok()
+        if vecnum == 11 && crate::dbg::svc()
             && (0x0800_8000..0x0801_8000).contains(&self.pc) {
             eprintln!("[net-svc] cyc={} sysnum={} r0={:#x} r1={:#x} r2={:#x} r3={:#x} \
                 r4={:#x} r5={:#x} r6={:#x} r7={:#x} psp={:#x} pc={:#x}",
@@ -884,7 +933,7 @@ impl Cpu {
         let frame_base = self.r[SP].wrapping_sub(4 * words);
         // Trace exceptions taken from a task's code (thread mode) so we can find
         // a return that restores a corrupt PC. Gated by $SP_EMU_EXCDBG.
-        if self.mode == Mode::Thread && fpca && std::env::var("SP_EMU_EXCDBG").is_ok() {
+        if self.mode == Mode::Thread && fpca && crate::dbg::exc() {
             eprintln!("[exc-ent] vec={} from_pc={:#010x} fpca={} it={:#04x} sp={:#010x} frame={:#010x} cyc={}",
                 vecnum, return_addr, fpca, self.itstate, self.r[SP], frame_base, self.cycles);
         }
@@ -962,7 +1011,7 @@ impl Cpu {
         self.sp_is_psp = self.mode == Mode::Thread && (self.control & 2) != 0;
         self.r[SP] = if self.sp_is_psp { self.psp } else { self.msp };
         let in_memmove = (0x0806_6c00..0x0806_6d00).contains(&self.pc);
-        if to_thread && (extended || in_memmove) && std::env::var("SP_EMU_EXCDBG").is_ok() {
+        if to_thread && (extended || in_memmove) && crate::dbg::exc() {
             eprintln!("[exc-ret]{} exc={:#x} -> pc={:#010x} extended={} base={:#010x} it={:#04x} cyc={}",
                 if in_memmove { " *MEMMOVE*" } else { "" }, exc, self.pc, extended, base, self.itstate, self.cycles);
         }
