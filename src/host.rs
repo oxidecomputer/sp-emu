@@ -1,0 +1,39 @@
+//! Host-integration boundary — the ONLY surface that touches the host OS.
+//!
+//! Phase 1 exposes just a serial/console sink. Phase 2 (networking, so a switch
+//! zone can talk to the emulated SP) adds a tap method here. Keeping the core
+//! behind this trait is precisely what lets the emulator develop on macOS today
+//! and later drop onto illumos/Helios by swapping only this shim — nothing in
+//! the CPU or SoC ever learns which OS it runs on.
+
+pub trait HostIo {
+    /// Emit one byte from an emulated UART / semihosting console.
+    fn serial_out(&mut self, byte: u8);
+
+    /// An Ethernet frame the emulated SP just transmitted (full L2 frame, no FCS).
+    /// The default drops it; the network bridge forwards it to the host.
+    fn eth_tx(&mut self, _frame: &[u8]) {}
+
+    /// Poll for an Ethernet frame to deliver to the SP, if the bridge has one.
+    fn eth_rx(&mut self) -> Option<Vec<u8>> { None }
+}
+
+/// Default host: forward emulated console bytes to our stdout. Ethernet frames
+/// are dropped unless `$SP_EMU_ETHDBG` is set, in which case TX frames are logged.
+pub struct StdoutHost;
+
+impl HostIo for StdoutHost {
+    fn serial_out(&mut self, byte: u8) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&[byte]);
+        let _ = out.flush();
+    }
+
+    fn eth_tx(&mut self, frame: &[u8]) {
+        if std::env::var("SP_EMU_ETHDBG").is_ok() {
+            eprintln!("[eth-tx] {} bytes: {}", frame.len(),
+                frame.iter().take(48).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""));
+        }
+    }
+}

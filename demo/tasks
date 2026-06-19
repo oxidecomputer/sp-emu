@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Show the LIVE Hubris task table on the emulated SP, via humility over the
+# emulator's OpenOCD transport. This is the "it's really running firmware"
+# money shot: 30+ real gimlet tasks with live states.
+#
+#   ./tasks              # the task table
+#   ./tasks -sl net      # stack-backtrace a task
+#
+# (Run this when the SP is idle — i.e. not mid-MGS-command — since humility
+# halts the CPU to read memory.)
+set -euo pipefail
+ARCHIVE="${ARCHIVE:-$HOME/oxide/hubris/target/gimlet-c/dist/default/build-gimlet-c-image-default.zip}"
+exec humility -a "$ARCHIVE" -p ocd tasks "$@"
