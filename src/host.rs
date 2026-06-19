@@ -14,7 +14,14 @@ pub trait HostIo {
     /// The default drops it; the network bridge forwards it to the host.
     fn eth_tx(&mut self, _frame: &[u8]) {}
 
-    /// Poll for an Ethernet frame to deliver to the SP, if the bridge has one.
+    /// Drain the host network into the bridge's inbound queue (once per pump).
+    /// Separated from `eth_rx` so the pump can poll once, then deliver only as
+    /// many frames as the SP's RX ring has room for — without popping (and thus
+    /// losing) a frame the ring can't yet accept. The default does nothing.
+    fn eth_poll(&mut self) {}
+
+    /// Pop one already-queued Ethernet frame for the SP, if any. Does NOT poll
+    /// the host (call `eth_poll` first). The default has none.
     fn eth_rx(&mut self) -> Option<Vec<u8>> { None }
 }
 

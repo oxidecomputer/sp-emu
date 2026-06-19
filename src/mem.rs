@@ -249,9 +249,28 @@ impl Bus {
     /// periodically from the run/gdb loops.
     pub fn pump_eth(&mut self, host: &mut dyn crate::host::HostIo) {
         for f in self.eth_take_tx() { host.eth_tx(&f); }
-        while let Some(f) = host.eth_rx() {
-            if !self.eth_rx_inject(&f) { break; } // RX ring full — drop the rest
+        // Drain the host network into the bridge once, then deliver only as many
+        // frames as the RX ring can accept right now. Checking ring space BEFORE
+        // popping means a frame is never lost to a full ring — it stays queued in
+        // the bridge (governed solely by the bridge's flow-fair backlog cap) and
+        // is delivered on a later pump once the SP frees a descriptor.
+        host.eth_poll();
+        while self.eth_rx_has_space() {
+            match host.eth_rx() {
+                Some(f) => { self.eth_rx_inject(&f); }
+                None => break,
+            }
         }
+    }
+
+    /// True if the next RX descriptor is owned by the DMA (free for the engine to
+    /// write) — i.e. the ring can accept one more frame. Mirrors the OWN-bit check
+    /// in `eth_rx_inject` so the pump can gate delivery without popping a frame.
+    fn eth_rx_has_space(&mut self) -> bool {
+        let base = self.eth_reg(DMACRXDLAR);
+        if base == 0 { return false; }
+        let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
+        self.read32(d + 12) & (1 << 31) != 0 // RDES3.OWN set → DMA owns it → free
     }
 
     /// Inject a received frame into the next free RX descriptor and raise the

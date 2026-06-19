@@ -55,7 +55,11 @@ pub struct Bridge {
     sp_by_vid: std::collections::HashMap<u16, ([u8; 6], [u8; 16])>,
     /// Last MGS host endpoint heard per VLAN (where that view's SP replies go).
     peer_by_vid: std::collections::HashMap<u16, SocketAddr>,
-    rx: VecDeque<Vec<u8>>,
+    /// Frames queued for the SP, each tagged with its MGS-client flow key (the
+    /// client's UDP source port; 0 = bridge-generated control frame). The tag
+    /// drives flow-fair eviction in `push_rx` so the rare request flows survive
+    /// the sensor-poll flood.
+    rx: VecDeque<(u16, Vec<u8>)>,
 }
 
 impl Bridge {
@@ -147,11 +151,11 @@ impl Bridge {
                 // Pre-warm this VLAN's neighbor cache for us so the SP's first
                 // reply isn't dropped pending NDP resolution: unsolicited NA.
                 let na = self.build_neighbor_advert(vid, src_mac, &src_ip);
-                self.rx.push_back(na);
+                self.push_rx(0, na);
                 if std::env::var("SP_EMU_PINGTEST").is_ok() {
                     eprintln!("[bridge] PINGTEST: echo-request -> SP vid {:#x}", vid);
                     let ping = self.build_echo_request(vid, src_mac, &src_ip);
-                    self.rx.push_back(ping);
+                    self.push_rx(0, ping);
                 }
             }
         }
@@ -177,13 +181,13 @@ impl Bridge {
                 if target == self.my_ip {
                     if self.dbg() { eprintln!("[bridge] NS for me on vid {:#x} -> NA", vid); }
                     let na = self.build_neighbor_advert(vid, sp_mac, src_ip);
-                    self.rx.push_back(na);
+                    self.push_rx(0, na);
                 }
             }
             ICMP6_ECHO_REQUEST => {
                 // Answer pings to us (handy RX-path sanity check).
                 let reply = self.build_echo_reply(vid, sp_mac, src_ip, p);
-                self.rx.push_back(reply);
+                self.push_rx(0, reply);
             }
             _ => {} // Router Solicit / MLD / NA / Echo Reply: absorb.
         }
@@ -246,19 +250,37 @@ impl Bridge {
             // handle_udp_tx routes each reply to the right client. (Was a fixed
             // MGS_PORT, which collapsed all clients onto one port.)
             let frame = self.build_udp6(vid, sp_mac, sp_ip, SP_PORT, src.port(), &data);
-            self.rx.push_back(frame);
+            self.push_rx(src.port(), frame);
         }
-        // Bound the inject backlog. A real MGS service polls the SP far faster
-        // than the emulated SP (~1000x slower than real silicon) can drain its
-        // small RX ring, so an unbounded queue makes every reply's latency climb
-        // without limit until discover/state time out — and it never recovers
-        // (the "worked for a minute, then hangs" failure on real hardware). Cap
-        // it and drop the STALEST frames (front): MGS retries, and a missed
-        // sensor poll is harmless, but bounding the depth keeps discover/state
-        // latency low enough to land within MGS's timeout.
+    }
+
+    /// Queue a frame for the SP and enforce the backlog bound with FLOW-FAIR
+    /// eviction. A real MGS polls the SP (sensors, continuously) far faster than
+    /// the emulated SP (~1000x slower than silicon) can drain its 4-entry RX
+    /// ring, so the backlog MUST be bounded or reply latency climbs without limit
+    /// and never recovers ("worked a minute, then hangs"). But dropping the
+    /// GLOBAL oldest is flow-blind: it sheds the rare, latency-critical request
+    /// flows (discover / state / ignition — each its own MGS source port) to make
+    /// room for the high-volume sensor-poll flood, so those requests time out
+    /// under load (the "ignition drops first request, succeeds 15-30s later"
+    /// failure observed on the live rack). Instead, when over cap, evict the
+    /// OLDEST frame of the BUSIEST flow: the flood sheds its own backlog (a missed
+    /// sensor poll is harmless — MGS retries) while one-off request flows stay
+    /// intact. Bridge control frames (NA/echo, flow 0) are rare and connectivity-
+    /// critical, so they're excluded from being the victim where possible.
+    fn push_rx(&mut self, flow: u16, frame: Vec<u8>) {
         const RX_BACKLOG_CAP: usize = 32;
+        self.rx.push_back((flow, frame));
         while self.rx.len() > RX_BACKLOG_CAP {
-            self.rx.pop_front();
+            let mut counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+            for (f, _) in &self.rx { *counts.entry(*f).or_insert(0) += 1; }
+            // Busiest non-control flow; fall back to the global oldest only if the
+            // queue is somehow all control frames.
+            let victim = counts.iter().filter(|(f, _)| **f != 0).max_by_key(|(_, c)| **c).map(|(f, _)| *f);
+            match victim.and_then(|vf| self.rx.iter().position(|(f, _)| *f == vf)) {
+                Some(pos) => { self.rx.remove(pos); }
+                None => { self.rx.pop_front(); }
+            }
         }
     }
 
@@ -332,9 +354,14 @@ impl HostIo for Bridge {
 
     fn eth_tx(&mut self, frame: &[u8]) { self.handle_tx(frame); }
 
+    fn eth_poll(&mut self) { self.poll_host(); }
+
     fn eth_rx(&mut self) -> Option<Vec<u8>> {
-        self.poll_host();
-        self.rx.pop_front()
+        // FIFO delivery; flow fairness is enforced on the EVICTION side (push_rx),
+        // which is what keeps the rare request flows from being dropped under the
+        // sensor-poll flood. (Fair scheduling on delivery was tried and made
+        // latency WORSE under heavy load — reordering churn — so it was removed.)
+        self.rx.pop_front().map(|(_, frame)| frame)
     }
 }
 
