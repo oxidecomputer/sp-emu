@@ -52,7 +52,11 @@ pub fn install_peripherals(bus: &mut Bus) {
     bus.add_device(0x4001_4400, 0x400, Box::new(Tim16::new()));
 
     // SPI4 + the KSZ8463 switch behind it (net's management interface).
-    bus.add_device(0x4001_3400, 0x400, Box::new(Spi4::new()));
+    if let Some(lk) = crate::sprot::link() {
+        bus.add_device(0x4001_3400, 0x400, Box::new(crate::sprot::SpiMaster::new(lk))); // SP<->RoT sprot link
+    } else {
+        bus.add_device(0x4001_3400, 0x400, Box::new(Spi4::new()));
+    }
 
     // GPIO bank (0x5802_0000, ports A-K @ 0x400 each). Store/return except the
     // input-data register IDR (+0x10): gimlet's boot polls power-good + board-rev
@@ -85,6 +89,13 @@ pub fn install_peripherals(bus: &mut Bus) {
         bus.add_device(base, 0x400, Box::new(I2c::new(ev_irq, sensors.clone(), vpd.clone())));
     }
 
+    // STM32H7 HASH (0x4802_1400, irq 80): gimlet's hash_driver starts a digest
+    // (STR.DCAL) then blocks on the HASH irq. Unmodeled, that irq never fires =>
+    // hash_driver never replies => hf (host-flash) waits forever => CPA deadlocks
+    // on `send to hf` and the whole gimlet SP goes dark the moment MGS does its
+    // inventory phase1 host-flash hash. Model it (below) so the digest completes.
+    bus.add_device(0x4802_1400, 0x1000, Box::new(Hash::new()));
+
     // QUADSPI (0x5200_5000): command-aware host-flash model for the `hf` task.
     // Answers RDID with a recognized Micron 32 MiB chip + blank flash, so hf's
     // init completes and it returns to its dispatch loop — which unblocks
@@ -96,6 +107,14 @@ pub fn install_peripherals(bus: &mut Bus) {
     // panics unless pkg[3:0] == 0b1000 (TFBGA240) — a guard against flashing
     // gimlet firmware onto a gimletlet. Synthesize the gimlet package.
     bus.add_device(0x5800_0400, 0x400, Box::new(Syscfg::new()));
+
+    // EXTI (0x5800_0000): when the sprot bridge is active, model it so the SP's
+    // sys task can deliver the ROT_IRQ (PE3 / EXTI line 3) interrupt and sprot's
+    // wait_rot_irq wakes the instant the RoT replies, instead of polling out a
+    // fallback timer. Added before the catch-all so it owns the EXTI range.
+    if let Some(lk) = crate::sprot::link() {
+        bus.add_device(0x5800_0000, 0x400, Box::new(crate::sprot::SpExti::new(lk)));
+    }
 
     // STM32H7 96-bit unique device ID @ 0x1FF1E800 (system/OTP memory, not RAM).
     // `net` hashes it into its MAC address; if unmapped the read returns 0 and a
@@ -240,17 +259,24 @@ pub struct Vsc7448 {
     waddr: u32,      // accumulated 24-bit word address
     rval: u32,       // register value being read out
     wval: u32,       // register value being assembled during a write
+    vscdbg: bool,    // SP_EMU_VSCDBG: trace every VSC7448 register read/write
 }
 impl Vsc7448 {
     pub fn new() -> Self {
         Vsc7448 { regs: std::collections::HashMap::new(), vsc: std::collections::HashMap::new(),
-            rx: Vec::new(), idx: 0, is_write: false, waddr: 0, rval: 0, wval: 0 }
+            rx: Vec::new(), idx: 0, is_write: false, waddr: 0, rval: 0, wval: 0,
+            vscdbg: std::env::var("SP_EMU_VSCDBG").is_ok() }
     }
     fn vsc_read(&self, waddr: u32) -> u32 {
         match waddr {
             // DEVCPU_GCB:CHIP_REGS:CHIP_ID (reg 0x71010000): rev_id=3, part_id=0x7468,
             // mfg_id=0x74, one=1 — see drv/vsc7448/src/lib.rs:397.
             0x4000 => 0x374680E9,
+            // HSIO:PLL5G_STATUS(0):PLL5G_STATUS1 (reg 0x7146003c): pll5g_setup polls
+            // gain_stat (bits[18:14]) and only accepts 2 < v < 0xa, else retries 10x
+            // then errors LcPllInitFailed → monorail BspInitFailed panic. Report a
+            // locked PLL (gain_stat=5). See drv/vsc7448/src/lib.rs pll5g_setup.
+            0x11800f => 5 << 14,
             _ => *self.vsc.get(&waddr).unwrap_or(&0),
         }
     }
@@ -263,7 +289,10 @@ impl Vsc7448 {
             1 => { self.waddr |= (b as u32) << 8; 0 }
             2 => {
                 self.waddr |= b as u32;
-                if !self.is_write { self.rval = self.vsc_read(self.waddr); }
+                if !self.is_write {
+                    self.rval = self.vsc_read(self.waddr);
+                    if self.vscdbg { eprintln!("[vsc] R reg={:#010x} val={:#010x}", 0x7100_0000 | (self.waddr << 2), self.rval); }
+                }
                 0
             }
             _ => {
@@ -283,6 +312,7 @@ impl Vsc7448 {
                             0x71f9_4358, 0x7141_39b8, 0x7145_0008, // ANA_AC, ASM, DSM
                         ];
                         if RAM_INIT_REGS.contains(&(0x7100_0000 | (a << 2))) { v &= !0x2; }
+                        if self.vscdbg { eprintln!("[vsc] W reg={:#010x} val={:#010x}", 0x7100_0000 | (a << 2), v); }
                         self.vsc.insert(a, v);
                     }
                     0
@@ -672,6 +702,15 @@ impl Mmio for GpioBank {
     fn read(&mut self, off: u32) -> u32 {
         let (port, reg) = (off / 0x400, off & 0x3FF & !3);
         if reg == 0x10 { // IDR
+            if port == 4 {
+                // GPIOE: PE3 is rot-irq (input from the RoT, active-low). Surface
+                // the sprot link's rot_irq on bit 3 so the SP's sprot-server sees it.
+                if let Some(lk) = crate::sprot::link() {
+                    let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
+                    let bit3 = if lk.borrow().rot_irq { 0 } else { 1 << 3 };
+                    return (odr & !(1 << 3)) | bit3;
+                }
+            }
             if self.sidecar {
                 return match port {
                     // GPIOC PC6/PC7/PC13 → board rev[0,1,2]; sidecar-c = 0b010 → PC7 only.
@@ -705,6 +744,34 @@ impl Mmio for GpioBank {
             self.regs.insert(odr_key, odr);
         } else {
             self.regs.insert(off & !3, val);
+        }
+        if port == 4 {
+            // GPIOE PE4 is the RoT chip-select (active-low). Drive the sprot link CS
+            // and latch the SSA/SSD slave-select events on each edge. We latch here,
+            // on the SP side, because this write always runs inside the SP's quantum
+            // and so never misses a CS edge — unlike the RoT, which only samples the
+            // line when it happens to touch its FLEXCOMM8 registers and can sleep
+            // through an entire assert→clock→deassert cycle. See SprotLink.
+            if let Some(lk) = crate::sprot::link() {
+                let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
+                let new_cs = (odr >> 4) & 1 == 0;
+                let mut l = lk.borrow_mut();
+                if new_cs != l.cs {
+                    if new_cs {
+                        // CS asserted: start of a transfer. Latch SSA + the SOT bit
+                        // for the first FIFORD frame the RoT reads.
+                        l.ssa = true;
+                        l.sot_pending = true;
+                    } else {
+                        // CS de-asserted: end of a transfer. Latch SSD.
+                        l.ssd = true;
+                    }
+                    if crate::sprot::dbg() {
+                        eprintln!("[gpio] PE4 CS {} (mosi={} miso={})", if new_cs {"ASSERT"} else {"deassert"}, l.mosi.len(), l.miso.len());
+                    }
+                }
+                l.cs = new_cs;
+            }
         }
         // GPIOB/GPIOI affect SPI2 CS; GPIOJ (port 9) affects the sidecar SPI5 CS.
         if port == 1 || port == 8 || port == 9 { self.update_cs(); }
@@ -793,21 +860,65 @@ fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
 /// boards get a blank (all-0xFF) EEPROM, preserving the proven gimlet behavior
 /// (its sharkfin VPD reads fail cleanly as "Truncated", which the firmware
 /// tolerates).
+/// STM32H7 HASH (0x4802_1400, irq 80). Minimal model so drv-stm32h7-hash
+/// completes: report DINIS (ready for data) + not BUSY, and when the driver
+/// writes STR.DCAL (start digest) set SR.DCIS and raise irq 80 so its
+/// `sys_recv_notification` wakes. Returns a fixed digest — MGS only records the
+/// phase1 hash for inventory; it is not checked against the flash here.
+struct Hash {
+    irq_pending: bool,
+    dcis: bool,
+}
+impl Hash {
+    pub fn new() -> Self { Hash { irq_pending: false, dcis: false } }
+}
+impl Mmio for Hash {
+    fn name(&self) -> &str { "HASH" }
+    fn read(&mut self, off: u32) -> u32 {
+        match off & !3 {
+            0x24 => (1 << 0) | if self.dcis { 1 << 1 } else { 0 }, // SR: DINIS + DCIS, BUSY=0
+            0x0C | 0x10 | 0x14 | 0x18 | 0x1C => 0xA5A5_A5A5,       // HR0-4
+            o if (0x310..=0x32C).contains(&o) => 0xA5A5_A5A5,      // HR0-7 alias (SHA-256)
+            _ => 0,
+        }
+    }
+    fn write(&mut self, off: u32, val: u32) {
+        match off & !3 {
+            0x00 => { if val & (1 << 2) != 0 { self.dcis = false; } }                 // CR.INIT
+            0x08 => { if val & (1 << 8) != 0 { self.dcis = true; self.irq_pending = true; } } // STR.DCAL
+            _ => {}
+        }
+    }
+    fn take_irq(&mut self) -> Option<u16> {
+        if self.irq_pending { self.irq_pending = false; Some(80) } else { None }
+    }
+}
+
 fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     let mut img = vec![0xFFu8; 1024];
-    if std::env::var("SP_EMU_BOARD").map(|b| b == "sidecar").unwrap_or(false) {
-        // MAC0: 128-MAC block, distinct from gimlet's 0e:1d:b7:fe:45:20.
-        let mut mac0 = Vec::new();
-        mac0.extend_from_slice(&[0x0e, 0x1d, 0xb7, 0xfe, 0x45, 0x30]); // base_mac
-        mac0.extend_from_slice(&128u16.to_le_bytes());                  // count
-        mac0.push(1);                                                   // stride
-        // BARC: 0XV2 barcode "version:part(<=11):rev:serial(<=11)".
-        let barc = b"0XV2:913-0000019:002:BRM42220001";
-        let mut fru0 = tlvc_chunk(b"MAC0", &mac0);
-        fru0.extend_from_slice(&tlvc_chunk(b"BARC", barc));
-        let root = tlvc_chunk(b"FRU0", &fru0);
-        img[..root.len()].copy_from_slice(&root);
-    }
+    let sidecar = std::env::var("SP_EMU_BOARD").map(|b| b == "sidecar").unwrap_or(false);
+    // Per-instance index from the bridge port (33300->0, 33310->1, ...) so the
+    // emulated gimlet SPs get DISTINCT serials AND MACs. Inventory keys SPs on
+    // serial, and a shared MAC (the old blank-VPD gimlet default) caused L2
+    // collisions => intermittent "no answer" on the management net.
+    let idx: u8 = std::env::var("SP_EMU_BRIDGE").ok()
+        .and_then(|b| b.rsplit(':').next().map(str::to_string))
+        .and_then(|p| p.parse::<u32>().ok())
+        .map(|p| ((p.wrapping_sub(33300)) / 10) as u8)
+        .unwrap_or(0);
+    // MAC0: 128-MAC block. sidecar base ...45:30; gimlets ...45:21/22/23.
+    let mac_last = if sidecar { 0x30 } else { 0x20u8.wrapping_add(idx) };
+    let mut mac0 = Vec::new();
+    mac0.extend_from_slice(&[0x0e, 0x1d, 0xb7, 0xfe, 0x45, mac_last]); // base_mac
+    mac0.extend_from_slice(&128u16.to_le_bytes());                    // count
+    mac0.push(1);                                                     // stride
+    // BARC: 0XV2 barcode "version:part(<=11):rev:serial(<=11)".
+    let serial = if sidecar { "BRM42220001".to_string() } else { format!("BRM4422000{}", idx) };
+    let barc = format!("0XV2:913-0000019:002:{}", serial);
+    let mut fru0 = tlvc_chunk(b"MAC0", &mac0);
+    fru0.extend_from_slice(&tlvc_chunk(b"BARC", barc.as_bytes()));
+    let root = tlvc_chunk(b"FRU0", &fru0);
+    img[..root.len()].copy_from_slice(&root);
     Rc::new(img)
 }
 

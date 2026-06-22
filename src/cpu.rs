@@ -54,6 +54,7 @@ pub struct Cpu {
     pub wfi_throttle: bool, // enable WFI idle-throttle (set by the gdb serve loop, post-preboot)
     pub idle_skip: u32, // instrs skipped to the next tick on an idle WFI (loop sleeps instead)
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
+    pub trace_svc: bool, // log Hubris syscalls (Sysnum in r11) at each SVC — RoT IPC tracing
     pub last_disasm: String,
     decoder: InstDecoder,
     /// PC-keyed decode cache. Hubris executes in place from immutable flash, so
@@ -87,7 +88,7 @@ impl Cpu {
             n: false, z: false, c: false, v: false, q: false,
             mode: Mode::Thread, control: 0, primask: false, basepri: 0, faultmask: false,
             ipsr: 0, msp: 0, psp: 0, sp_is_psp: false, itstate: 0, s: [0; 32], fpscr: 0, cur_insn: 0,
-            cycles: 0, entered_task: false, bad_ret_dumps: 0, last_vfp: false, last_it: false, last_sys: false, cur_in_it: false, cur_setflags: false, systick: 0, wfi_throttle: false, idle_skip: 0, record_disasm: false, last_disasm: String::new(),
+            cycles: 0, entered_task: false, bad_ret_dumps: 0, last_vfp: false, last_it: false, last_sys: false, cur_in_it: false, cur_setflags: false, systick: 0, wfi_throttle: false, idle_skip: 0, record_disasm: false, trace_svc: false, last_disasm: String::new(),
             decoder: InstDecoder::default_thumb(),
             dcache: std::collections::HashMap::new(),
             syst_csr: 0, syst_rvr: 1,
@@ -202,7 +203,8 @@ impl Cpu {
             None => {
                 // VFP (or genuinely unimplemented). Thumb VFP encodings are 4 bytes.
                 if cond_ok {
-                    if self.try_vfp(raw, pc, bus) { Ok(()) }
+                    if self.try_v8m(raw, pc, bus) { Ok(()) }
+                    else if self.try_vfp(raw, pc, bus) { Ok(()) }
                     else { Err(Trap::Decode { pc }) }
                 } else {
                     self.pc = pc.wrapping_add(4); // skip the conditional VFP instr
@@ -217,6 +219,45 @@ impl Cpu {
     }
 
     /// Fetch the instruction at `pc` and decode it (the work the dcache memoizes).
+    /// ARMv8-M load-acquire / store-release (LDA/STL + B/H + LDAEX/STLEX), which
+    /// yaxpeax's ARMv7 decoder rejects. The LPC55 RoT (Cortex-M33) uses these for
+    /// atomics/sync. On a single-core emulator the acquire/release/exclusive
+    /// semantics are trivially satisfied, so they reduce to plain loads/stores
+    /// (exclusives always succeed). hw1 = 1110_1000_110L_Rnnn (0xE8C0 store,
+    /// 0xE8D0 load); hw2[11:8]=1111, hw2[7:4] = size/exclusive selector.
+    fn try_v8m(&mut self, raw: u32, pc: u32, bus: &mut Bus) -> bool {
+        let hw1 = (raw & 0xFFFF) as u16;
+        let hw2 = ((raw >> 16) & 0xFFFF) as u16;
+        if hw1 & 0xFFE0 != 0xE8C0 { return false; }
+        if (hw2 >> 8) & 0xF != 0xF { return false; }
+        let (size, exclusive) = match (hw2 >> 4) & 0xF {
+            0x8 => (1u8, false), 0x9 => (2, false), 0xA => (4, false),
+            0xC => (1, true), 0xD => (2, true), 0xE => (4, true),
+            _ => return false,
+        };
+        let load = hw1 & 0x10 != 0;
+        let rn = (hw1 & 0xF) as usize;
+        let rt = ((hw2 >> 12) & 0xF) as usize;
+        let addr = self.r[rn];
+        if load {
+            self.r[rt] = match size {
+                1 => bus.read8(addr) as u32,
+                2 => bus.read16(addr) as u32,
+                _ => bus.read32(addr),
+            };
+        } else {
+            let v = self.r[rt];
+            match size {
+                1 => bus.write8(addr, v as u8),
+                2 => bus.write16(addr, v as u16),
+                _ => bus.write32(addr, v),
+            }
+            if exclusive { self.r[(hw2 & 0xF) as usize] = 0; } // STLEX: report success
+        }
+        self.pc = pc.wrapping_add(4);
+        true
+    }
+
     fn fetch_decode(&self, pc: u32, bus: &mut Bus) -> Decoded {
         let mut buf = [0u8; 4];
         buf[0..2].copy_from_slice(&bus.read16(pc).to_le_bytes());
@@ -536,7 +577,16 @@ impl Cpu {
                 self.primask = disable; Ok(())
             }
 
-            Opcode::SVC => { self.exception_entry(11, bus); Ok(()) }
+            Opcode::SVC => {
+                if self.trace_svc {
+                    // Hubris ABI: syscall number in r11 at the SVC. Log it + a couple
+                    // args (Send target/op in r4/r5) to trace RoT IPC (sprot->update_server).
+                    let sys = self.r[11];
+                    let name = match sys { 0=>"Send",1=>"Recv",2=>"Reply",3=>"SetTimer",4=>"BorrowRead",5=>"BorrowWrite",6=>"BorrowInfo",7=>"IrqControl",8=>"PANIC",9=>"GetTimer",10=>"RefreshTaskId",11=>"Post",12=>"ReplyFault",13=>"IrqStatus",_=>"?" };
+                    eprintln!("[rotsvc] {} r4={:#x} r5={:#x} r6={:#x}", name, self.r[4], self.r[5], self.r[6]);
+                }
+                self.exception_entry(11, bus); Ok(())
+            }
             Opcode::UDF => Err(()), // permanently undefined: surface as a stop
 
             _ => Err(()),

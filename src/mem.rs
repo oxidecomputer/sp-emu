@@ -249,6 +249,31 @@ impl Bus {
     /// Drain frames the SP has transmitted (for the host bridge to forward).
     pub fn eth_take_tx(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.eth.tx_frames) }
 
+    /// Write a humility-`hydrate`-compatible raw memory dump into `dir`: each RAM
+    /// region as `0x<base>.bin` plus a `dump.json`. Flash (0x08000000) is omitted
+    /// because hydrate reconstructs it from the Hubris archive. Zip the dir, then
+    ///   humility -a <archive> hydrate <zip>  &&  humility -d <core> tasks
+    /// reads the live (possibly wedged) task table/ringbufs off the emulated SP
+    /// with no probe or gdb attach.
+    pub fn write_hydrate_dump(&self, dir: &str, archive_id: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        for r in &self.rams {
+            if r.base == 0x0800_0000 { continue; } // flash comes from the archive
+            std::fs::write(format!("{}/0x{:x}.bin", dir, r.base), &r.data)?;
+        }
+        let json = format!(
+            "{{\"format\":1,\"task_index\":0,\"crash_time\":0,\"board_name\":\"sidecar-c\",\"git_commit\":\"emu\",\"archive_id\":\"{}\",\"fw_version\":null}}",
+            archive_id);
+        std::fs::write(format!("{}/dump.json", dir), json)
+    }
+
+    /// True if the SP has queued one or more frames for transmit but the serve
+    /// loop hasn't flushed them to the bridge yet. The serve loop polls this to
+    /// break its instruction batch the instant a reply is ready, so a round-trip
+    /// costs ~one small quantum instead of waiting out a full batch (the eth
+    /// latency that, under rack contention, blows MGS's per-attempt budget).
+    pub fn eth_has_tx(&self) -> bool { !self.eth.tx_frames.is_empty() }
+
     /// Glue between the ETH DMA and the host network bridge: forward transmitted
     /// frames out, and inject any frames the bridge has for us. Called
     /// periodically from the run/gdb loops.
@@ -365,6 +390,12 @@ impl Bus {
     }
 
     /// Poll every device for a raised interrupt and set it pending in the NVIC.
+    /// Pend an external NVIC IRQ (used by the sprot bridge to wake the RoT's
+    /// FLEXCOMM8 slave on a chip-select assert).
+    pub fn pend_irq(&mut self, irq: u16) {
+        self.nvic_pend[(irq / 32) as usize] |= 1 << (irq % 32);
+    }
+
     pub fn collect_irqs(&mut self) {
         // Poll devices only if one was accessed since the last collect — no modeled
         // device raises an IRQ without an MMIO access, so this is exact, not lossy,

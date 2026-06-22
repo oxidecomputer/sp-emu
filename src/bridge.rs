@@ -25,6 +25,8 @@ const ICMP6_NEIGHBOR_SOLICIT: u8 = 135;
 const ICMP6_NEIGHBOR_ADVERT: u8 = 136;
 const SP_PORT: u16 = 11111; // control_plane_agent's MGS socket
 const MGS_PORT: u16 = 22222;
+const EREPORT_PORT: u16 = 57005; // snitch's ereport socket (SP side)
+const EREPORT_OFFSET: u16 = 11100; // host ereport port = mgmt port + this (33300->44400)
 const VLAN_TPID: u16 = 0x8100;
 
 /// The SP's two management VLANs (gimlet app.toml): sidecar1 (vid 0x301) is the
@@ -39,6 +41,7 @@ const VID_SWITCH1: u16 = 0x302;
 struct BoundSock {
     sock: UdpSocket,
     vid: u16,
+    sp_port: u16, // SP UDP port this socket relays (11111 mgmt | 57005 ereport)
 }
 
 pub struct Bridge {
@@ -54,12 +57,25 @@ pub struct Bridge {
     /// can inject on the correct switch view and keep each neighbor cache warm.
     sp_by_vid: std::collections::HashMap<u16, ([u8; 6], [u8; 16])>,
     /// Last MGS host endpoint heard per VLAN (where that view's SP replies go).
-    peer_by_vid: std::collections::HashMap<u16, SocketAddr>,
+    peer_by_vid: std::collections::HashMap<(u16, u16), SocketAddr>,
     /// Frames queued for the SP, each tagged with its MGS-client flow key (the
     /// client's UDP source port; 0 = bridge-generated control frame). The tag
     /// drives flow-fair eviction in `push_rx` so the rare request flows survive
     /// the sensor-poll flood.
     rx: VecDeque<(u16, Vec<u8>)>,
+    /// RX-path drop diagnostics (SP_EMU_RXSTATS): frames received from the host
+    /// sockets, evicted by the flow-fair cap, and delivered to the SP.
+    n_recv: u64,
+    n_evict: u64,
+    n_pop: u64,
+    /// SP round-trip diagnostics (SP_EMU_RTTSTATS): arrival time of the most
+    /// recent client request injected toward the SP, and accumulated request->
+    /// reply latency THROUGH THE EMULATOR (excludes faux-mgs/process/kernel time).
+    /// Single-client measurement; under a flood the pairing is approximate.
+    last_req_at: Option<std::time::Instant>,
+    rtt_n: u64,
+    rtt_sum_us: u128,
+    rtt_max_us: u128,
 }
 
 impl Bridge {
@@ -95,7 +111,20 @@ impl Bridge {
             let sock = UdpSocket::bind(a)?;
             sock.set_nonblocking(true)?;
             eprintln!("[bridge] listening on {} (switch{} view, vid {:#x})", a, off, vid);
-            socks.push(BoundSock { sock, vid });
+            socks.push(BoundSock { sock, vid, sp_port: SP_PORT });
+            // ereport relay: MGS expects the SP ereport endpoint at mgmt+OFFSET
+            // (33300->44400); relay it to the SP snitch socket (57005). Without
+            // this MGS ereport polls hit an unbound port and retry-storm.
+            let mut ea = base;
+            ea.set_port(base.port().wrapping_add(off).wrapping_add(EREPORT_OFFSET));
+            match UdpSocket::bind(ea) {
+                Ok(es) => {
+                    let _ = es.set_nonblocking(true);
+                    eprintln!("[bridge] ereport listening on {} (switch{} view, vid {:#x})", ea, off, vid);
+                    socks.push(BoundSock { sock: es, vid, sp_port: EREPORT_PORT });
+                }
+                Err(e) => eprintln!("[bridge] ereport bind {} failed: {} (ereport relay off)", ea, e),
+            }
         }
         eprintln!("[bridge] point MGS/faux-mgs at {} (switch0) or its +1 port (switch1)", base);
         Ok(Bridge {
@@ -107,6 +136,8 @@ impl Bridge {
             sp_by_vid: std::collections::HashMap::new(),
             peer_by_vid: std::collections::HashMap::new(),
             rx: VecDeque::new(),
+            n_recv: 0, n_evict: 0, n_pop: 0,
+            last_req_at: None, rtt_n: 0, rtt_sum_us: 0, rtt_max_us: 0,
         })
     }
 
@@ -197,7 +228,7 @@ impl Bridge {
         if udp.len() < 8 { return; }
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         // Only relay the SP's management socket; ignore broadcast/echo chatter.
-        if src_port != SP_PORT { return; }
+        if src_port != SP_PORT && src_port != EREPORT_PORT { return; }
         // Route the reply to the SPECIFIC MGS client that sent the request: the
         // SP echoes that client's ephemeral port as the UDP *destination* port
         // (we inject requests with the real client port as the UDP source — see
@@ -207,15 +238,24 @@ impl Bridge {
         // sensor-polling socket hogs the replies). We keep the MGS IP from the
         // learned peer (all clients share the in-zone loopback) + this port.
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
-        let peer_ip = match self.peer_by_vid.get(&vid) { Some(p) => p.ip(), None => return };
+        let peer_ip = match self.peer_by_vid.get(&(vid, src_port)) { Some(p) => p.ip(), None => return };
         let peer = std::net::SocketAddr::new(peer_ip, dst_port);
         let payload = &udp[8..];
         if self.dbg() {
             let hex: String = payload.iter().map(|b| format!("{:02x}", b)).collect();
             eprintln!("[bridge] SP->MGS vid {:#x} {} bytes -> {} payload={}", vid, payload.len(), peer, hex);
         }
-        if let Some(bs) = self.socks.iter().find(|s| s.vid == vid) {
+        if let Some(bs) = self.socks.iter().find(|s| s.vid == vid && s.sp_port == src_port) {
             let _ = bs.sock.send_to(payload, peer);
+        }
+        // Round-trip latency through the emulator: request-injected -> reply-sent.
+        if let Some(t) = self.last_req_at.take() {
+            let us = t.elapsed().as_micros();
+            self.rtt_n += 1;
+            self.rtt_sum_us += us;
+            if us > self.rtt_max_us { self.rtt_max_us = us; }
+            eprintln!("[rttstats] sp_roundtrip={}us (n={} avg={}us max={}us)",
+                us, self.rtt_n, self.rtt_sum_us / self.rtt_n as u128, self.rtt_max_us);
         }
     }
 
@@ -225,18 +265,23 @@ impl Bridge {
         let mut buf = [0u8; 2048];
         // Collect (vid, src, len, bytes) first to avoid borrowing self.socks while
         // mutating self.peer_by_vid / self.rx below.
-        let mut got: Vec<(u16, SocketAddr, Vec<u8>)> = Vec::new();
+        let mut got: Vec<(u16, u16, SocketAddr, Vec<u8>)> = Vec::new();
         for bs in &self.socks {
             loop {
                 match bs.sock.recv_from(&mut buf) {
-                    Ok((n, src)) => got.push((bs.vid, src, buf[..n].to_vec())),
+                    Ok((n, src)) => got.push((bs.vid, bs.sp_port, src, buf[..n].to_vec())),
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
             }
         }
-        for (vid, src, data) in got {
-            self.peer_by_vid.insert(vid, src);
+        self.n_recv += got.len() as u64;
+        if std::env::var("SP_EMU_RXSTATS").is_ok() && self.n_recv % 500 < got.len() as u64 {
+            eprintln!("[rxstats] recv={} evict={} pop={} qdepth={}",
+                self.n_recv, self.n_evict, self.n_pop, self.rx.len());
+        }
+        for (vid, sp_port, src, data) in got {
+            self.peer_by_vid.insert((vid, sp_port), src);
             let (sp_mac, sp_ip) = match self.sp_by_vid.get(&vid) {
                 Some(t) => *t,
                 None => { if self.dbg() { eprintln!("[bridge] drop MGS pkt (vid {:#x}): SP not yet learned", vid); } continue; }
@@ -249,7 +294,7 @@ impl Bridge {
             // so the SP echoes it back as the reply's dest port — that's how
             // handle_udp_tx routes each reply to the right client. (Was a fixed
             // MGS_PORT, which collapsed all clients onto one port.)
-            let frame = self.build_udp6(vid, sp_mac, sp_ip, SP_PORT, src.port(), &data);
+            let frame = self.build_udp6(vid, sp_mac, sp_ip, sp_port, src.port(), &data);
             self.push_rx(src.port(), frame);
         }
     }
@@ -269,6 +314,11 @@ impl Bridge {
     /// intact. Bridge control frames (NA/echo, flow 0) are rare and connectivity-
     /// critical, so they're excluded from being the victim where possible.
     fn push_rx(&mut self, flow: u16, frame: Vec<u8>) {
+        // Flow != 0 is a real MGS client request (flow 0 = bridge control: NA/echo).
+        // Stamp its arrival so the SP's reply can report the round-trip latency.
+        if flow != 0 && std::env::var("SP_EMU_RTTSTATS").is_ok() {
+            self.last_req_at = Some(std::time::Instant::now());
+        }
         const RX_BACKLOG_CAP: usize = 32;
         self.rx.push_back((flow, frame));
         while self.rx.len() > RX_BACKLOG_CAP {
@@ -281,6 +331,7 @@ impl Bridge {
                 Some(pos) => { self.rx.remove(pos); }
                 None => { self.rx.pop_front(); }
             }
+            self.n_evict += 1;
         }
     }
 
@@ -357,10 +408,20 @@ impl HostIo for Bridge {
     fn eth_poll(&mut self) { self.poll_host(); }
 
     fn eth_rx(&mut self) -> Option<Vec<u8>> {
-        // FIFO delivery; flow fairness is enforced on the EVICTION side (push_rx),
-        // which is what keeps the rare request flows from being dropped under the
-        // sensor-poll flood. (Fair scheduling on delivery was tried and made
-        // latency WORSE under heavy load — reordering churn — so it was removed.)
+        // Control frames (NA/echo, flow 0) are connectivity-critical — serve
+        // them first (oldest-first).
+        if let Some(pos) = self.rx.iter().position(|(f, _)| *f == 0) {
+            self.n_pop += 1;
+            return self.rx.remove(pos).map(|(_, frame)| frame);
+        }
+        // Management requests: NEWEST-first. Under sustained/overlapping MGS
+        // sweeps the ~8x-slower SP runs perpetually behind, so FIFO made it always
+        // answer a request MGS had already abandoned (stale message_id → discarded
+        // → /ignition timed out). Serving the freshest request makes the reply
+        // match MGS's current outstanding request; superseded older retries age
+        // out via the push_rx cap. (Newest-first, not the round-robin fairness
+        // that regressed latency before.)
+        if !self.rx.is_empty() { self.n_pop += 1; }
         self.rx.pop_front().map(|(_, frame)| frame)
     }
 }

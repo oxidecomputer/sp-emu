@@ -24,6 +24,9 @@ mod gdb;
 mod host;
 mod mem;
 mod soc;
+mod lpc55;
+mod sprot;
+mod rot_service;
 
 use anyhow::{bail, Context, Result};
 use cpu::{Cpu, Trap};
@@ -57,6 +60,8 @@ fn main() -> Result<()> {
         Some("info") => cmd_info(),
         Some("run") => cmd_run(&args[1..]),
         Some("gdb") => cmd_gdb(&args[1..]),
+        Some("rot") => cmd_rot(&args[1..]),
+        Some("rot-serve") => cmd_rot_serve(&args[1..]),
         // Legacy: `sp-emu <image.bin> [max]` boots a flat image without a slot.
         Some(p) if std::path::Path::new(p).exists() => {
             let max = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
@@ -70,6 +75,7 @@ fn main() -> Result<()> {
             eprintln!("  sp-emu info                      show slot reset vectors");
             eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot");
             eprintln!("  sp-emu gdb [a|b] [preboot]       boot a slot, then serve a GDB stub for humility");
+            eprintln!("  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone");
             Ok(())
         }
     }
@@ -170,9 +176,135 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
             slot.to_ascii_uppercase(), slot);
     }
     eprintln!("[sp] booting from slot {} ({}) for GDB", slot.to_ascii_uppercase(), path);
+    // RoT bridge: either a SHARED rot-service over IPC (SP_EMU_ROT_SERVICE, the
+    // light path — no in-process RoT core), or an in-process RoT core
+    // (SP_EMU_ROT_FLASH, the original two-core path). The service wins if both set.
+    let rot_service = std::env::var("SP_EMU_ROT_SERVICE").ok().filter(|s| !s.is_empty());
+    if rot_service.is_some() || std::env::var("SP_EMU_ROT_FLASH").is_ok() { sprot::enable(); }
     let (cpu, bus) = setup(&nvm, flash::slot_base(slot)?)?;
+    let rot = match (&rot_service, std::env::var("SP_EMU_ROT_FLASH")) {
+        (None, Ok(p)) => { eprintln!("[rot] SP_EMU_ROT_FLASH={p}"); let img = flash::load_image(&p)?; Some(build_rot_core(&img)?) }
+        _ => None,
+    };
+    let rot_client = rot_service.map(|a| { eprintln!("[rot] SP_EMU_ROT_SERVICE={a}"); rot_service::RotClient::connect(&a) });
     let mut host = make_host();
-    gdb::serve(cpu, bus, host.as_mut(), preboot)
+    gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
+}
+
+/// rot <oxide-rot-1 image|archive> [max] — boot the LPC55 RoT firmware standalone
+/// (no sprot link yet) on the existing core to see how far it gets and which
+/// LPC55 peripherals it touches (the unmapped-access log drives what to model).
+/// Build the LPC55 RoT core (Cortex-M33 + LPC55 SoC) loaded with the oxide-rot-1
+/// image and reset, ready to step. Shared by `sp-emu rot` (standalone) and
+/// `serve` (the in-process two-core SP+RoT integration, gated on SP_EMU_ROT_FLASH).
+pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
+    let base = lpc55::IMAGE_A_BASE;
+    let mut bus = Bus::new();
+    lpc55::install_memory(&mut bus);
+    lpc55::install_peripherals(&mut bus, image);
+    bus.load(base, image)?;
+    publish_rot_bootstate(&mut bus, image);
+    let initial_sp = bus.read32(base);
+    let reset_pc = bus.read32(base + 4) & !1;
+    eprintln!("[rot] RoT core: loaded {} bytes @ {:#010x}; SP={:#010x} PC={:#010x}", image.len(), base, initial_sp, reset_pc);
+    let mut cpu = Cpu::new();
+    cpu.reset(initial_sp, reset_pc);
+    cpu.wfi_throttle = true;
+    bus.write32(0xE000_ED08, base);
+    Ok((cpu, bus))
+}
+
+/// Publish the RoT boot-state measurement handoff that stage0/bootleby would
+/// produce on real hardware. The `lpc55-update-server` reads `RotBootStateV2`
+/// from `UPDATE_RANGE` (0x4010_2000, USB SRAM) via `bootstate()`, and the SP's
+/// `rot_boot_info` sprot query returns the slot SHA3-256 digests from it. sp-emu
+/// skips stage0, so without this the handoff is zeroed and the digests come back
+/// as all-zero (or the load fails). We compute the real SHA3-256 of the loaded
+/// slot-A image (padded to the 512-byte flash page with 0xff, matching the
+/// firmware's "all programmed pages" measurement) and serialize a valid handoff:
+///   HandoffDataHeader { version: u32 = 0, magic: b"whatwhatwhat" }   (hubpack)
+///   RotBootStateV2 { active: RotSlot, a/b/stage0/stage0next: RotImageDetailsV2 }
+/// where RotImageDetailsV2 = { digest: [u8;32], status: Result<(), ImageError> }.
+/// hubpack encodes integers LE, arrays/structs in field order, enums/Result as a
+/// 1-byte discriminant (Ok=0). Slots we don't load (b/stage0/stage0next) get the
+/// digest of an erased page + status Ok (the control plane records but does not
+/// validate digests). See lib/stage0-handoff in hubris.
+fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
+    use sha3::{Digest, Sha3_256};
+    const FLASH_PAGE: usize = 512;
+    let page_hash = |bytes: &[u8]| -> [u8; 32] {
+        let mut h = Sha3_256::new();
+        h.update(bytes);
+        // Pad up to the next flash-page boundary with 0xff, as the RoT measures
+        // all programmed pages including the 0xff tail of the final page.
+        let rem = bytes.len() % FLASH_PAGE;
+        if rem != 0 { h.update(&vec![0xffu8; FLASH_PAGE - rem]); }
+        h.finalize().into()
+    };
+    let digest_a = page_hash(image);
+    let digest_erased = page_hash(&[0xffu8; FLASH_PAGE]);
+
+    let mut blob: Vec<u8> = Vec::with_capacity(149);
+    blob.extend_from_slice(&0u32.to_le_bytes()); // HandoffDataHeader.version
+    blob.extend_from_slice(b"whatwhatwhat");     // HandoffDataHeader.magic
+    blob.push(0u8); // RotBootStateV2.active = RotSlot::A
+    // a/b/stage0/stage0next: digest[32] + status (Ok(()) = discriminant 0).
+    for d in [&digest_a, &digest_erased, &digest_erased, &digest_erased] {
+        blob.extend_from_slice(d);
+        blob.push(0u8); // Result::Ok(())
+    }
+
+    const UPDATE_RANGE_BASE: u32 = 0x4010_2000;
+    for (i, b) in blob.iter().enumerate() {
+        bus.write8(UPDATE_RANGE_BASE + i as u32, *b);
+    }
+    eprintln!("[rot] published RotBootStateV2 handoff @ {:#010x} ({} bytes); slot-A sha3-256 = {}",
+        UPDATE_RANGE_BASE, blob.len(),
+        digest_a.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+}
+
+/// rot-serve <listen-addr> <oxide-rot-1 image|archive> — run ONE shared RoT that
+/// answers sprot request frames over a socket (frame-level IPC), so every SP can
+/// share it instead of each emulating its own RoT core. See `rot_service`.
+fn cmd_rot_serve(args: &[String]) -> Result<()> {
+    let listen = args.first().context("usage: rot-serve <listen-addr> <rot-image>")?;
+    let image_path = args.get(1).context("usage: rot-serve <listen-addr> <rot-image>")?;
+    let image = flash::load_image(image_path)?;
+    rot_service::run(listen, &image)
+}
+
+fn cmd_rot(args: &[String]) -> Result<()> {
+    let path = args.first().context("usage: sp-emu rot <oxide-rot-1 image.bin|archive.zip> [max]")?;
+    let image = flash::load_image(path)?;
+    let max = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(20_000_000);
+    let (mut cpu, mut bus) = build_rot_core(&image)?;
+    let trace = std::env::var("SP_EMU_TRACE").is_ok();
+    cpu.record_disasm = trace;
+    let mut host = make_host();
+    let mut stopped = false;
+    let mut idle_hits: u64 = 0;
+    let mut first_idle = false;
+    for i in 0..max {
+        let pc = cpu.pc;
+        if cpu.step(&mut bus, host.as_mut()).is_err() {
+            eprintln!("[rot] STOP (trap) at pc={:#010x} [{}] after {} insns", pc, cpu.last_disasm, i);
+            stopped = true;
+            break;
+        }
+        if trace { eprintln!("{:08x}: {}", pc, cpu.last_disasm); }
+        cpu.maybe_tick(&mut bus);
+        cpu.maybe_interrupt(&mut bus);
+        if cpu.idle_skip > 0 {
+            if !first_idle { first_idle = true; eprintln!("[rot] reached WFI/idle at pc={:#010x} after {} insns", pc, i); }
+            idle_hits += 1;
+            cpu.idle_skip = 0;
+        }
+    }
+    if !stopped { eprintln!("[rot] ran to max ({} insns)", max); }
+    eprintln!("[rot] idle/WFI hits = {}", idle_hits);
+    eprintln!("[rot] final PC={:#010x}, cycles={}, unmapped r/w={}/{}",
+        cpu.pc, cpu.cycles, bus.unmapped_reads, bus.unmapped_writes);
+    Ok(())
 }
 
 /// Build the SoC, load flash, and reset the CPU from `boot_base`'s vector table.
