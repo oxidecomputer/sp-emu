@@ -42,7 +42,16 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
     let mut done = false;
     let mut quiet = 0u32;
     const Q: u32 = 2048;
-    for _ in 0..200_000u32 {
+    for it in 0..200_000u32 {
+        if dbg() && it > 0 && it % 40_000 == 0 {
+            let nz = resp.iter().position(|&b| b != 0);
+            let head: String = match nz {
+                Some(s) => resp[s..].iter().take(20).map(|b| format!("{b:02x}")).collect(),
+                None => String::from("(all-zero)"),
+            };
+            eprintln!("[rotsvc] grind it={it} phase2={phase2} resp={} first_nonzero@{:?} head={head} rot_pc={:#010x}",
+                resp.len(), nz, rc.pc);
+        }
         // Phase 1: feed request bytes as the RoT drains mosi (16-byte FIFO cap);
         // deassert CS once the whole request is in and nearly drained.
         if !deasserted {
@@ -77,8 +86,12 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 break;
             }
         }
-        // On rot-irq ("reply ready"), re-assert CS so the RoT clocks the reply out,
-        // then collect whatever it produces.
+        // On rot-irq ("reply ready"), enter phase 2: assert CS for the reply-read
+        // transaction, EXACTLY as the SP does on seeing rot-irq. Then `continue` so
+        // the RoT gets stepped at least once with CS asserted before we collect or
+        // end the transaction — otherwise a small reply that already fills the FIFO
+        // would let us assert+deassert CS in a single iteration, and the RoT would
+        // never observe transaction 2's slave-select.
         {
             let mut lk = link.borrow_mut();
             if !phase2 && lk.rot_irq {
@@ -89,15 +102,24 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 if dbg() {
                     eprintln!("[rotsvc] phase2 (rot-irq)");
                 }
+                drop(lk);
+                continue;
             }
-            while let Some(b) = lk.miso.pop_front() {
-                // Once the reply is complete (`done`), we're only stepping the RoT
-                // so it observes SSD and deasserts rot-irq — drain+discard anything
-                // it clocks during that wind-down so it can't append trailing junk
-                // to the reply (which would leave the SP unable to fully drain miso
-                // and thus stuck with rot-irq asserted into the next transaction).
-                if !done {
-                    resp.push(b);
+            // Collect the reply ONLY in phase 2 — i.e. only after the RoT signalled
+            // it (rot-irq) and we (re)asserted CS for the reply-read transaction.
+            // This mirrors the real SP, which never reads the reply before rot-irq.
+            // Draining `miso` during phase 1 grabbed the reply *before* the RoT had
+            // sent it in a transaction it was aware of, so the exchange returned
+            // while the RoT was still mid-reply; the NEXT exchange's link reset then
+            // re-asserted CS underneath it and it ground forever, never reading the
+            // follow-up request (the caboose's chunked read). Once the reply is
+            // complete (`done`) we keep draining but discard, so trailing idle frames
+            // the RoT clocks during wind-down don't get appended to the reply.
+            if phase2 {
+                while let Some(b) = lk.miso.pop_front() {
+                    if !done {
+                        resp.push(b);
+                    }
                 }
             }
         }
@@ -110,7 +132,7 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         // start .. start+6+body_size+CRC(2). (The old code parsed resp[4..6]
         // blindly, read body_size=0 from leading zeros, truncated at 8, and
         // abandoned slow replies before they arrived.)
-        if total.is_none() {
+        if phase2 && total.is_none() {
             if let Some(start) = resp.iter().position(|&b| b != 0) {
                 if resp.len() >= start + 6 {
                     let body_size =
@@ -158,7 +180,8 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         }
     }
     if dbg() {
-        eprintln!("[rotsvc] exchange: req {}B -> resp {}B", req.len(), resp.len());
+        let hx: String = resp.iter().take(48).map(|b| format!("{b:02x}")).collect();
+        eprintln!("[rotsvc] exchange: req {}B -> resp {}B [{hx}]", req.len(), resp.len());
     }
     resp
 }
@@ -194,15 +217,46 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
         }
         eprintln!("[rotsvc] RoT prebooted ({preboot} insns), ready");
         let mut cache: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        for (req, resp_tx) in req_rx {
-            let resp = if let Some(r) = cache.get(&req) {
-                r.clone()
-            } else {
-                let r = rot_exchange(&mut rc, &mut rb, &mut host, &req);
-                cache.insert(req.clone(), r.clone());
-                r
-            };
-            let _ = resp_tx.send(resp);
+        // Drive the RoT CONTINUOUSLY, like the in-process two-core bridge. Between
+        // requests we keep stepping it so it finishes tearing down the prior reply
+        // and returns to its sprot receive loop — otherwise it freezes mid-teardown
+        // the instant a reply completes and never reads the FOLLOW-UP request (e.g.
+        // the caboose's chunked reads), leaving that request unread while the RoT
+        // idles -> the SP blocks forever. (Confirmed: two-core reads req2; the old
+        // recv-blocked worker did not.)
+        loop {
+            match req_rx.try_recv() {
+                Ok((req, resp_tx)) => {
+                    if dbg() {
+                        let hx: String = req.iter().map(|b| format!("{b:02x}")).collect();
+                        eprintln!("[rotsvc] req mt={:#04x} len={} hex={hx} cache_hit={}",
+                            req.get(6).copied().unwrap_or(0), req.len(), cache.contains_key(&req));
+                    }
+                    let resp = if let Some(r) = cache.get(&req) {
+                        r.clone()
+                    } else {
+                        let r = rot_exchange(&mut rc, &mut rb, &mut host, &req);
+                        cache.insert(req.clone(), r.clone());
+                        r
+                    };
+                    let _ = resp_tx.send(resp);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No request in flight: keep the RoT alive in its receive loop.
+                    for _ in 0..2048 {
+                        if rc.step(&mut rb, &mut host).is_err() {
+                            break;
+                        }
+                        rc.maybe_tick(&mut rb);
+                        rc.maybe_interrupt(&mut rb);
+                        if rc.idle_skip > 0 {
+                            rc.idle_skip = 0;
+                            break;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
         }
     });
     let l = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;

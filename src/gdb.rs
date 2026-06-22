@@ -589,11 +589,23 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                     lk.rot_irq = true; // EXTI block below pends irq 9 -> wakes SP
                     lk.request_in_flight = false;
                     awaiting_reply = true;
-                } else if awaiting_reply && l.borrow().miso.is_empty() {
+                } else if awaiting_reply && ssd {
+                    // The SP deasserted CS after clocking in the reply -> this sprot
+                    // transaction is complete. Deassert rot-irq and DROP any unread
+                    // reply bytes, so the NEXT request the SP clocks (e.g. the
+                    // caboose's multi-step follow-up read) is captured WHOLE.
+                    //
+                    // Keying end-of-transaction on `miso.is_empty()` was the bug: if
+                    // the SP left even one reply byte unread, `awaiting_reply` stuck
+                    // true and the HEAD of the next request got eaten by the phase-2
+                    // `mosi.clear()` above -> a truncated request -> the RoT never
+                    // sees a complete frame and grinds in its TX loop forever. The
+                    // SP's CS edge is the real protocol boundary; use it.
                     let mut lk = l.borrow_mut();
                     lk.rot_irq = false;
                     lk.ssa = false;
                     lk.ssd = false;
+                    lk.miso.clear();
                     awaiting_reply = false;
                 }
                 // Keep the host full-speed while a request/reply is outstanding.
