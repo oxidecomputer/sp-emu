@@ -39,6 +39,7 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
     let mut phase2 = false;
     let mut resp: Vec<u8> = Vec::new();
     let mut total: Option<usize> = None;
+    let mut done = false;
     let mut quiet = 0u32;
     const Q: u32 = 2048;
     for _ in 0..200_000u32 {
@@ -54,18 +55,6 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 lk.cs = false;
                 lk.ssd = true;
                 deasserted = true;
-            }
-        }
-        // Reply ready -> phase 2: re-assert CS so the RoT clocks the response out
-        // as we drain miso.
-        if !phase2 && link.borrow().rot_irq {
-            phase2 = true;
-            let mut lk = link.borrow_mut();
-            lk.cs = true;
-            lk.ssa = true;
-            lk.ssd = false;
-            if dbg() {
-                eprintln!("[rotsvc] phase2 (rot-irq), resp={}B so far", resp.len());
             }
         }
         // Wake the RoT FLEXCOMM8 (irq 59) while the bus is active, as serve() does.
@@ -88,28 +77,75 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 break;
             }
         }
+        // On rot-irq ("reply ready"), re-assert CS so the RoT clocks the reply out,
+        // then collect whatever it produces.
         {
             let mut lk = link.borrow_mut();
+            if !phase2 && lk.rot_irq {
+                phase2 = true;
+                lk.cs = true;
+                lk.ssa = true;
+                lk.ssd = false;
+                if dbg() {
+                    eprintln!("[rotsvc] phase2 (rot-irq)");
+                }
+            }
             while let Some(b) = lk.miso.pop_front() {
-                resp.push(b);
+                // Once the reply is complete (`done`), we're only stepping the RoT
+                // so it observes SSD and deasserts rot-irq — drain+discard anything
+                // it clocks during that wind-down so it can't append trailing junk
+                // to the reply (which would leave the SP unable to fully drain miso
+                // and thus stuck with rot-irq asserted into the next transaction).
+                if !done {
+                    resp.push(b);
+                }
             }
         }
-        // Terminate at the reply's declared length. Header = version(u32) +
-        // body_size(u16); total = 6 + body_size + CRC(2). Length-bounding is
-        // essential: if we hold CS past the reply the RoT keeps clocking out idle
-        // 0x0000 frames forever.
-        if total.is_none() && resp.len() >= 6 {
-            let body_size = u16::from_le_bytes([resp[4], resp[5]]) as usize;
-            let t = 6 + body_size + 2;
-            if t <= 2048 {
-                total = Some(t);
+        // Bound the reply by its declared length. The RoT shifts out leading dummy
+        // 0x0000 frames BEFORE the real reply (full-duplex while receiving the
+        // request, plus idle frames while it works — a caboose read does flash work
+        // and emits many), so we can't assume the header is at resp[0]: the reply
+        // begins at the first nonzero byte (the protocol version, 0x06). Find that
+        // start, then header = version(u32) + body_size(u16); reply spans
+        // start .. start+6+body_size+CRC(2). (The old code parsed resp[4..6]
+        // blindly, read body_size=0 from leading zeros, truncated at 8, and
+        // abandoned slow replies before they arrived.)
+        if total.is_none() {
+            if let Some(start) = resp.iter().position(|&b| b != 0) {
+                if resp.len() >= start + 6 {
+                    let body_size =
+                        u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
+                    let t = start + 6 + body_size + 2;
+                    if body_size + 8 <= 2048 {
+                        total = Some(t);
+                    }
+                }
             }
         }
         if let Some(t) = total {
-            if resp.len() >= t {
-                resp.truncate(t);
-                break;
+            if resp.len() >= t && !done {
+                // Strip the leading dummy frames so the reply we return starts at
+                // the protocol version, exactly as the SP's sprot driver expects.
+                let start = resp.iter().position(|&b| b != 0).unwrap_or(0);
+                resp.drain(..start);
+                resp.truncate(t - start);
+                // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
+                // SSD (FLEXCOMM8 STAT bit5), completes, and deasserts rot-irq —
+                // returning it to idle, ready for the NEXT request. Without this the
+                // RoT spins on the SSD poll forever and never services the following
+                // request (this is what wedged the caboose read after boot-info).
+                let mut lk = link.borrow_mut();
+                lk.cs = false;
+                lk.ssa = false;
+                lk.ssd = true;
+                done = true;
             }
+        }
+        // After signalling end-of-transfer, let the RoT observe SSD and finish
+        // (deassert rot-irq), then stop. The pend_irq above keeps stepping it while
+        // rot-irq is still asserted.
+        if done && !link.borrow().rot_irq {
+            break;
         }
         // Fallback for a malformed/short reply: stop once the RoT idles quietly.
         if phase2 && idled && link.borrow().miso.is_empty() {
