@@ -14,7 +14,9 @@
 
 use crate::host::{HostIo, StdoutHost};
 use std::collections::VecDeque;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::net::UnixStream;
 
 const ETHERTYPE_IPV6: u16 = 0x86DD;
 const IPPROTO_UDP: u8 = 17;
@@ -76,6 +78,10 @@ pub struct Bridge {
     rtt_n: u64,
     rtt_sum_us: u128,
     rtt_max_us: u128,
+    /// host-sp-comms (UART7) bytes to/from the host CPU. In voxel this is the
+    /// propolis IPCC COM port (a unix socket); set `$SP_EMU_HOST_UART` to its
+    /// path. None -> the host UART is unbacked (TX dropped, no RX), as before.
+    host_uart: Option<UnixStream>,
 }
 
 impl Bridge {
@@ -138,6 +144,16 @@ impl Bridge {
             rx: VecDeque::new(),
             n_recv: 0, n_evict: 0, n_pop: 0,
             last_req_at: None, rtt_n: 0, rtt_sum_us: 0, rtt_max_us: 0,
+            host_uart: std::env::var("SP_EMU_HOST_UART").ok().and_then(|p| {
+                match UnixStream::connect(&p) {
+                    Ok(s) => {
+                        let _ = s.set_nonblocking(true);
+                        eprintln!("[bridge] host-uart (UART7/IPCC) connected: {p}");
+                        Some(s)
+                    }
+                    Err(e) => { eprintln!("[bridge] host-uart connect {p} failed: {e}"); None }
+                }
+            }),
         })
     }
 
@@ -406,6 +422,21 @@ impl HostIo for Bridge {
     fn eth_tx(&mut self, frame: &[u8]) { self.handle_tx(frame); }
 
     fn eth_poll(&mut self) { self.poll_host(); }
+
+    fn host_uart_tx(&mut self, byte: u8) {
+        if let Some(s) = self.host_uart.as_mut() {
+            let _ = s.write_all(&[byte]);
+        }
+    }
+
+    fn host_uart_rx(&mut self) -> Option<u8> {
+        let s = self.host_uart.as_mut()?;
+        let mut b = [0u8; 1];
+        match s.read(&mut b) {
+            Ok(1) => Some(b[0]),
+            _ => None, // 0 (EOF) or WouldBlock
+        }
+    }
 
     fn eth_rx(&mut self) -> Option<Vec<u8>> {
         // Control frames (NA/echo, flow 0) are connectivity-critical — serve

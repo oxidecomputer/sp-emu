@@ -455,6 +455,12 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             if txbreak && bus.eth_has_tx() { break; }
         }
         bus.pump_eth(host);
+        // host-sp-comms (UART7 / IPCC + host console): drain the SP's TX to the
+        // host and feed host input into the SP's RX. Pumped here (not cycle-gated)
+        // so it runs even on the idle path — a host byte injects into uart_rx,
+        // collect_irqs pends IRQ 82, and the idle SP wakes (otherwise an idle WFI
+        // would never see the RX and the channel would deadlock).
+        bus.pump_uart(host);
         // Whether the RoT is mid-exchange (a request in flight or still building a
         // reply). When true we must NOT sleep the host below: an idle SP parked in
         // wait_rot_irq would otherwise pay a full idle_ms (~20ms) per poll cycle

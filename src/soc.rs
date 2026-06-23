@@ -121,6 +121,16 @@ pub fn install_peripherals(bus: &mut Bus) {
     // downstream slice panics, so provide a stable fake UID.
     bus.add_device(0x1FF1_E800, 0x10, Box::new(Uid));
 
+    // UART7 (0x4000_7800, IRQ 82): the SP<->host-CPU link the real Hubris
+    // `host_sp_comms` task drives (host-sp-comms / IPCC + the host serial
+    // console). Unmodeled it hits the store/return catch-all below and the channel
+    // is dead. Installed before the catch-all so it owns the UART7 range. TX/RX
+    // bytes ride the shared queues the Bus pumps to/from the host (`pump_uart`);
+    // the RX IRQ is delivered Bus-side (collect_irqs) like the eth DMA, since host
+    // input is asynchronous (not gated by the dev-touched IRQ-poll optimization).
+    let (utx, urx) = (bus.uart_tx.clone(), bus.uart_rx.clone());
+    bus.add_device(0x4000_7800, 0x400, Box::new(Uart7::new(utx, urx)));
+
     // Broad store-and-return model for the rest of the peripheral space (GPIO,
     // SPI, I2C, USART, timers, ...). Added LAST so the specific devices above
     // (RCC/PWR/FLASH, which synthesize ready bits) take precedence. This lets
@@ -149,6 +159,74 @@ impl Mmio for Tim16 {
         *self.regs.entry(0x10).or_insert(0) |= 1; // SR.UIF (update interrupt flag)
         *self.regs.entry(0x00).or_insert(0) &= !1; // CR1.CEN self-clears (one-pulse)
         Some(117)
+    }
+}
+
+/// Shared byte queue between the UART7 device and the host bridge — the same
+/// Rc-sharing idiom as `Spi2Cs`. TX = SP->host, RX = host->SP. `Bus::pump_uart`
+/// drains/fills these against the `HostIo` (the propolis IPCC COM port).
+pub type UartQueue = Rc<RefCell<std::collections::VecDeque<u8>>>;
+
+/// UART7 (0x4000_7800, IRQ 82) — the SP<->host-CPU link the real Hubris
+/// `host_sp_comms` task drives (host-sp-comms / IPCC + the host serial console).
+/// Faithful enough for the unmodified `drv-stm32h7-usart` (verified against the
+/// task's captured register usage): the transmit path is always ready
+/// (TXFNF|TC|TXFE + TEACK|REACK), so a write to TDR pushes straight to the host
+/// TX queue; a byte in the RX queue sets ISR.RXNE and a read of RDR pops it. The
+/// RX interrupt (IRQ 82) is raised Bus-side in `collect_irqs` while the RX queue
+/// is non-empty (level-triggered, matching the H7 FIFO RXFNE the task enables) —
+/// host input is asynchronous, so it can't go through the dev-touched IRQ poll.
+/// The task uses no TX interrupt (it polls TXFNF), so none is modeled.
+pub struct Uart7 {
+    regs: std::collections::HashMap<u32, u32>,
+    tx: UartQueue, // SP -> host
+    rx: UartQueue, // host -> SP
+    dbg: bool,
+}
+impl Uart7 {
+    pub fn new(tx: UartQueue, rx: UartQueue) -> Self {
+        Uart7 {
+            regs: std::collections::HashMap::new(),
+            tx,
+            rx,
+            dbg: std::env::var("SP_EMU_UARTDBG").is_ok(),
+        }
+    }
+}
+impl Mmio for Uart7 {
+    fn name(&self) -> &str { "UART7" }
+    fn read(&mut self, off: u32) -> u32 {
+        let r = off & !3;
+        match r {
+            // ISR: transmit path always ready (TXFNF7|TC6|TXFE23|TEACK21|REACK22);
+            // RXNE/RXFNE(5) set whenever a host byte is waiting in the RX queue.
+            0x1C => {
+                let mut isr = (1 << 7) | (1 << 6) | (1 << 23) | (1 << 21) | (1 << 22);
+                if !self.rx.borrow().is_empty() {
+                    isr |= 1 << 5;
+                }
+                isr
+            }
+            // RDR: pop one received byte (clears RXNE for the next ISR read).
+            0x24 => {
+                let b = self.rx.borrow_mut().pop_front();
+                if self.dbg {
+                    if let Some(b) = b { eprintln!("[uart7] RX {:#04x}", b); }
+                }
+                b.map(|b| b as u32).unwrap_or(0)
+            }
+            _ => *self.regs.get(&r).unwrap_or(&0),
+        }
+    }
+    fn write(&mut self, off: u32, val: u32) {
+        let r = off & !3;
+        if r == 0x28 {
+            // TDR: a transmitted byte -> the host TX queue.
+            self.tx.borrow_mut().push_back(val as u8);
+            if self.dbg { eprintln!("[uart7] TX {:#04x}", val & 0xff); }
+        } else {
+            self.regs.insert(r, val);
+        }
     }
 }
 

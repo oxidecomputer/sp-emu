@@ -401,7 +401,7 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
         if diff.is_none() { // interrupts off in diff mode (deterministic lockstep)
             cpu.maybe_tick(&mut bus);
             cpu.maybe_interrupt(&mut bus);
-            if cpu.cycles & 0xFFF == 0 { bus.pump_eth(host.as_mut()); }
+            if cpu.cycles & 0xFFF == 0 { bus.pump_eth(host.as_mut()); bus.pump_uart(host.as_mut()); }
         }
     }
 

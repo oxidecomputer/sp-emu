@@ -64,6 +64,12 @@ pub struct Bus {
     // because the DMA engine must read/write descriptor rings + packet buffers
     // that live in RAM, which only the Bus can reach.
     eth: EthDma,
+    // host-sp-comms (UART7) byte queues, shared with the `Uart7` Mmio device. The
+    // host bridge pumps them to/from the host (the propolis IPCC COM port) via
+    // `pump_uart`; the RX IRQ is raised in `collect_irqs` while `uart_rx` is
+    // non-empty (host input is async, outside the dev-touched IRQ poll).
+    pub uart_tx: crate::soc::UartQueue, // SP -> host
+    pub uart_rx: crate::soc::UartQueue, // host -> SP
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
@@ -72,6 +78,7 @@ const SCB_ICSR: u32 = 0xE000_ED04;
 const ETH_BASE: u32 = 0x4002_8000;
 const ETH_END: u32 = 0x4002_A000;
 const ETH_IRQ: u16 = 61;
+const UART7_IRQ: u16 = 82; // host-sp-comms USART (UART7) global interrupt (H7)
 // Register offsets relative to ETH_BASE.
 const MACMDIOAR: u32 = 0x0200; // MDIO address/control; MB (bit0) = busy, self-clears
 const DMAMR: u32 = 0x1000; // DMA mode; SWR (bit0) = soft reset, self-clears
@@ -112,7 +119,9 @@ impl Bus {
             .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
         Bus { rams: Vec::new(), devs: Vec::new(), unmapped_reads: 0, unmapped_writes: 0, log_unmapped: true, watch, cur_pc: 0, cur_cyc: 0, mmio_hit: false, rec: false, writes: Vec::new(),
             nvic_en: [0; 8], nvic_pend: [0; 8], nvic_prio: [0; 256], pend_pendsv: false,
-            dev_touched: false, eth: EthDma::default() }
+            dev_touched: false, eth: EthDma::default(),
+            uart_tx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
+            uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())) }
     }
 
     /// Consume a pending PendSV (the deferred context-switch request).
@@ -396,6 +405,24 @@ impl Bus {
         self.nvic_pend[(irq / 32) as usize] |= 1 << (irq % 32);
     }
 
+
+    /// Bridge the host-sp-comms UART (UART7) to the host: drain the SP's TX queue
+    /// out to the host, then feed any host input into the SP's RX queue. Mirrors
+    /// `pump_eth` and is called on the same cadence. The RX IRQ is raised in
+    /// `collect_irqs` (level-triggered while `uart_rx` is non-empty).
+    pub fn pump_uart(&mut self, host: &mut dyn crate::host::HostIo) {
+        loop {
+            let b = self.uart_tx.borrow_mut().pop_front();
+            match b {
+                Some(byte) => host.host_uart_tx(byte),
+                None => break,
+            }
+        }
+        while let Some(byte) = host.host_uart_rx() {
+            self.uart_rx.borrow_mut().push_back(byte);
+        }
+    }
+
     pub fn collect_irqs(&mut self) {
         // Poll devices only if one was accessed since the last collect — no modeled
         // device raises an IRQ without an MMIO access, so this is exact, not lossy,
@@ -417,6 +444,14 @@ impl Bus {
         if self.eth.irq {
             self.eth.irq = false;
             self.nvic_pend[(ETH_IRQ / 32) as usize] |= 1 << (ETH_IRQ % 32);
+        }
+        // UART7 (host-sp-comms) RX: like the eth DMA, host input is asynchronous
+        // (not gated by the dev-touched poll). Keep IRQ 82 pending while a host
+        // byte waits — level-triggered, matching the H7 FIFO RXFNE the task
+        // enables; NVIC enable gates actual delivery, and the task's ISR drains
+        // RDR (popping `uart_rx`), which clears it.
+        if !self.uart_rx.borrow().is_empty() {
+            self.nvic_pend[(UART7_IRQ / 32) as usize] |= 1 << (UART7_IRQ % 32);
         }
     }
 
