@@ -26,7 +26,6 @@ const ICMP6_ECHO_REPLY: u8 = 129;
 const ICMP6_NEIGHBOR_SOLICIT: u8 = 135;
 const ICMP6_NEIGHBOR_ADVERT: u8 = 136;
 const SP_PORT: u16 = 11111; // control_plane_agent's MGS socket
-const MGS_PORT: u16 = 22222;
 const EREPORT_PORT: u16 = 57005; // snitch's ereport socket (SP side)
 const EREPORT_OFFSET: u16 = 11100; // host ereport port = mgmt port + this (33300->44400)
 const VLAN_TPID: u16 = 0x8100;
@@ -309,7 +308,7 @@ impl Bridge {
             // Inject with the MGS client's REAL ephemeral source port (src.port())
             // so the SP echoes it back as the reply's dest port — that's how
             // handle_udp_tx routes each reply to the right client. (Was a fixed
-            // MGS_PORT, which collapsed all clients onto one port.)
+            // 22222, which collapsed all clients onto one port.)
             let frame = self.build_udp6(vid, sp_mac, sp_ip, sp_port, src.port(), &data);
             self.push_rx(src.port(), frame);
         }

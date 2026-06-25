@@ -606,16 +606,16 @@ impl Cpu {
             (a, self.opval(&ops[2])?)
         };
         let cin = self.c as u32;
-        let (res, setflags_arith): (u32, Option<(u32, u32)>) = match op {
-            Alu::Add => (a.wrapping_add(b), Some((a, b))),
-            Alu::Sub => (a.wrapping_sub(b), None),
-            Alu::Rsb => (b.wrapping_sub(a), None),
-            Alu::Adc => (a.wrapping_add(b).wrapping_add(cin), Some((a, b))),
-            Alu::Sbc => (a.wrapping_sub(b).wrapping_sub(1 - cin), None),
-            Alu::And => (a & b, None),
-            Alu::Orr => (a | b, None),
-            Alu::Eor => (a ^ b, None),
-            Alu::Bic => (a & !b, None),
+        let res: u32 = match op {
+            Alu::Add => a.wrapping_add(b),
+            Alu::Sub => a.wrapping_sub(b),
+            Alu::Rsb => b.wrapping_sub(a),
+            Alu::Adc => a.wrapping_add(b).wrapping_add(cin),
+            Alu::Sbc => a.wrapping_sub(b).wrapping_sub(1 - cin),
+            Alu::And => a & b,
+            Alu::Orr => a | b,
+            Alu::Eor => a ^ b,
+            Alu::Bic => a & !b,
         };
         self.write_reg(rd, res);
         if self.cur_setflags {
@@ -628,7 +628,6 @@ impl Cpu {
                 Alu::Sbc => { let b2 = b.wrapping_add(1 - cin); self.flags_sub(a, b2); }
                 _ => self.set_nz(res),
             }
-            let _ = setflags_arith;
         }
         Ok(())
     }

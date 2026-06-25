@@ -398,7 +398,6 @@ impl Bus {
         true
     }
 
-    /// Poll every device for a raised interrupt and set it pending in the NVIC.
     /// Pend an external NVIC IRQ (used by the sprot bridge to wake the RoT's
     /// FLEXCOMM8 slave on a chip-select assert).
     pub fn pend_irq(&mut self, irq: u16) {

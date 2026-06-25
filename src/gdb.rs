@@ -271,12 +271,9 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         rc.wfi_throttle = false;
         let t = std::time::Instant::now();
         let dbgtrap = crate::sprot::dbg();
-        let mut last_pbtrap = u32::MAX;
         for _ in 0..40_000_000u64 {
             if let Err(t) = rc.step(rb, host) {
-                let tpc = match &t { crate::cpu::Trap::Unimplemented { pc, .. } | crate::cpu::Trap::Decode { pc } | crate::cpu::Trap::Halt { pc, .. } => *pc };
-                if dbgtrap && tpc != last_pbtrap {
-                    last_pbtrap = tpc;
+                if dbgtrap {
                     eprintln!("[rottrap-preboot] {:?}", t);
                 }
                 break;
