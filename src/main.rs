@@ -27,6 +27,7 @@ mod soc;
 mod lpc55;
 mod sprot;
 mod rot_service;
+mod i2c_bridge;
 
 use anyhow::{bail, Context, Result};
 use cpu::{Cpu, Trap};
@@ -62,6 +63,14 @@ fn main() -> Result<()> {
         Some("gdb") => cmd_gdb(&args[1..]),
         Some("rot") => cmd_rot(&args[1..]),
         Some("rot-serve") => cmd_rot_serve(&args[1..]),
+        Some("i2c-sniff") => {
+            let addr = args.get(1).map(|s| s.as_str()).unwrap_or("[::1]:9100");
+            i2c_bridge::serve(addr)
+        }
+        Some("i2c-device") => {
+            let addr = args.get(1).map(|s| s.as_str()).unwrap_or("[::1]:9100");
+            i2c_bridge::serve_device(addr, args.get(2..).unwrap_or(&[]))
+        }
         // Legacy: `sp-emu <image.bin> [max]` boots a flat image without a slot.
         Some(p) if std::path::Path::new(p).exists() => {
             let max = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
@@ -76,6 +85,9 @@ fn main() -> Result<()> {
             eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot");
             eprintln!("  sp-emu gdb [a|b] [preboot]       boot a slot, then serve a GDB stub for humility");
             eprintln!("  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone");
+            eprintln!("  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here");
+            eprintln!("  sp-emu i2c-device [addr] [spec]  act AS I2C devices for an emulator (SP_EMU_I2C_DEVICE);");
+            eprintln!("                                   spec: addr/reg=val  or  addr@eeprom-file");
             Ok(())
         }
     }

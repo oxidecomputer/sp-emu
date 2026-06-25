@@ -85,8 +85,16 @@ pub fn install_peripherals(bus: &mut Bus) {
     // One shared sensor environment (scriptable physical values) across controllers.
     let sensors = SensorEnv::from_env();
     let vpd = build_vpd_eeprom();
-    for (base, ev_irq) in [(0x4000_5400, 31), (0x4000_5800, 33), (0x4000_5C00, 72), (0x5800_1C00, 95)] {
-        bus.add_device(base, 0x400, Box::new(I2c::new(ev_irq, sensors.clone(), vpd.clone())));
+    // One shared I2C bridge socket (SP_EMU_I2C_BRIDGE sniff / SP_EMU_I2C_DEVICE
+    // delegate) carries every bus.
+    let bridge = crate::i2c_bridge::I2cBridge::from_env();
+    for (i, (base, ev_irq)) in
+        [(0x4000_5400u32, 31u16), (0x4000_5800, 33), (0x4000_5C00, 72), (0x5800_1C00, 95)]
+            .into_iter()
+            .enumerate()
+    {
+        let dev = I2c::new(ev_irq, sensors.clone(), vpd.clone(), bridge.clone(), (i + 1) as u8);
+        bus.add_device(base, 0x400, Box::new(dev));
     }
 
     // STM32H7 HASH (0x4802_1400, irq 80): gimlet's hash_driver starts a digest
@@ -1012,11 +1020,19 @@ pub struct I2c {
     writing: bool,   // current phase is a master write (register-pointer set)
     wrote_ptr: bool, // captured the register-pointer byte this write phase
     eeprom: Rc<Vec<u8>>, // AT24CSW080 VPD/FRUID backing store (1024 bytes)
+    bridge: crate::i2c_bridge::I2cBridge, // SP_EMU_I2C_BRIDGE sniff / _DEVICE delegate (no-op when off)
+    bus: u8,         // 1-based bus number (i2c1..i2c4) for the trace
 }
 impl I2c {
-    pub fn new(ev_irq: u16, env: Sensors, eeprom: Rc<Vec<u8>>) -> Self {
+    pub fn new(
+        ev_irq: u16,
+        env: Sensors,
+        eeprom: Rc<Vec<u8>>,
+        bridge: crate::i2c_bridge::I2cBridge,
+        bus: u8,
+    ) -> Self {
         I2c { regs: std::collections::HashMap::new(), ev_irq, active: false, env,
-            addr: 0, reg_ptr: 0, read_idx: 0, writing: false, wrote_ptr: false, eeprom }
+            addr: 0, reg_ptr: 0, read_idx: 0, writing: false, wrote_ptr: false, eeprom, bridge, bus }
     }
     /// Accurate device-register model, keyed by I2C address. Returns the 16-bit
     /// value of `reg` (drivers read big-endian: high byte first; single-byte reads
@@ -1066,6 +1082,12 @@ impl Mmio for I2c {
                 if crate::dbg::vpd() {
                     eprintln!("[i2c{:#x}] RD RXDR addr={:#04x} ptr={} ridx={}", self.ev_irq, self.addr, self.reg_ptr, self.read_idx);
                 }
+                // DELEGATE (SP_EMU_I2C_DEVICE): a local device server may answer
+                // this read; `None` falls through to the built-in model below.
+                if let Some(b) = self.bridge.on_read(self.bus, self.addr, self.reg_ptr, self.read_idx) {
+                    self.read_idx = self.read_idx.wrapping_add(1);
+                    return b as u32;
+                }
                 // AT24CSW080 (0x50..0x53): the EEPROM folds address bits A9:A8 into
                 // the I2C device address and uses a single-byte word pointer (the
                 // driver writes addr-low, then reads N bytes with auto-increment).
@@ -1079,11 +1101,13 @@ impl Mmio for I2c {
                         eprintln!("[vpd] rd addr={:#04x} ptr={} ridx={} off={} -> {:#04x}",
                             self.addr, self.reg_ptr, self.read_idx, idx, byte);
                     }
+                    self.bridge.on_read_served(self.bus, self.addr, self.reg_ptr, self.read_idx, byte);
                     self.read_idx = self.read_idx.wrapping_add(1);
                     return byte as u32;
                 }
                 let v = self.device_reg(self.addr, self.reg_ptr).unwrap_or(0);
                 let byte = if self.read_idx == 0 { (v >> 8) & 0xFF } else { v & 0xFF };
+                self.bridge.on_read_served(self.bus, self.addr, self.reg_ptr, self.read_idx, byte as u8);
                 self.read_idx = self.read_idx.wrapping_add(1);
                 byte as u32
             }
@@ -1095,7 +1119,9 @@ impl Mmio for I2c {
             eprintln!("[i2c4] WR off={:#05x} val={:#010x}", off & !3, val);
         }
         if off & !3 == 0x28 { // TXDR: first byte of a write phase is the register pointer
-            if self.writing && !self.wrote_ptr { self.reg_ptr = (val & 0xFF) as u8; self.wrote_ptr = true; }
+            let byte = (val & 0xFF) as u8;
+            if self.writing && !self.wrote_ptr { self.reg_ptr = byte; self.wrote_ptr = true; }
+            self.bridge.on_write(self.bus, self.addr, byte);
             return;
         }
         if off & !3 == 0x04 { // CR2: START begins a master transfer, STOP ends it.
@@ -1113,6 +1139,7 @@ impl Mmio for I2c {
                     eprintln!("[i2c{:#x}] START addr={:#04x} rd={} nbytes={}", self.ev_irq, self.addr,
                         (val >> 10) & 1, (val >> 16) & 0xFF);
                 }
+                self.bridge.on_start(self.bus, self.addr, val & (1 << 10) != 0, (val >> 16) & 0xFF);
             }
             if val & (1 << 14) != 0 { self.active = false; } // STOP
             // START/STOP are command bits that auto-clear in hardware; store them
