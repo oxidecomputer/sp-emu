@@ -512,11 +512,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                         // A RoT task that hits an unimplemented/undecodable instruction
                         // would otherwise re-fault every quantum, silently wedged (the
                         // kernel never sees a fault exception here). Surface it once.
-                        let tpc = match &t {
-                            crate::cpu::Trap::Unimplemented { pc, .. } => *pc,
-                            crate::cpu::Trap::Decode { pc } => *pc,
-                            crate::cpu::Trap::Halt { pc, .. } => *pc,
-                        };
+                        let tpc = t.pc();
                         if crate::sprot::dbg() && tpc != last_rottrap {
                             last_rottrap = tpc;
                             match &t {

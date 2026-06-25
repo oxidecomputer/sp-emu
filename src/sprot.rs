@@ -17,6 +17,14 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+/// The RoT's FLEXCOMM8 RX FIFO depth in bytes (8 frames × 2 bytes); the SP-side
+/// SPI master mirrors the same TX-FIFO depth. Bytes clocked past it are dropped on
+/// real hardware, so the bridge bounds both `mosi`/`miso` buffers here.
+const SPROT_FIFO_BYTES: usize = 16;
+
+/// EXTI line-3 bit (PE3 = ROT_IRQ), surfaced on the SP's EXTI CPUPR1 register.
+const ROT_IRQ_EXTI_BIT: u32 = 1 << 3;
+
 #[derive(Default)]
 pub struct SprotLink {
     pub mosi: VecDeque<u8>, // SP -> RoT (request bytes the master clocks out)
@@ -53,7 +61,9 @@ pub struct SprotLink {
 }
 pub type Link = Rc<RefCell<SprotLink>>;
 
-pub fn dbg() -> bool { std::env::var("SP_EMU_SPROTDBG").is_ok() }
+// The sprot debug flag (memoized in `dbg.rs`); re-exported so the existing
+// `crate::sprot::dbg()` call sites (lpc55/soc/gdb) and this module keep working.
+pub use crate::dbg::sprot as dbg;
 
 // One-shot RoT instruction-trace window: armed when the first sprot request frame
 // is read, consumed by the gdb serve loop to log the RoT pc for N instructions so
@@ -61,7 +71,9 @@ pub fn dbg() -> bool { std::env::var("SP_EMU_SPROTDBG").is_ok() }
 static ROT_TRACE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 pub fn arm_rot_trace(n: u32) {
     use std::sync::atomic::Ordering;
-    eprintln!("[rottr] ARM called n={}", n);
+    if dbg() {
+        eprintln!("[rottr] ARM called n={}", n);
+    }
     let _ = ROT_TRACE.compare_exchange(0, n, Ordering::SeqCst, Ordering::SeqCst);
 }
 pub fn rot_trace_tick() -> bool {
@@ -136,7 +148,7 @@ impl Mmio for SpiMaster {
                 // (when it doesn't see rot-irq) pile unbounded bytes into `mosi`,
                 // and the RoT's `while has_entry { read_fifo }` drain never ends —
                 // the receive loop livelocks and never delivers the request.
-                if lk.mosi.len() < 16 { lk.mosi.push_back((val & 0xFF) as u8); }
+                if lk.mosi.len() < SPROT_FIFO_BYTES { lk.mosi.push_back((val & 0xFF) as u8); }
                 let inb = lk.miso.pop_front().unwrap_or(0);
                 drop(lk);
                 self.rx.push_back(inb);
@@ -176,7 +188,7 @@ impl Mmio for RotSpiSlave {
             0xE04 => { // FIFOSTAT: TXNOTFULL(5) until 8 frames (16 bytes) queued,
                        // RXNOTEMPTY(6) once a full 16-bit frame (>=2 bytes) is available.
                 let lk = self.link.borrow();
-                (if lk.miso.len() < 16 { 1 << 5 } else { 0 })
+                (if lk.miso.len() < SPROT_FIFO_BYTES { 1 << 5 } else { 0 })
                     | (if lk.mosi.len() >= 2 { 1 << 6 } else { 0 })
             }
             0xE30 => { // FIFORD: 16-bit frame (RXDATA[15:0]) + SOT(20). The SP clocks
@@ -312,8 +324,8 @@ impl Mmio for SpExti {
         let off = off & !3;
         if off == 0x88 {
             // CPUPR1: bit 3 (EXTI line 3 = PE3 = ROT_IRQ) from the pending latch.
-            let p = if self.link.borrow().sp_rot_irq_pending { 1 << 3 } else { 0 };
-            return (self.regs.get(&off).copied().unwrap_or(0) & !(1 << 3)) | p;
+            let p = if self.link.borrow().sp_rot_irq_pending { ROT_IRQ_EXTI_BIT } else { 0 };
+            return (self.regs.get(&off).copied().unwrap_or(0) & !ROT_IRQ_EXTI_BIT) | p;
         }
         *self.regs.get(&off).unwrap_or(&0)
     }
@@ -321,7 +333,7 @@ impl Mmio for SpExti {
         let off = off & !3;
         if off == 0x88 {
             // Write-1-clear the ROT_IRQ pending latch.
-            if val & (1 << 3) != 0 { self.link.borrow_mut().sp_rot_irq_pending = false; }
+            if val & ROT_IRQ_EXTI_BIT != 0 { self.link.borrow_mut().sp_rot_irq_pending = false; }
             return;
         }
         self.regs.insert(off, val);

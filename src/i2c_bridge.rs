@@ -161,12 +161,20 @@ fn env_addr(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
 }
 
+/// Parse a delegate device's reply byte: `0xNN` hex, or (tolerated) decimal.
+/// Kept distinct from [`parse_hex`] because of that decimal fallback.
 fn parse_byte(s: &str) -> Option<u8> {
     let s = s.trim();
     match s.strip_prefix("0x") {
         Some(h) => u8::from_str_radix(h, 16).ok(),
         None => s.parse().ok(),
     }
+}
+
+/// Parse a hex number with an optional `0x` prefix (whitespace trimmed). Shared by
+/// the `i2c-device` spec + reply-line parsers.
+fn parse_hex(s: &str) -> Option<u32> {
+    u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
 }
 
 /// Annotate a 7-bit I2C address with the device behind it (mirrors `soc::I2c`).
@@ -229,18 +237,17 @@ enum Override {
 ///   `<addr>/<reg>=<val>`   e.g. `0x48/0x00=0x2800`  (TMP117 temp register)
 ///   `<addr>@<file>`        e.g. `0x50@my-vpd.bin`   (serve a file as the EEPROM)
 fn parse_override(s: &str) -> anyhow::Result<Override> {
-    let hex = |x: &str| u32::from_str_radix(x.trim().trim_start_matches("0x"), 16);
     if let Some((addr, file)) = s.split_once('@') {
-        let addr = hex(addr).map_err(|_| anyhow::anyhow!("bad addr in {s:?}"))? as u8;
+        let addr = parse_hex(addr).ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))? as u8;
         let bytes = std::fs::read(file.trim()).map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
         return Ok(Override::Image { addr, bytes });
     }
     let (lhs, val) = s.split_once('=').ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val` or `addr@file`"))?;
     let (addr, reg) = lhs.split_once('/').ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val`"))?;
     Ok(Override::Reg {
-        addr: hex(addr).map_err(|_| anyhow::anyhow!("bad addr in {s:?}"))? as u8,
-        reg: hex(reg).map_err(|_| anyhow::anyhow!("bad reg in {s:?}"))? as u8,
-        val: hex(val).map_err(|_| anyhow::anyhow!("bad val in {s:?}"))? as u16,
+        addr: parse_hex(addr).ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))? as u8,
+        reg: parse_hex(reg).ok_or_else(|| anyhow::anyhow!("bad reg in {s:?}"))? as u8,
+        val: parse_hex(val).ok_or_else(|| anyhow::anyhow!("bad val in {s:?}"))? as u16,
     })
 }
 
@@ -291,8 +298,7 @@ pub fn serve_device(addr: &str, specs: &[String]) -> anyhow::Result<()> {
             if f.first() != Some(&"R") || f.len() < 5 {
                 continue;
             }
-            let pb = |x: &str| u32::from_str_radix(x.trim_start_matches("0x"), 16).ok();
-            let (addr, reg, idx) = match (pb(f[2]), pb(f[3]), f[4].parse::<usize>().ok()) {
+            let (addr, reg, idx) = match (parse_hex(f[2]), parse_hex(f[3]), f[4].parse::<usize>().ok()) {
                 (Some(a), Some(r), Some(i)) => (a as u8, r as u8, i),
                 _ => continue,
             };

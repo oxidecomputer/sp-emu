@@ -13,7 +13,39 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 
-fn dbg() -> bool { std::env::var("SP_EMU_SPROTDBG").is_ok() }
+use crate::dbg::sprot as dbg;
+
+/// Upper bound on a decoded sprot reply (header + body + CRC); a parsed
+/// `body_size` past this is treated as not-yet-complete rather than trusted.
+const MAX_RESP: usize = 2048;
+/// Max length of a length-prefixed frame on the RoT-service socket; a longer
+/// declared length is a desync, so we drop the connection.
+const MAX_FRAME: usize = 4096;
+
+/// Step the RoT core up to `n` instructions, stopping early on a CPU error or when
+/// the core signals idle (`idle_skip`, which it clears). Returns whether it idled.
+/// Shared by `rot_exchange`'s grind loop and the idle keep-alive loop. (The preboot
+/// loop deliberately does NOT stop on idle, so it doesn't use this.)
+fn run_quantum(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, n: u32) -> bool {
+    for _ in 0..n {
+        if rc.step(rb, host).is_err() {
+            break;
+        }
+        rc.maybe_tick(rb);
+        rc.maybe_interrupt(rb);
+        if rc.idle_skip > 0 {
+            rc.idle_skip = 0;
+            return true;
+        }
+    }
+    false
+}
+
+/// Index of the first nonzero byte (the sprot reply starts after leading dummy
+/// frames / clock padding).
+fn first_nonzero(buf: &[u8]) -> Option<usize> {
+    buf.iter().position(|&b| b != 0)
+}
 
 /// Drive the RoT through ONE sprot transaction: clock the request in (phase 1),
 /// let it process + assert rot-irq, then clock the response out (phase 2). This
@@ -44,7 +76,7 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
     const Q: u32 = 2048;
     for it in 0..200_000u32 {
         if dbg() && it > 0 && it % 40_000 == 0 {
-            let nz = resp.iter().position(|&b| b != 0);
+            let nz = first_nonzero(&resp);
             let head: String = match nz {
                 Some(s) => resp[s..].iter().take(20).map(|b| format!("{b:02x}")).collect(),
                 None => String::from("(all-zero)"),
@@ -73,19 +105,7 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 rb.pend_irq(59);
             }
         }
-        let mut idled = false;
-        for _ in 0..Q {
-            if rc.step(rb, host).is_err() {
-                break;
-            }
-            rc.maybe_tick(rb);
-            rc.maybe_interrupt(rb);
-            if rc.idle_skip > 0 {
-                rc.idle_skip = 0;
-                idled = true;
-                break;
-            }
-        }
+        let idled = run_quantum(rc, rb, host, Q);
         // On rot-irq ("reply ready"), enter phase 2: assert CS for the reply-read
         // transaction, EXACTLY as the SP does on seeing rot-irq. Then `continue` so
         // the RoT gets stepped at least once with CS asserted before we collect or
@@ -133,12 +153,12 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         // blindly, read body_size=0 from leading zeros, truncated at 8, and
         // abandoned slow replies before they arrived.)
         if phase2 && total.is_none() {
-            if let Some(start) = resp.iter().position(|&b| b != 0) {
+            if let Some(start) = first_nonzero(&resp) {
                 if resp.len() >= start + 6 {
                     let body_size =
                         u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
                     let t = start + 6 + body_size + 2;
-                    if body_size + 8 <= 2048 {
+                    if body_size + 8 <= MAX_RESP {
                         total = Some(t);
                     }
                 }
@@ -148,7 +168,7 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
             if resp.len() >= t && !done {
                 // Strip the leading dummy frames so the reply we return starts at
                 // the protocol version, exactly as the SP's sprot driver expects.
-                let start = resp.iter().position(|&b| b != 0).unwrap_or(0);
+                let start = first_nonzero(&resp).unwrap_or(0);
                 resp.drain(..start);
                 resp.truncate(t - start);
                 // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
@@ -243,17 +263,7 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     // No request in flight: keep the RoT alive in its receive loop.
-                    for _ in 0..2048 {
-                        if rc.step(&mut rb, &mut host).is_err() {
-                            break;
-                        }
-                        rc.maybe_tick(&mut rb);
-                        rc.maybe_interrupt(&mut rb);
-                        if rc.idle_skip > 0 {
-                            rc.idle_skip = 0;
-                            break;
-                        }
-                    }
+                    run_quantum(&mut rc, &mut rb, &mut host, 2048);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
@@ -280,7 +290,7 @@ fn conn_loop(mut s: TcpStream, req_tx: mpsc::Sender<Job>) {
             break;
         }
         let n = u32::from_le_bytes(lenb) as usize;
-        if n > 4096 {
+        if n > MAX_FRAME {
             break;
         }
         let mut req = vec![0u8; n];
@@ -341,7 +351,7 @@ impl RotClient {
                 let mut lb = [0u8; 4];
                 if s.read_exact(&mut lb).is_ok() {
                     let n = u32::from_le_bytes(lb) as usize;
-                    if n <= 4096 {
+                    if n <= MAX_FRAME {
                         let mut resp = vec![0u8; n];
                         if s.read_exact(&mut resp).is_ok() {
                             return resp;

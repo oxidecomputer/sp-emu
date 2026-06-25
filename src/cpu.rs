@@ -21,6 +21,17 @@ pub enum Trap {
     Halt { pc: u32, why: &'static str },
 }
 
+impl Trap {
+    /// The program counter at which the trap occurred (every variant carries one).
+    pub fn pc(&self) -> u32 {
+        match self {
+            Trap::Decode { pc }
+            | Trap::Unimplemented { pc, .. }
+            | Trap::Halt { pc, .. } => *pc,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode { Thread, Handler }
 

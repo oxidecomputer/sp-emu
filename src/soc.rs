@@ -238,6 +238,29 @@ impl Mmio for Uart7 {
     }
 }
 
+/// The KSZ8463 switch's SPI register model, shared by the gimlet's net `Spi4` and
+/// the sequencer-multiplexed `Spi2`. Mostly store/return, except CIDER (chip id) =
+/// 0x8452 and IADR5's high word = 0x4000, both of which the driver polls.
+#[derive(Default)]
+struct Ksz8463 {
+    regs: std::collections::HashMap<u16, u16>,
+}
+impl Ksz8463 {
+    fn read(&self, addr: u16) -> u16 {
+        match addr {
+            0x0C => 0x8452, // CIDER (register 0x000): KSZ8463 chip id — driver requires this
+            // IADR5 (register 0x02E, packed 0x2F0): high word of an indirect-access
+            // MIB-counter read. read_mib_counter() spin-loops here until bit 14
+            // ("valid") is set; counter value 0 → driver returns Count(0).
+            0x2F0 => 0x4000,
+            _ => *self.regs.get(&addr).unwrap_or(&0),
+        }
+    }
+    fn write(&mut self, addr: u16, val: u16) {
+        self.regs.insert(addr, val);
+    }
+}
+
 /// SPI4 (0x40013400) with an attached KSZ8463 switch slave. `net` talks to the
 /// switch over SPI: a 4-byte exchange [addr_be_hi, addr_be_lo, d0, d1] where the
 /// MSB of byte0 means write. Reads return the 16-bit register (little-endian) in
@@ -247,7 +270,7 @@ impl Mmio for Uart7 {
 /// which the driver checks before proceeding.
 pub struct Spi4 {
     regs: std::collections::HashMap<u32, u32>,
-    ksz: std::collections::HashMap<u16, u16>,
+    ksz: Ksz8463,
     rx: Vec<u8>,
     idx: u32,      // byte index within the current SPI transaction
     cmd: u16,      // accumulated command word (address + write bit)
@@ -257,18 +280,8 @@ pub struct Spi4 {
 }
 impl Spi4 {
     pub fn new() -> Self {
-        Spi4 { regs: std::collections::HashMap::new(), ksz: std::collections::HashMap::new(),
+        Spi4 { regs: std::collections::HashMap::new(), ksz: Ksz8463::default(),
             rx: Vec::new(), idx: 0, cmd: 0, is_write: false, val: 0, dlo: 0 }
-    }
-    fn ksz_read(&self, addr: u16) -> u16 {
-        match addr {
-            0x0C => 0x8452, // CIDER (register 0x000): KSZ8463 chip id — driver requires this
-            // IADR5 (register 0x02E, packed 0x2F0): high word of an indirect-access
-            // MIB-counter read. read_mib_counter() spin-loops here until bit 14
-            // ("valid") is set; counter value 0 → driver returns Count(0).
-            0x2F0 => 0x4000,
-            _ => *self.ksz.get(&addr).unwrap_or(&0),
-        }
     }
     /// Clock one byte out (and one in) of the KSZ, by position in the 4-byte xfer.
     fn xfer_byte(&mut self, b: u8) -> u8 {
@@ -279,13 +292,13 @@ impl Spi4 {
             1 => {
                 self.cmd |= b as u16;
                 self.is_write = self.cmd & 0x8000 != 0;
-                self.val = self.ksz_read(self.cmd & 0x7FFF);
+                self.val = self.ksz.read(self.cmd & 0x7FFF);
                 0
             }
             2 => if self.is_write { self.dlo = b; 0 } else { (self.val & 0xFF) as u8 },
             3 => {
                 if self.is_write {
-                    self.ksz.insert(self.cmd & 0x7FFF, ((b as u16) << 8) | self.dlo as u16);
+                    self.ksz.write(self.cmd & 0x7FFF, ((b as u16) << 8) | self.dlo as u16);
                     0
                 } else { (self.val >> 8) as u8 }
             }
@@ -293,16 +306,28 @@ impl Spi4 {
         }
     }
 }
+/// Synthesize the STM32H7 SPI `SR` for the simple transfer model the SPI device
+/// blocks share: TXP always set (tx space available), RXPLVL when rx has data, and
+/// EOT+TXC once `done_count` clocked bytes reach the CR2 `tsize` (`done_count` is
+/// each block's `idx`, except Spi5's `xfer_cnt`).
+fn spi_sr(done_count: u32, tsize: u32, rx_nonempty: bool) -> u32 {
+    let mut sr = 1 << 1; // TXP: tx space always available
+    if rx_nonempty {
+        sr |= 1 << 13; // RXPLVL != 0: rx data available
+    }
+    if done_count >= tsize.max(1) {
+        sr |= (1 << 3) | (1 << 12); // EOT + TXC
+    }
+    sr
+}
+
 impl Mmio for Spi4 {
     fn name(&self) -> &str { "SPI4" }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x14 => { // SR
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
-                let mut sr = 1 << 1; // TXP: tx space always available
-                if !self.rx.is_empty() { sr |= 1 << 13; } // RXPLVL != 0: rx data available
-                if self.idx >= tsize.max(1) { sr |= (1 << 3) | (1 << 12); } // EOT + TXC
-                sr
+                spi_sr(self.idx, tsize, !self.rx.is_empty())
             }
             0x30 => if self.rx.is_empty() { 0 } else { self.rx.remove(0) as u32 }, // RXDR: pop
             0x20 => 0, // TXDR read (only happens via byte-write RMW) — harmless
@@ -416,10 +441,7 @@ impl Mmio for Vsc7448 {
         match off & !3 {
             0x14 => { // SR
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
-                let mut sr = 1 << 1; // TXP: tx space always available
-                if !self.rx.is_empty() { sr |= 1 << 13; } // RXPLVL != 0: rx data available
-                if self.idx >= tsize.max(1) { sr |= (1 << 3) | (1 << 12); } // EOT + TXC
-                sr
+                spi_sr(self.idx, tsize, !self.rx.is_empty())
             }
             0x30 => if self.rx.is_empty() { 0 } else { self.rx.remove(0) as u32 }, // RXDR: pop
             0x20 => 0, // TXDR read (only via byte-write RMW) — harmless
@@ -461,7 +483,7 @@ pub struct Spi2 {
     seq_cmd: u8,
     seq_addr: u16,
     // KSZ8463 (same model as Spi4)
-    ksz: std::collections::HashMap<u16, u16>,
+    ksz: Ksz8463,
     kcmd: u16, kwrite: bool, kval: u16, kdlo: u8,
     dbg_txn: u32,
 }
@@ -469,7 +491,7 @@ impl Spi2 {
     pub fn new(cs: Spi2Cs) -> Self {
         Spi2 { regs: Default::default(), cs, target: 0, idx: 0, rx: Vec::new(),
             seq: Default::default(), seq_cmd: 0, seq_addr: 0,
-            ksz: Default::default(), kcmd: 0, kwrite: false, kval: 0, kdlo: 0, dbg_txn: 0 }
+            ksz: Ksz8463::default(), kcmd: 0, kwrite: false, kval: 0, kdlo: 0, dbg_txn: 0 }
     }
     fn seq_read(&self, addr: u16) -> u8 {
         match addr {
@@ -478,9 +500,6 @@ impl Spi2 {
             0x13 => 0x00,                              // PWR_CTRL → 0 (A2 resting)
             a => *self.seq.get(&a).unwrap_or(&0),
         }
-    }
-    fn ksz_read(&self, addr: u16) -> u16 {
-        match addr { 0x0C => 0x8452, 0x2F0 => 0x4000, a => *self.ksz.get(&a).unwrap_or(&0) }
     }
     fn xfer(&mut self, b: u8) -> u8 {
         let pos = self.idx; self.idx += 1;
@@ -512,9 +531,9 @@ impl Spi2 {
                 match pos % 4 {
                     0 => { self.kcmd = (b as u16) << 8; 0 }
                     1 => { self.kcmd |= b as u16; self.kwrite = self.kcmd & 0x8000 != 0;
-                           self.kval = self.ksz_read(self.kcmd & 0x7FFF); 0 }
+                           self.kval = self.ksz.read(self.kcmd & 0x7FFF); 0 }
                     2 => if self.kwrite { self.kdlo = b; 0 } else { (self.kval & 0xFF) as u8 },
-                    _ => { if self.kwrite { self.ksz.insert(self.kcmd & 0x7FFF, ((b as u16) << 8) | self.kdlo as u16); 0 }
+                    _ => { if self.kwrite { self.ksz.write(self.kcmd & 0x7FFF, ((b as u16) << 8) | self.kdlo as u16); 0 }
                            else { (self.kval >> 8) as u8 } }
                 }
             }
@@ -528,10 +547,7 @@ impl Mmio for Spi2 {
         match off & !3 {
             0x14 => { // SR
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
-                let mut sr = 1 << 1;
-                if !self.rx.is_empty() { sr |= 1 << 13; }
-                if self.idx >= tsize.max(1) { sr |= (1 << 3) | (1 << 12); }
-                sr
+                spi_sr(self.idx, tsize, !self.rx.is_empty())
             }
             0x30 => if self.rx.is_empty() { 0 } else { self.rx.remove(0) as u32 },
             o => *self.regs.get(&o).unwrap_or(&0),
@@ -721,13 +737,9 @@ impl Mmio for Spi5 {
     fn name(&self) -> &str { "SPI5" }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x14 => { // SR
+            0x14 => { // SR (EOT/TXC keyed on xfer_cnt, not idx — full-duplex byte count)
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
-                let mut sr = 1 << 1; // TXP
-                if !self.rx.is_empty() { sr |= 1 << 13; } // RXPLVL
-                // EOT/TXC once this transfer has clocked its DLR-sized byte count.
-                if self.xfer_cnt >= tsize.max(1) { sr |= (1 << 3) | (1 << 12); }
-                sr
+                spi_sr(self.xfer_cnt, tsize, !self.rx.is_empty())
             }
             0x30 => { // RXDR
                 if let Some(b) = (!self.rx.is_empty()).then(|| self.rx.remove(0)) {

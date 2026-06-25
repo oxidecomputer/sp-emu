@@ -25,3 +25,4 @@ flag!(spi, "SP_EMU_SPIDBG");
 flag!(panic, "SP_EMU_PANICDBG");
 flag!(svc, "SP_EMU_SVCDBG");
 flag!(exc, "SP_EMU_EXCDBG");
+flag!(sprot, "SP_EMU_SPROTDBG");
