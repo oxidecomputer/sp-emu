@@ -61,3 +61,34 @@ SP_PORT=33311 ./mgs state    # same SP, reached via the *other* switch uplink
   gimlet image was compiled against — the wire protocol must match the firmware.
 - Run `./tasks` when the SP is idle (not mid-`./mgs`-command): humility halts
   the CPU to read memory.
+
+## I2C bridge demos — pipe the SP's I2C traffic to a local process
+
+Box-local (no rack). Each flashes a gimlet image, boots a standalone `sp-emu`,
+and prints every command it runs (transcript style). Build first: `cargo build
+--release`.
+
+**`./i2c-sniff.sh [hubris.zip]` — SNIFF (observe).** Live-streams every I2C
+transaction the SP makes, then a per-device access summary. Uses `sp-emu
+i2c-sniff` + `SP_EMU_I2C_BRIDGE`. Watch the SP bring the board up over I2C:
+muxes → GPIO expander → VPD EEPROM → temp sensors.
+
+**`./i2c-device.sh [--read-sensor] [spec] ` — DELEGATE (be the device).** A local
+socket *answers as* the I2C device(s); everything else defers to the built-in
+model so the SP still boots. Uses `sp-emu i2c-device` + `SP_EMU_I2C_DEVICE`.
+
+```
+./i2c-device.sh                       # default: front TMP117 (0x48) reads ~128 C
+./i2c-device.sh 0x48/0x00=0x4000      # inject a register value (hi byte at idx 0)
+./i2c-device.sh 0x50@/path/vpd.bin    # serve a file as a VPD/FRUID EEPROM
+./i2c-device.sh --read-sensor         # ALSO read it back via Hubris's sensor API (MGS)
+```
+
+`--read-sensor` shows the injected value propagating end-to-end: socket → SP I2C
+→ Hubris sensor task → `faux-mgs read-sensor-value` (the injected sensor reports
+your value; the others read their normal ~30 C).
+
+Wire protocol (so you can write a device model in any language): `S <bus> <addr>
+<R|W>`, `W <bus> <addr> <byte>`, `R <bus> <addr> <reg> <idx>` → server replies a
+hex byte or `-` (defer). `faux-mgs`/the hubris image default to `/root/oxide`
+sibling paths (override `$FAUX` / `$IMG`).
