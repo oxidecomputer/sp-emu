@@ -6,7 +6,7 @@
 //!   - SP `SPI4` master  @ 0x4001_3400  (this crate's `SpiMaster`)
 //!   - RoT `FLEXCOMM8` slave @ 0x4009_F000 (`RotSpiSlave`)
 //!   - CS:     SP GPIO PE4 (low = asserted) — driven via `soc::GpioBank`, set into `cs`
-//!   - rot-irq: RoT GPIO P0_18 (low = asserted) — `LpcGpio` → `rot_irq`; the SP
+//!   - rot-irq: RoT GPIO P0_18 (low = asserted) — `LpcGpio` -> `rot_irq`; the SP
 //!     reads it on GPIO PE3 (the SP's sprot waits on a timer and re-reads the pin,
 //!     so no EXTI model is needed for correctness, just for low latency).
 //!
@@ -33,7 +33,7 @@ pub struct SprotLink {
     pub rot_irq: bool,      // RoT asserting rot-irq (P0_18 low)
     // Sticky SPI slave-select latches. Set by the SP-side CS driver (soc.rs, the
     // PE4 GPIO write) on each CS edge, NOT by the RoT polling `cs`. This is the
-    // fix for the two-core interleaving race: the SP can assert→clock→deassert CS
+    // fix for the two-core interleaving race: the SP can assert->clock->deassert CS
     // entirely within its own quantum before the RoT ever runs, so an RoT that
     // derives SSA/SSD from edge-detecting `cs` at register-access time misses the
     // edges and `wait_for_csn_asserted` hangs (or fires inconsistently across

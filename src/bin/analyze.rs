@@ -3,9 +3,7 @@
 //! Decodes the executable sections of a Hubris ELF (kernel or task), using the
 //! ARM `$t`/`$d` mapping symbols to separate Thumb code from inline literal
 //! pools (the same technique Hubris's own xtask uses), and histograms every
-//! opcode and operand-variant shape encountered. The output is the exact set of
-//! instructions/operand forms the emulator must implement — no guessing, no
-//! one-trap-at-a-time discovery.
+//! opcode and operand-variant shape encountered. 
 //!
 //! Usage: analyze <elf>
 

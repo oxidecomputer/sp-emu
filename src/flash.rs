@@ -43,7 +43,7 @@ pub fn save_nvm(path: &str, data: &[u8]) -> Result<()> {
 }
 
 /// Load a flashable image from either a raw flat binary or a Hubris build
-/// archive (a zip containing `img/final.bin` — the same artifact `humility -a`
+/// archive (a zip containing `img/final.bin`, the same artifact `humility -a`
 /// consumes, produced by `cargo xtask dist`). The archive's entries are bzip2-
 /// compressed, so we read it with the `zip` crate rather than hand-extraction.
 pub fn load_image(path: &str) -> Result<Vec<u8>> {

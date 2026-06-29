@@ -250,7 +250,7 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
         // Pad up to the next flash-page boundary with 0xff, as the RoT measures
         // all programmed pages including the 0xff tail of the final page.
         let rem = bytes.len() % FLASH_PAGE;
-        if rem != 0 { h.update(&vec![0xffu8; FLASH_PAGE - rem]); }
+        if rem != 0 { h.update(vec![0xffu8; FLASH_PAGE - rem]); }
         h.finalize().into()
     };
     let digest_a = page_hash(image);

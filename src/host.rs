@@ -1,10 +1,9 @@
-//! Host-integration boundary — the ONLY surface that touches the host OS.
+//! Host-integration boundary
 //!
 //! Phase 1 exposes just a serial/console sink. Phase 2 (networking, so a switch
 //! zone can talk to the emulated SP) adds a tap method here. Keeping the core
 //! behind this trait is precisely what lets the emulator develop on macOS today
-//! and later drop onto illumos/Helios by swapping only this shim — nothing in
-//! the CPU or SoC ever learns which OS it runs on.
+//! and later drop onto illumos/Helios by swapping only this shim
 
 pub trait HostIo {
     /// Emit one byte from an emulated UART / semihosting console.
@@ -16,7 +15,7 @@ pub trait HostIo {
 
     /// Drain the host network into the bridge's inbound queue (once per pump).
     /// Separated from `eth_rx` so the pump can poll once, then deliver only as
-    /// many frames as the SP's RX ring has room for — without popping (and thus
+    /// many frames as the SP's RX ring has room for, without popping (and thus
     /// losing) a frame the ring can't yet accept. The default does nothing.
     fn eth_poll(&mut self) {}
 
@@ -25,7 +24,7 @@ pub trait HostIo {
     fn eth_rx(&mut self) -> Option<Vec<u8>> { None }
 
     /// A byte the emulated SP wrote to the host-facing UART (UART7 / the
-    /// `host_sp_comms` link to the host CPU — IPCC + host console). The default
+    /// `host_sp_comms` link to the host CPU - IPCC + host console). The default
     /// drops it; the bridge forwards it to the host over a socket (the propolis
     /// IPCC COM port).
     fn host_uart_tx(&mut self, _byte: u8) {}

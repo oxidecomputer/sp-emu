@@ -113,6 +113,12 @@ const VLAN_TPID: u16 = 0x8100;
 const NVIC_LO: u32 = 0xE000_E100;
 const NVIC_HI: u32 = 0xE000_E500;
 
+impl Default for Bus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Bus {
     pub fn new() -> Self {
         let watch = std::env::var("SP_EMU_WATCH").ok()
@@ -166,9 +172,9 @@ impl Bus {
             (0, 2) => 0x0007,  // IDENTIFIER_1  ┐ id = 0x0007_04e2 = VSC8552_ID
             (0, 3) => 0x04e2,  // IDENTIFIER_2  ┘
             (1, 23) => 0x0000, // EXTENDED_PHY_CONTROL_4: port>>11 == 0 (base port)
-            (1, 25) => 0x29e8, // VERIPHY_CTRL_REG2: 8051 CRC == EXPECTED_CRC → skip patch
+            (1, 25) => 0x29e8, // VERIPHY_CTRL_REG2: 8051 CRC == EXPECTED_CRC -> skip patch
             // MICRO_PAGE: the driver writes a command (bit15=go) and polls until
-            // bit15 clears (done) with bit14 clear (no error) → mask both off.
+            // bit15 clears (done) with bit14 clear (no error) -> mask both off.
             (16, 18) => *self.eth.regs.get(&(0x1_0000 | (16u32 << 8) | 18)).unwrap_or(&0) as u16 & 0x3FFF,
             (16, 30) => 0x0001, // EXTENDED_REVISION: tesla_e == 1
             _ => *self.eth.regs.get(&(0x1_0000 | (page as u32) << 8 | reg as u32)).unwrap_or(&0) as u16,
@@ -180,7 +186,7 @@ impl Bus {
         // MDIO transaction: writing MACMDIOAR with MB performs a PHY read/write.
         if off == MACMDIOAR && val & 1 != 0 {
             let (goc, rda) = ((val >> 2) & 3, ((val >> 16) & 0x1F) as u8);
-            if goc == 0b11 { // read → latch the result into MACMDIODR
+            if goc == 0b11 { // read -> latch the result into MACMDIODR
                 let v = self.phy_read(self.eth.mdio_page, rda);
                 if crate::dbg::mdio() {
                     eprintln!("[mdio] RD page={} reg={} -> {:#06x}", self.eth.mdio_page, rda, v);
@@ -207,7 +213,7 @@ impl Bus {
             }
             _ => { self.eth.regs.insert(off, val); }
         }
-        // Writing the TX tail pointer hands new descriptors to the DMA → transmit.
+        // Writing the TX tail pointer hands new descriptors to the DMA -> transmit.
         if off == DMACTXDTPR && !self.rec { self.eth_tx_walk(); }
     }
 
@@ -225,7 +231,7 @@ impl Bus {
         for i in 0..ring_len {
             let d = base.wrapping_add(i.wrapping_mul(16));
             let tdes3 = self.read32(d + 12);
-            if tdes3 & (1 << 31) == 0 { continue; } // driver owns it → nothing to send
+            if tdes3 & (1 << 31) == 0 { continue; } // driver owns it -> nothing to send
             self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN — back to the driver
             // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
             // insert into the following packet. Not a packet itself — don't emit.
@@ -309,7 +315,7 @@ impl Bus {
         let base = self.eth_reg(DMACRXDLAR);
         if base == 0 { return false; }
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
-        self.read32(d + 12) & (1 << 31) != 0 // RDES3.OWN set → DMA owns it → free
+        self.read32(d + 12) & (1 << 31) != 0 // RDES3.OWN set -> DMA owns it -> free
     }
 
     /// Inject a received frame into the next free RX descriptor and raise the
@@ -321,7 +327,7 @@ impl Bus {
         let ring_dbg = crate::dbg::rx();
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
         let rdes3 = self.read32(d + 12);
-        if rdes3 & (1 << 31) == 0 { // driver still owns it → ring full (DMA can't write)
+        if rdes3 & (1 << 31) == 0 { // driver still owns it -> ring full (DMA can't write)
             if ring_dbg {
                 eprintln!("[rx-drop] ring full: rx_next={} ringlen={} d={:#x} rdes3={:#x} (OWN clear) cyc={}",
                     self.eth.rx_next, ring_len, d, rdes3, self.cur_cyc);
@@ -553,9 +559,8 @@ impl Bus {
 
     pub fn write32(&mut self, addr: u32, val: u32) {
         if let Some(w) = self.watch { if addr == w { eprintln!("[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})", addr, val, self.cur_pc, self.cur_cyc); } }
-        if (NVIC_LO..NVIC_HI).contains(&addr) {
-            if self.nvic_write(addr & !3, val) { self.mmio_hit = true; return; }
-        }
+        if (NVIC_LO..NVIC_HI).contains(&addr)
+            && self.nvic_write(addr & !3, val) { self.mmio_hit = true; return; }
         if addr & !3 == SCB_ICSR {
             if val & (1 << 28) != 0 { self.pend_pendsv = true; }  // PENDSVSET
             if val & (1 << 27) != 0 { self.pend_pendsv = false; } // PENDSVCLR

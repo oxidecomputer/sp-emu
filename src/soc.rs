@@ -251,7 +251,7 @@ impl Ksz8463 {
             0x0C => 0x8452, // CIDER (register 0x000): KSZ8463 chip id — driver requires this
             // IADR5 (register 0x02E, packed 0x2F0): high word of an indirect-access
             // MIB-counter read. read_mib_counter() spin-loops here until bit 14
-            // ("valid") is set; counter value 0 → driver returns Count(0).
+            // ("valid") is set; counter value 0 -> driver returns Count(0).
             0x2F0 => 0x4000,
             _ => *self.regs.get(&addr).unwrap_or(&0),
         }
@@ -358,7 +358,7 @@ impl Mmio for Spi4 {
 /// We model the master synchronously (each TXDR byte immediately yields its RXDR
 /// byte and SR reports TXP+RXP) so the spi-core transfer loop never has to sleep
 /// on spi-irq — same trick as the gimlet `Spi4`/KSZ8463 model. The one value the
-/// driver insists on is CHIP_ID (reg 0x71010000 → word addr 0x4000): it must
+/// driver insists on is CHIP_ID (reg 0x71010000 -> word addr 0x4000): it must
 /// decode rev_id=0x3, part_id=0x7468, mfg_id=0x74, one=0x1 (= 0x374680E9), or
 /// `monorail` panics `BadChipId`. Every other register is store/return-0.
 pub struct Vsc7448 {
@@ -385,7 +385,7 @@ impl Vsc7448 {
             0x4000 => 0x374680E9,
             // HSIO:PLL5G_STATUS(0):PLL5G_STATUS1 (reg 0x7146003c): pll5g_setup polls
             // gain_stat (bits[18:14]) and only accepts 2 < v < 0xa, else retries 10x
-            // then errors LcPllInitFailed → monorail BspInitFailed panic. Report a
+            // then errors LcPllInitFailed -> monorail BspInitFailed panic. Report a
             // locked PLL (gain_stat=5). See drv/vsc7448/src/lib.rs pll5g_setup.
             0x11800f => 5 << 14,
             _ => *self.vsc.get(&waddr).unwrap_or(&0),
@@ -466,7 +466,7 @@ impl Mmio for Vsc7448 {
 /// SPI2 (0x4000_3800) — gimlet's bus shared (by chip-select) between the iCE40
 /// sequencer FPGA (CS PB5) and the KSZ8463 switch (CS PI0). The active device is
 /// read from the shared `Spi2Cs` cell (set by the GPIO bank). The transaction is
-/// latched at SPE 0→1 so a whole exchange goes to one device.
+/// latched at SPE 0->1 so a whole exchange goes to one device.
 ///
 /// Sequencer FPGA protocol: a 3-byte header [cmd, addr_be_hi, addr_be_lo] then
 /// data; READ (cmd=1) returns reg[addr++] for bytes after the header. Registers
@@ -495,9 +495,9 @@ impl Spi2 {
     }
     fn seq_read(&self, addr: u16) -> u8 {
         match addr {
-            0x0 => 0xDE, 0x1 => 0x01,                  // ID0/ID1 (LE) → ident 0x01DE = 0x1DE
-            0xa => 0x81, 0xb => 0x39, 0xc => 0x75, 0xd => 0x74, // CS0..3 → 0x74753981 (LE)
-            0x13 => 0x00,                              // PWR_CTRL → 0 (A2 resting)
+            0x0 => 0xDE, 0x1 => 0x01,                  // ID0/ID1 (LE) -> ident 0x01DE = 0x1DE
+            0xa => 0x81, 0xb => 0x39, 0xc => 0x75, 0xd => 0x74, // CS0..3 -> 0x74753981 (LE)
+            0x13 => 0x00,                              // PWR_CTRL -> 0 (A2 resting)
             a => *self.seq.get(&a).unwrap_or(&0),
         }
     }
@@ -556,7 +556,7 @@ impl Mmio for Spi2 {
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
             0x20 => { let rx = self.xfer(val as u8); self.rx.push(rx); }
-            0x00 => { // CR1: SPE 0→1 latches the CS target and starts a transaction
+            0x00 => { // CR1: SPE 0->1 latches the CS target and starts a transaction
                 let was = self.regs.get(&0).map(|v| v & 1 != 0).unwrap_or(false);
                 self.regs.insert(0, val);
                 if val & 1 != 0 && !was { self.idx = 0; self.rx.clear(); } // target latched at 1st byte
@@ -568,7 +568,7 @@ impl Mmio for Spi2 {
 
 /// SPI5 (0x4001_5000, irq85) — sidecar's mainboard ECP5 FPGA via drv-fpga-server
 /// (`use-spi-core`, so the task drives SPI5 directly). The ECP5 is reported
-/// "configured" via GPIO (done=PJ15 high → DeviceState::RunningUserDesign), so
+/// "configured" via GPIO (done=PJ15 high -> DeviceState::RunningUserDesign), so
 /// SPI5 only carries the FPGA *user-design* register protocol: a 3-byte header
 /// [op, addr_be_hi, addr_be_lo] then data. op: Read=1, Write=0, BitSet=2,
 /// BitClear=3, ReadNoAddrIncr=6, WriteNoAddrIncr=5; Read auto-increments addr.
@@ -602,7 +602,7 @@ pub struct Spi5 {
 ///     [0] CONTROLLER_STATE      TARGET_PRESENT(0x01)
 ///     [1] CONTROLLER_LINK_STATUS RECEIVER_ALIGNED|RECEIVER_LOCKED (0x03)
 ///     [2] TARGET_SYSTEM_TYPE     RFD-141 id (gimlet 0x11, sidecar 0x12, psc 0x13, cosmo 0x04)
-///     [3] TARGET_SYSTEM_STATUS   CONTROLLER0_DETECTED(0x01)|SYSTEM_POWER_ENABLED(0x04) → On
+///     [3] TARGET_SYSTEM_STATUS   CONTROLLER0_DETECTED(0x01)|SYSTEM_POWER_ENABLED(0x04) -> On
 ///     [5] TARGET_REQUEST_STATUS  0 (no power transition in progress)
 ///     [6] TARGET_LINK0_STATUS / [7] TARGET_LINK1_STATUS  aligned|locked (0x03)
 ///
@@ -654,14 +654,14 @@ fn seed_ignition(fpga: &mut std::collections::HashMap<u16, u8>) {
 impl Spi5 {
     pub fn new(cs: Spi5Cs) -> Self {
         let mut fpga = std::collections::HashMap::new();
-        // IDENT @ ID0..: id=0x01de5bae (ident.id is BE → bytes 01 de 5b ae).
+        // IDENT @ ID0..: id=0x01de5bae (ident.id is BE -> bytes 01 de 5b ae).
         // checksum: the driver reads ident.checksum BE but compares to the LE
         // interpretation of SIDECAR_MAINBOARD_BITSTREAM_CHECKSUM[..4]=[5e,47,07,64]
-        // = 0x6407475e, so CS0..3 must be 64 07 47 5e (BE → 0x6407475e). version/sha=0.
+        // = 0x6407475e, so CS0..3 must be 64 07 47 5e (BE -> 0x6407475e). version/sha=0.
         for (a, v) in [(0u16, 0x01u8), (1, 0xde), (2, 0x5b), (3, 0xae),
                        (4, 0x64), (5, 0x07), (6, 0x47), (7, 0x5e),
                        // FRONT_IO_STATE (0x30): STATE field is bits[7:4]; set it to
-                       // PowerRailStatus::Enabled(4) → 4<<4 = 0x40, so the sequencer's
+                       // PowerRailStatus::Enabled(4) -> 4<<4 = 0x40, so the sequencer's
                        // front-IO hot-swap preinit loop completes (status == Enabled).
                        (0x30, 0x40),
                        // Tofino sequencer register block (drv-sidecar-mainboard-controller
@@ -671,7 +671,7 @@ impl Spi5 {
                        // so the SP only has to report the switch as present/powered, not
                        // sequence real silicon). TofinoSeqStatus decodes 6 bytes at
                        // 0x100..0x105: CTRL, STATE=A2(1), STEP=Init(0), ERROR=None(0),
-                       // ERROR_STATE=Init(0), ERROR_STEP=Init(0) → abort=None.
+                       // ERROR_STATE=Init(0), ERROR_STEP=Init(0) -> abort=None.
                        (0x100, 0x00),  // TOFINO_SEQ_CTRL (EN=0; we are at rest in A2)
                        (0x101, 0x01),  // TOFINO_SEQ_STATE = A2
                        (0x102, 0x00),  // TOFINO_SEQ_STEP = Init
@@ -684,11 +684,11 @@ impl Spi5 {
         seed_ignition(&mut fpga);
         Spi5 { regs: std::collections::HashMap::new(), rx: Vec::new(), idx: 0, op: 0, addr: 0, dpos: 0, xfer_cnt: 0, dbg_n: 0, cs, last_gen: 0, fpga }
     }
-    /// Reset per-command state on the CS deasserted→asserted edge — a command
+    /// Reset per-command state on the CS deasserted->asserted edge — a command
     /// (header write + data read) spans two SPE cycles under one CS lock.
     fn check_cs(&mut self) {
         let gen = self.cs.get();
-        if gen != self.last_gen { // a new CS lock began → new FPGA command
+        if gen != self.last_gen { // a new CS lock began -> new FPGA command
             self.idx = 0; self.dpos = 0; self.rx.clear(); self.op = 0; self.addr = 0; self.xfer_cnt = 0;
             self.last_gen = gen;
         }
@@ -755,7 +755,7 @@ impl Mmio for Spi5 {
         self.check_cs(); // resets per-command state on the CS asserting edge
         match off & !3 {
             0x20 => { let rx = self.xfer(val as u8); self.rx.push(rx); } // TXDR
-            0x04 => { self.xfer_cnt = 0; self.regs.insert(0x04, val); // CR2.TSIZE: new transfer → reset EOT count
+            0x04 => { self.xfer_cnt = 0; self.regs.insert(0x04, val); // CR2.TSIZE: new transfer -> reset EOT count
                 if crate::dbg::spi() && self.dbg_n < 120 { eprintln!("[spi5] CR2/TSIZE <- {:#x} (xfer_cnt reset)", val); } }
             o => {
                 if crate::dbg::spi() && self.dbg_n < 120 && (o == 0x00) { eprintln!("[spi5] CR1 <- {:#x}", val); }
@@ -767,8 +767,9 @@ impl Mmio for Spi5 {
 
 /// GPIO bank — store/return, but the read-only input register IDR (+0x10 within
 /// each 0x400 port) is synthesized for the boot-critical externally-driven pins:
-///  - GPIOC (port 2): PC6/PC7 = sequencer V3P3/V1P2 power-good → bits 6,7 high.
-///  - GPIOG (port 6): PG[2:0] = board revision → 0b010 for gimlet-c.
+///  - GPIOC (port 2): PC6/PC7 = sequencer V3P3/V1P2 power-good -> bits 6,7 high.
+///  - GPIOG (port 6): PG[2:0] = board revision -> 0b010 for gimlet-c.
+///
 /// Other ports' IDR mirrors their ODR (+0x14) so output read-back works.
 pub struct GpioBank { regs: std::collections::HashMap<u32, u32>, cs: Spi2Cs, spi5_cs: Spi5Cs, prev_pj6_low: Cell<bool>, sidecar: bool }
 impl GpioBank {
@@ -780,14 +781,14 @@ impl GpioBank {
 }
 impl GpioBank {
     /// Recompute the shared SPI2 chip-select from the port-B/port-I ODR state.
-    /// CS is active-low: pin driven low selects the device. PB5 → sequencer,
-    /// PI0 → KSZ8463 (per app/gimlet/base.toml config.spi.spi2.devices).
+    /// CS is active-low: pin driven low selects the device. PB5 -> sequencer,
+    /// PI0 -> KSZ8463 (per app/gimlet/base.toml config.spi.spi2.devices).
     fn update_cs(&self) {
-        let pb = *self.regs.get(&(1 * 0x400 + 0x14)).unwrap_or(&0); // GPIOB ODR
+        let pb = *self.regs.get(&(0x400 + 0x14)).unwrap_or(&0); // GPIOB ODR
         let pi = *self.regs.get(&(8 * 0x400 + 0x14)).unwrap_or(&0); // GPIOI ODR
         self.cs.set(if pb & (1 << 5) == 0 { 1 } else if pi & (1 << 0) == 0 { 2 } else { 0 });
         // Sidecar SPI5 user-design CS = Port J (port 9) pin 6, active-low. Count
-        // each deasserted→asserted edge so Spi5 can delimit FPGA commands even
+        // each deasserted->asserted edge so Spi5 can delimit FPGA commands even
         // when the deassert happens between (Spi5-invisible) GPIO writes.
         let pj = *self.regs.get(&(9 * 0x400 + 0x14)).unwrap_or(&0); // GPIOJ ODR
         let pj6_low = pj & (1 << 6) == 0;
@@ -811,12 +812,12 @@ impl Mmio for GpioBank {
             }
             if self.sidecar {
                 return match port {
-                    // GPIOC PC6/PC7/PC13 → board rev[0,1,2]; sidecar-c = 0b010 → PC7 only.
+                    // GPIOC PC6/PC7/PC13 -> board rev[0,1,2]; sidecar-c = 0b010 -> PC7 only.
                     2 => 1 << 7,
-                    // GPIOF PF12 = front-IO POWER_GOOD (input) → high so the sequencer's
+                    // GPIOF PF12 = front-IO POWER_GOOD (input) -> high so the sequencer's
                     // front-IO preinit passes the PG check.
                     5 => self.regs.get(&(5 * 0x400 + 0x14)).copied().unwrap_or(0) | (1 << 12),
-                    // GPIOJ: mainboard ECP5 config pins — done=PJ15 high (=configured →
+                    // GPIOJ: mainboard ECP5 config pins — done=PJ15 high (=configured ->
                     // device_state RunningUserDesign, skip bitstream) + program_n=PJ13
                     // high (not in reset). init_n=PJ12 (don't-care once done is high).
                     9 => (1 << 15) | (1 << 13),
@@ -833,7 +834,7 @@ impl Mmio for GpioBank {
     }
     fn write(&mut self, off: u32, val: u32) {
         let (port, reg) = (off / 0x400, off & 0x3FF & !3);
-        // BSRR (+0x18): set bits [15:0], reset bits [31:16] → fold into ODR.
+        // BSRR (+0x18): set bits [15:0], reset bits [31:16] -> fold into ODR.
         if reg == 0x18 {
             let odr_key = port * 0x400 + 0x14;
             let mut odr = *self.regs.get(&odr_key).unwrap_or(&0);
@@ -849,7 +850,7 @@ impl Mmio for GpioBank {
             // on the SP side, because this write always runs inside the SP's quantum
             // and so never misses a CS edge — unlike the RoT, which only samples the
             // line when it happens to touch its FLEXCOMM8 registers and can sleep
-            // through an entire assert→clock→deassert cycle. See SprotLink.
+            // through an entire assert->clock->deassert cycle. See SprotLink.
             if let Some(lk) = crate::sprot::link() {
                 let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
                 let new_cs = (odr >> 4) & 1 == 0;
@@ -1049,14 +1050,14 @@ impl I2c {
     /// Accurate device-register model, keyed by I2C address. Returns the 16-bit
     /// value of `reg` (drivers read big-endian: high byte first; single-byte reads
     /// take the high byte). Physical values come from the SensorEnv. `None` = no
-    /// modeled device here → bus reads 0 → that device honestly stays "Failed"
+    /// modeled device here -> bus reads 0 -> that device honestly stays "Failed"
     /// until modeled. Add accurate devices by extending this match.
     fn device_reg(&self, addr: u8, reg: u8) -> Option<u16> {
         let env = self.env.borrow();
         match addr {
             // TMP117 temperature sensors (front/rear, 0x48-0x4a): 7.8125 m°C/LSB,
             // DeviceID must read 0x0117.
-            0x48 | 0x49 | 0x4a => Some(match reg {
+            0x48..=0x4a => Some(match reg {
                 0x0f => 0x0117,                                          // DeviceID
                 0x00 => (env.temp_c(addr) / 0.0078125) as i16 as u16,    // TempResult
                 0x01 => 0x0220,                                          // Configuration
@@ -1074,7 +1075,7 @@ impl I2c {
             // EEPROM branch. They need real sequential, auto-incrementing reads
             // off the `eeprom` backing store, not the 16-bit-register split below.
             // TMP451 (T6 NIC temp, behind the M.2 mux seg 4, addr 0x4c). Reads are
-            // SINGLE-byte → the value goes in the high byte (read_idx 0). ManufacturerId
+            // SINGLE-byte -> the value goes in the high byte (read_idx 0). ManufacturerId
             // (0xFE) must be 0x55 (TI); Local/Remote temp hi byte = integer °C.
             0x4c => Some(match reg {
                 0xFE => 0x5500,                                          // ManufacturerId = 0x55
@@ -1140,7 +1141,7 @@ impl Mmio for I2c {
             if val & (1 << 13) != 0 { // START
                 self.active = true;
                 self.addr = ((val >> 1) & 0x7F) as u8; // SADD[7:1] = 7-bit address
-                if val & (1 << 10) != 0 { // RD_WRN set → read phase
+                if val & (1 << 10) != 0 { // RD_WRN set -> read phase
                     self.read_idx = 0;
                     self.writing = false;
                 } else { // write phase (sets the register pointer)
@@ -1175,13 +1176,12 @@ impl Mmio for I2c {
 /// `hf` task's init completes (it reads the JEDEC ID and *fails hard* unless it
 /// recognizes the chip, then scans for persistent data). We answer just enough:
 ///
-///   * RDID (0x9F)      -> [0x20, 0xBA, 0x19, ...]  (Micron MT25Q, 32 MiB:
-///                         byte0=Micron, byte1=3.3V, byte2=log2(capacity)=25)
-///   * RDSR (0x05)      -> 0x00                     (status: not busy, WIP=0)
-///   * memory reads     -> 0xFF                     (blank flash => the hf
-///                         persistent-data scan finds nothing => clean
-///                         "initial power-on" path, no writes)
-///   * writes/erase     -> accepted (discarded)
+/// * RDID (0x9F)  -> [0x20, 0xBA, 0x19, ...]  (Micron MT25Q, 32 MiB:
+///   byte0=Micron, byte1=3.3V, byte2=log2(capacity)=25)
+/// * RDSR (0x05)  -> 0x00  (status: not busy, WIP=0)
+/// * memory reads -> 0xFF  (blank flash => the hf persistent-data scan finds
+///   nothing => clean "initial power-on" path, no writes)
+/// * writes/erase -> accepted (discarded)
 ///
 /// The driver (drv-stm32h7-qspi) drives transfers by polling SR.FLEVEL (FIFO
 /// level, bits 8..13) and SR.TCF (transfer complete, bit1), reading data one

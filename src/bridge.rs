@@ -1,11 +1,11 @@
-//! Host network bridge — Stage 5 of the Ethernet effort.
+//! Host network bridge
 //!
 //! The emulated SP's `net` task speaks IPv6/UDP over Ethernet (with NDP for
-//! link-layer resolution). On real hardware the path is SP ↔ KSZ8463 switch ↔
-//! rack; here the host *is* the rack, so this bridge implements just enough of
+//! link-layer resolution). On real hardware the path is SP <-> KSZ8463 switch <->
+//! rack; here the host is the rack, so this bridge implements just enough of
 //! an IPv6 neighbor to (a) answer the SP's Neighbor Solicitations, and (b) relay
 //! UDP between the SP's management socket (port 11111) and `faux-mgs` over a
-//! plain host UDP socket. Point faux-mgs at it with:
+//! plain host UDP socket. You can point faux-mgs at it with:
 //!
 //!   faux-mgs --sp-sim-addr [::1]:11111 <command>
 //!
@@ -47,13 +47,13 @@ struct BoundSock {
 
 pub struct Bridge {
     serial: StdoutHost,
-    /// One socket per switch view (base_port+0 → vid 0x301, base_port+1 → 0x302).
+    /// One socket per switch view (base_port+0 -> vid 0x301, base_port+1 -> 0x302).
     socks: Vec<BoundSock>,
     /// Bridge's own identity on the emulated link (the "MGS" neighbor); same on
     /// every VLAN (the SP resolves it per-VLAN).
     my_mac: [u8; 6],
     my_ip: [u8; 16],
-    /// SP identity learned per VLAN from its tagged TX: vid → (mac, link-local).
+    /// SP identity learned per VLAN from its tagged TX: vid -> (mac, link-local).
     /// net uses a distinct per-port MAC + link-local per VLAN; we keep both so we
     /// can inject on the correct switch view and keep each neighbor cache warm.
     sp_by_vid: std::collections::HashMap<u16, ([u8; 6], [u8; 16])>,
@@ -71,7 +71,7 @@ pub struct Bridge {
     n_pop: u64,
     /// SP round-trip diagnostics (SP_EMU_RTTSTATS): arrival time of the most
     /// recent client request injected toward the SP, and accumulated request->
-    /// reply latency THROUGH THE EMULATOR (excludes faux-mgs/process/kernel time).
+    /// reply latency through the emulator (excludes faux-mgs/process/kernel time).
     /// Single-client measurement; under a flood the pairing is approximate.
     last_req_at: Option<std::time::Instant>,
     rtt_n: u64,
@@ -79,7 +79,7 @@ pub struct Bridge {
     rtt_max_us: u128,
     /// host-sp-comms (UART7) bytes to/from the host CPU. In voxel this is the
     /// propolis IPCC COM port (a unix socket); set `$SP_EMU_HOST_UART` to its
-    /// path. None -> the host UART is unbacked (TX dropped, no RX), as before.
+    /// path.
     host_uart: Option<UnixStream>,
 }
 
@@ -87,7 +87,7 @@ impl Bridge {
     pub fn new(bind: &str) -> std::io::Result<Self> {
         // `bind` is the SP's base management addr (switch0 view). We also bind
         // base_port+1 for the switch1 view, matching the a4x2 per-SP port pair
-        // (e.g. gimlet0 → 33310/33311). faux-mgs/MGS dials either view.
+        // (e.g. gimlet0 -> 33310/33311). faux-mgs/MGS dials either view.
         let base: SocketAddr = bind.parse().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput,
                 format!("SP_EMU_BRIDGE bind addr {:?} must be host:port", bind))
@@ -95,11 +95,11 @@ impl Bridge {
         // The management VLAN ids differ by board (gimlet app.toml uses 0x301/
         // 0x302; the sidecar uses 0x12c/0x12d). Allow overriding via env so the
         // bridge injects MGS traffic on the VLAN the SP's net task actually
-        // listens on — otherwise the SP drops it (its per-VLAN smoltcp iface for
+        // listens on, otherwise the SP drops it (its per-VLAN smoltcp iface for
         // the wrong vid doesn't exist). Default to the gimlet VLANs.
         // Per-board trusted-VLAN defaults: the sidecar's management VLANs are
-        // local_sidecar (0x130, port 1 → switch0 view) and peer_sidecar (0x302,
-        // port 2 → switch1 view); both are `trusted=true`, which MGS state/
+        // local_sidecar (0x130, port 1 -> switch0 view) and peer_sidecar (0x302,
+        // port 2 -> switch1 view); both are `trusted=true`, which MGS state/
         // inventory require (the tech-port VLANs 0x12c/0x12d are untrusted). The
         // gimlet uses 0x301/0x302. SP_EMU_VID0/VID1 still override either default.
         let sidecar = std::env::var("SP_EMU_BOARD").map(|b| b == "sidecar").unwrap_or(false);
@@ -136,7 +136,6 @@ impl Bridge {
             serial: StdoutHost,
             socks,
             my_mac: [0x0e, 0x00, 0x00, 0x00, 0x00, 0x01],
-            // fe80::1 — a link-local for the bridge ("MGS") neighbor.
             my_ip: [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             sp_by_vid: std::collections::HashMap::new(),
             peer_by_vid: std::collections::HashMap::new(),
@@ -188,8 +187,7 @@ impl Bridge {
             if first {
                 // Quiet, ungated readiness marker: the SP's net stack is up and
                 // transmitting, so it's reachable by MGS. A supervisor (voxel-init
-                // / run-fleet.sh) gates bring-up by waiting for this single line —
-                // no need for the SP_EMU_BRIDGEDBG firehose. Printed once.
+                // / run-fleet.sh) gates bring-up by waiting for this single line.
                 if self.sp_by_vid.len() == 1 {
                     eprintln!("[sp-emu] online: SP reachable on the management network (first vid {:#x})", vid);
                 }
@@ -244,9 +242,9 @@ impl Bridge {
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
         // Only relay the SP's management socket; ignore broadcast/echo chatter.
         if src_port != SP_PORT && src_port != EREPORT_PORT { return; }
-        // Route the reply to the SPECIFIC MGS client that sent the request: the
-        // SP echoes that client's ephemeral port as the UDP *destination* port
-        // (we inject requests with the real client port as the UDP source — see
+        // Route the reply to the specific MGS client that sent the request: the
+        // SP echoes that client's ephemeral port as the UDP destination port
+        // (we inject requests with the real client port as the UDP source, see
         // poll_host). Real MGS opens many concurrent sockets, so routing to a
         // single "last-seen peer per VLAN" starves all but the busiest client
         // (the symptom: discover/state intermittently "no SP discovered" while a
@@ -306,9 +304,7 @@ impl Bridge {
                 eprintln!("[bridge] MGS->SP {} bytes from {} (vid {:#x}) payload={}", data.len(), src, vid, hex);
             }
             // Inject with the MGS client's REAL ephemeral source port (src.port())
-            // so the SP echoes it back as the reply's dest port — that's how
-            // handle_udp_tx routes each reply to the right client. (Was a fixed
-            // 22222, which collapsed all clients onto one port.)
+            // so the SP echoes it back as the reply's dest port.
             let frame = self.build_udp6(vid, sp_mac, sp_ip, sp_port, src.port(), &data);
             self.push_rx(src.port(), frame);
         }
@@ -318,16 +314,7 @@ impl Bridge {
     /// eviction. A real MGS polls the SP (sensors, continuously) far faster than
     /// the emulated SP (~1000x slower than silicon) can drain its 4-entry RX
     /// ring, so the backlog MUST be bounded or reply latency climbs without limit
-    /// and never recovers ("worked a minute, then hangs"). But dropping the
-    /// GLOBAL oldest is flow-blind: it sheds the rare, latency-critical request
-    /// flows (discover / state / ignition — each its own MGS source port) to make
-    /// room for the high-volume sensor-poll flood, so those requests time out
-    /// under load (the "ignition drops first request, succeeds 15-30s later"
-    /// failure observed on the live rack). Instead, when over cap, evict the
-    /// OLDEST frame of the BUSIEST flow: the flood sheds its own backlog (a missed
-    /// sensor poll is harmless — MGS retries) while one-off request flows stay
-    /// intact. Bridge control frames (NA/echo, flow 0) are rare and connectivity-
-    /// critical, so they're excluded from being the victim where possible.
+    /// and never recovers ("worked a minute, then hangs").
     fn push_rx(&mut self, flow: u16, frame: Vec<u8>) {
         // Flow != 0 is a real MGS client request (flow 0 = bridge control: NA/echo).
         // Stamp its arrival so the SP's reply can report the round-trip latency.
@@ -438,19 +425,12 @@ impl HostIo for Bridge {
     }
 
     fn eth_rx(&mut self) -> Option<Vec<u8>> {
-        // Control frames (NA/echo, flow 0) are connectivity-critical — serve
+        // Control frames (NA/echo, flow 0) are connectivity-critical, serve
         // them first (oldest-first).
         if let Some(pos) = self.rx.iter().position(|(f, _)| *f == 0) {
             self.n_pop += 1;
             return self.rx.remove(pos).map(|(_, frame)| frame);
         }
-        // Management requests: NEWEST-first. Under sustained/overlapping MGS
-        // sweeps the ~8x-slower SP runs perpetually behind, so FIFO made it always
-        // answer a request MGS had already abandoned (stale message_id → discarded
-        // → /ignition timed out). Serving the freshest request makes the reply
-        // match MGS's current outstanding request; superseded older retries age
-        // out via the push_rx cap. (Newest-first, not the round-robin fairness
-        // that regressed latency before.)
         if !self.rx.is_empty() { self.n_pop += 1; }
         self.rx.pop_front().map(|(_, frame)| frame)
     }

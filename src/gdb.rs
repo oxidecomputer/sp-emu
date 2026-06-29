@@ -34,7 +34,7 @@ fn take_message(buf: &mut Vec<u8>) -> Option<Msg> {
             Some(0x03) => { buf.remove(0); return Some(Msg::Interrupt); }
             Some(b'+') | Some(b'-') => { buf.remove(0); } // ack — skip, look for real msg
             Some(b'$') => {
-                let Some(hash) = buf.iter().position(|&c| c == b'#') else { return None };
+                let hash = buf.iter().position(|&c| c == b'#')?;
                 if buf.len() < hash + 3 { return None; } // checksum bytes not here yet
                 let payload = String::from_utf8_lossy(&buf[1..hash]).into_owned();
                 buf.drain(0..hash + 3);
@@ -239,6 +239,7 @@ fn serve_gdb(
 /// Pre-boot to steady state, then serve both humility debug transports:
 ///  - GDB RSP on :3333  (`humility -p ocdgdb`, read-only)
 ///  - OpenOCD Tcl on :6666 (`humility -p ocd`, reads + writes)
+///
 /// Between connections the emulator keeps running, so time advances across a
 /// series of humility commands.
 pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_client: Option<crate::rot_service::RotClient>, host: &mut dyn HostIo, preboot: u64) -> Result<()> {
@@ -314,7 +315,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // wall-clock latency in each direction. On a contended host (the rack runs
     // several SP instances next to the whole control plane) a batch's wall-clock
     // inflates, so a few-hundred-ms MGS attempt budget (e.g. the inventory
-    // collector's GET /ignition) times out → empty SP inventory. A small quantum
+    // collector's GET /ignition) times out -> empty SP inventory. A small quantum
     // bounds inbound latency; `eth_has_tx`-break (below) bounds outbound. The
     // preboot loop is separate, so full-speed boot throughput is unaffected.
     let quantum: u32 = std::env::var("SP_EMU_ETH_QUANTUM").ok()
@@ -472,7 +473,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             // Wake the RoT's FLEXCOMM8 slave (irq 59) whenever it owes us a receive
             // — i.e. there is an un-processed slave-select assert latched (`ssa`) or
             // a transfer is currently active (`cs`). Keying off the latched `ssa`,
-            // not just current CS, is essential: the SP can assert→clock→deassert CS
+            // not just current CS, is essential: the SP can assert->clock->deassert CS
             // entirely within its own quantum, so by now CS is already de-asserted,
             // yet the RoT still owes us the receive and is asleep in
             // sys_recv_notification(SPI_IRQ) — without the IRQ it sleeps forever and
@@ -611,7 +612,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                 rot_busy = awaiting_reply || !req_buf.is_empty();
             }
         }
-        // ROT_IRQ → SP EXTI: when the RoT toggles rot-irq (PE3 / EXTI line 3),
+        // ROT_IRQ -> SP EXTI: when the RoT toggles rot-irq (PE3 / EXTI line 3),
         // latch the SP's EXTI pending bit and pend the EXTI3 NVIC IRQ (9, routed to
         // the sys task's exti wildcard). The sys task then posts the ROT_IRQ
         // notification and sprot's wait_rot_irq returns at once, instead of waiting
