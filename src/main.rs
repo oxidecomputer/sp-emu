@@ -1,8 +1,8 @@
 //! sp-emu — a native-Rust emulated Service Processor.
 //!
-//! Models an STM32H753 SP as an "empty" board with two flash slots (A/B) backed
-//! by a persistent host file. You flash a Hubris image into a slot once, then
-//! boot from it — just like real silicon.
+//! Models an STM32H753 SP as an empty board with two flash slots (A/B) backed
+//! by a persistent host file. Flash a Hubris image into a slot once, then
+//! boot from it, as on real silicon.
 //!
 //! Subcommands:
 //!   sp-emu flash <a|b> <image.bin>   Program an image into a slot (persists).
@@ -188,9 +188,9 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
             slot.to_ascii_uppercase(), slot);
     }
     eprintln!("[sp] booting from slot {} ({}) for GDB", slot.to_ascii_uppercase(), path);
-    // RoT bridge: either a SHARED rot-service over IPC (SP_EMU_ROT_SERVICE, the
-    // light path — no in-process RoT core), or an in-process RoT core
-    // (SP_EMU_ROT_FLASH, the original two-core path). The service wins if both set.
+    // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
+    // in-process RoT core), or an in-process RoT core (SP_EMU_ROT_FLASH, the
+    // two-core path). The service wins if both are set.
     let rot_service = std::env::var("SP_EMU_ROT_SERVICE").ok().filter(|s| !s.is_empty());
     if rot_service.is_some() || std::env::var("SP_EMU_ROT_FLASH").is_ok() { sprot::enable(); }
     let (cpu, bus) = setup(&nvm, flash::slot_base(slot)?)?;
@@ -203,9 +203,6 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
 }
 
-/// rot <oxide-rot-1 image|archive> [max] — boot the LPC55 RoT firmware standalone
-/// (no sprot link yet) on the existing core to see how far it gets and which
-/// LPC55 peripherals it touches (the unmapped-access log drives what to model).
 /// Build the LPC55 RoT core (Cortex-M33 + LPC55 SoC) loaded with the oxide-rot-1
 /// image and reset, ready to step. Shared by `sp-emu rot` (standalone) and
 /// `serve` (the in-process two-core SP+RoT integration, gated on SP_EMU_ROT_FLASH).
@@ -231,14 +228,14 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
 /// from `UPDATE_RANGE` (0x4010_2000, USB SRAM) via `bootstate()`, and the SP's
 /// `rot_boot_info` sprot query returns the slot SHA3-256 digests from it. sp-emu
 /// skips stage0, so without this the handoff is zeroed and the digests come back
-/// as all-zero (or the load fails). We compute the real SHA3-256 of the loaded
+/// as all-zero (or the load fails). Compute the SHA3-256 of the loaded
 /// slot-A image (padded to the 512-byte flash page with 0xff, matching the
-/// firmware's "all programmed pages" measurement) and serialize a valid handoff:
+/// firmware's all-programmed-pages measurement) and serialize a valid handoff:
 ///   HandoffDataHeader { version: u32 = 0, magic: b"whatwhatwhat" }   (hubpack)
 ///   RotBootStateV2 { active: RotSlot, a/b/stage0/stage0next: RotImageDetailsV2 }
 /// where RotImageDetailsV2 = { digest: [u8;32], status: Result<(), ImageError> }.
 /// hubpack encodes integers LE, arrays/structs in field order, enums/Result as a
-/// 1-byte discriminant (Ok=0). Slots we don't load (b/stage0/stage0next) get the
+/// 1-byte discriminant (Ok=0). Slots not loaded (b/stage0/stage0next) get the
 /// digest of an erased page + status Ok (the control plane records but does not
 /// validate digests). See lib/stage0-handoff in hubris.
 fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
@@ -275,7 +272,7 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
         digest_a.iter().map(|b| format!("{:02x}", b)).collect::<String>());
 }
 
-/// rot-serve <listen-addr> <oxide-rot-1 image|archive> — run ONE shared RoT that
+/// rot-serve <listen-addr> <oxide-rot-1 image|archive> — run one shared RoT that
 /// answers sprot request frames over a socket (frame-level IPC), so every SP can
 /// share it instead of each emulating its own RoT core. See `rot_service`.
 fn cmd_rot_serve(args: &[String]) -> Result<()> {
@@ -338,8 +335,8 @@ fn setup(image: &[u8], boot_base: u32) -> Result<(Cpu, Bus)> {
 
     // Measurement-handoff token (RFD 568): production gimlet firmware spins
     // resetting itself until the RoT deposits a "measured" token at DTCM base,
-    // or a debugger deposits the SKIP token. We have no RoT yet, so act as the
-    // debugger and deposit SKIP (0x9f38bd71) at 0x2000_0000 to boot directly.
+    // or a debugger deposits the SKIP token. No RoT yet, so acts as the
+    // debugger and deposits SKIP (0x9f38bd71) at 0x2000_0000 to boot directly.
     // TODO: once the LPC55 RoT core exists, have it write VALID (0x0c887a12).
     bus.write32(0x2000_0000, 0x9f38_bd71);
     Ok((cpu, bus))
@@ -379,8 +376,8 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
                 }
                 if let Some(f) = diff.as_mut() {
                     let exc = cpu.mode != mode0 || cpu.ipsr != ipsr0;
-                    // VFP is now validated against Unicorn (S-regs included), so
-                    // it is no longer skipped — only things Unicorn can't mirror.
+                    // VFP is validated against Unicorn (S-regs included), so it
+                    // is not skipped; only state Unicorn cannot mirror is.
                     let skip = (bus.mmio_hit || exc || cpu.last_it || cpu.last_sys) as u8;
                     let _ = write!(f, "{:08x}", pc);
                     for k in 0..15 { let _ = write!(f, " {:08x}", cpu.r[k]); }
@@ -410,7 +407,7 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
         }
         // Drive SysTick (skipped in diff mode so the lockstep trace is
         // deterministic and free of asynchronous interrupts).
-        if diff.is_none() { // interrupts off in diff mode (deterministic lockstep)
+        if diff.is_none() {
             cpu.maybe_tick(&mut bus);
             cpu.maybe_interrupt(&mut bus);
             if cpu.cycles & 0xFFF == 0 { bus.pump_eth(host.as_mut()); bus.pump_uart(host.as_mut()); }

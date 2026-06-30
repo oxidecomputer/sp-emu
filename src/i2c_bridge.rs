@@ -6,15 +6,15 @@
 //!    as an annotated human-readable line; the SP's built-in device model still
 //!    answers. `sp-emu i2c-sniff <addr>` is the pretty-printing listener.
 //!  - **DEVICE / DELEGATE** (`SP_EMU_I2C_DEVICE=<addr>`) - request/response: a
-//!    local process ANSWERS reads as the device(s). sp-emu streams START/write
+//!    local process answers reads as the device(s). sp-emu streams START/write
 //!    observations and, per read, sends a query the server replies to with a byte
-//!    (or `-` to DEFER to the built-in model, so the SP still boots). Lets you
-//!    inject arbitrary device behavior - a chosen sensor value, a custom/corrupt
-//!    EEPROM image - and watch how Hubris copes. `sp-emu i2c-device <addr>
-//!    [spec...]` is a scriptable example server.
+//!    (or `-` to defer to the built-in model, so the SP still boots). Injects
+//!    arbitrary device behavior - a chosen sensor value, a custom/corrupt EEPROM
+//!    image - to exercise how Hubris copes. `sp-emu i2c-device <addr> [spec...]`
+//!    is a scriptable example server.
 //!
-//! DEVICE wire protocol (newline-delimited text - a device model is writable in
-//! any language; one connection carries all four buses):
+//! DEVICE wire protocol (newline-delimited text - a device model may be written
+//! in any language; one connection carries all four buses):
 //! ```text
 //!   sp-emu -> server:  S <bus> <addr> <R|W>         transaction start
 //!                      W <bus> <addr> <byte>        write byte (1st = reg pointer)
@@ -52,7 +52,12 @@ impl I2cBridge {
             match TcpStream::connect(&addr) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
-                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    // Bounds on_read()'s blocking wait so a hung device server
+                    // can't stall the emulator. Set before try_clone so the read
+                    // half inherits it; warn if it didn't take.
+                    if let Err(e) = s.set_read_timeout(Some(Duration::from_secs(2))) {
+                        eprintln!("[i2c-device] WARNING: could not set read timeout ({e})");
+                    }
                     let r = s.try_clone().ok().map(BufReader::new);
                     eprintln!("[i2c-device] delegating I2C reads to {addr}");
                     return Self::wrap(Mode::Device, Some(s), r);
@@ -85,7 +90,7 @@ impl I2cBridge {
     }
 
     /// One-way line write (observations + sniff trace). Drops the stream on a
-    /// broken pipe so we stop trying.
+    /// broken pipe so writes stop.
     fn send(&self, line: &str) {
         let mut g = self.0.borrow_mut();
         if let Some(s) = g.w.as_mut() {
@@ -253,8 +258,8 @@ fn parse_override(s: &str) -> anyhow::Result<Override> {
 
 /// `sp-emu i2c-device <listen-addr> [spec...]` - an example DELEGATE device
 /// server. Answers `R` queries from the given overrides (defers everything else
-/// to the emulator's built-in model with `-`), logging each injected read so you
-/// can watch the SP consume your values. Specs:
+/// to the emulator's built-in model with `-`), logging each injected read so the
+/// SP's consumption of the values is visible. Specs:
 ///   `<addr>/<reg>=<val>`   inject a 16-bit register value (hi byte first)
 ///   `<addr>@<file>`        serve a file as that device's read stream (EEPROM)
 pub fn serve_device(addr: &str, specs: &[String]) -> anyhow::Result<()> {

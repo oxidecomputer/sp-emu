@@ -1,10 +1,10 @@
-//! Flash banks (Slot A / Slot B) backed by a persistent host file — the
-//! "non-volatile memory" of the emulated SP.
+//! Flash banks (Slot A / Slot B) backed by a persistent host file: the
+//! non-volatile memory of the emulated SP.
 //!
 //! The STM32H753 has 2 MB of flash in two 1 MB banks: bank 1 at 0x08000000
-//! (Slot A) and bank 2 at 0x08100000 (Slot B). We model both as a single 2 MB
-//! image persisted to a host file so that, like real silicon, what you flash
-//! stays flashed across runs. You program a slot once and then just `run`.
+//! (Slot A) and bank 2 at 0x08100000 (Slot B). Both are modeled as a single 2 MB
+//! image persisted to a host file so that, as on real silicon, flash contents
+//! persist across runs. Program a slot once, then `run`.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -45,7 +45,7 @@ pub fn save_nvm(path: &str, data: &[u8]) -> Result<()> {
 /// Load a flashable image from either a raw flat binary or a Hubris build
 /// archive (a zip containing `img/final.bin`, the same artifact `humility -a`
 /// consumes, produced by `cargo xtask dist`). The archive's entries are bzip2-
-/// compressed, so we read it with the `zip` crate rather than hand-extraction.
+/// compressed, so read via the `zip` crate rather than hand-extraction.
 pub fn load_image(path: &str) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {path}"))?;
     if raw.starts_with(b"PK") {

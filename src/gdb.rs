@@ -1,10 +1,10 @@
-//! A minimal GDB Remote Serial Protocol (RSP) server, just enough for humility
-//! to attach to the running emulated SP and inspect it.
+//! Minimal GDB Remote Serial Protocol (RSP) server for humility to attach to
+//! the running emulated SP and inspect it.
 //!
 //! humility's GDB core (humility-probes-core/src/gdb.rs) connects to
-//! 127.0.0.1:3333, speaks RSP, and is *read-only* — it sends `qSupported`,
+//! 127.0.0.1:3333, speaks RSP, and is read-only — it sends `qSupported`,
 //! `m addr,len` (read memory), `p reg` (read register), `c` (continue), and a
-//! raw 0x03 byte (halt). It never writes target state. So a server that answers
+//! raw 0x03 byte (halt). It never writes target state. A server answering
 //! those reads lets `humility tasks` / `dump` / `ringbuf` work against sp-emu.
 //!
 //! Ack discipline (matched to humility's `recv`):
@@ -19,7 +19,7 @@ use anyhow::Result;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-/// One thing pulled off the wire.
+/// One message pulled off the wire.
 enum Msg {
     Interrupt,       // raw 0x03 — halt request
     Packet(String),  // a `$payload#xx` command (payload only)
@@ -32,7 +32,7 @@ fn take_message(buf: &mut Vec<u8>) -> Option<Msg> {
         match buf.first().copied() {
             None => return None,
             Some(0x03) => { buf.remove(0); return Some(Msg::Interrupt); }
-            Some(b'+') | Some(b'-') => { buf.remove(0); } // ack — skip, look for real msg
+            Some(b'+') | Some(b'-') => { buf.remove(0); } // ack — skip
             Some(b'$') => {
                 let hash = buf.iter().position(|&c| c == b'#')?;
                 if buf.len() < hash + 3 { return None; } // checksum bytes not here yet
@@ -109,13 +109,13 @@ fn handle(s: &mut TcpStream, p: &str, cpu: &Cpu, bus: &mut Bus) -> Result<bool> 
     Ok(false)
 }
 
-// ---- OpenOCD Tcl RPC (humility's `-p ocd` core: reads AND writes) -----------
+// ---- OpenOCD Tcl RPC (humility's `-p ocd` core: reads and writes) -----------
 //
 // Protocol: each command and each reply is terminated by a 0x1a byte. humility
 // treats a reply containing "Error: " / "invalid command name " as failure.
-// Commands it uses: `version`, `mrw addr` (read word, DECIMAL), `array unset
+// Commands used: `version`, `mrw addr` (read word, decimal), `array unset
 // output` + `mem2array output 8 addr len` + `return $output` (read bytes as
-// space-separated `idx val` DECIMAL pairs), `reg N` (read register), `mww/mwb
+// space-separated `idx val` decimal pairs), `reg N` (read register), `mww/mwb
 // addr val` (write). halt/run are client-side no-ops, so the target stays
 // frozen for the duration of an OpenOCD connection (a consistent snapshot).
 
@@ -134,7 +134,7 @@ fn handle_ocd(cmd: &str, cpu: &Cpu, bus: &mut Bus, pending: &mut String) -> Stri
     match t.next() {
         Some("version") => "Open On-Chip Debugger 0.12.0 (sp-emu)".to_string(),
         Some("mrw") => match t.next().and_then(parse_hex_or_dec) {
-            Some(addr) => format!("{}", bus.read32(addr)),   // DECIMAL, per humility
+            Some(addr) => format!("{}", bus.read32(addr)),   // decimal, per humility
             None => String::new(),
         },
         Some("mem2array") => {
@@ -143,7 +143,7 @@ fn handle_ocd(cmd: &str, cpu: &Cpu, bus: &mut Bus, pending: &mut String) -> Stri
             let _width = t.next();
             let addr = t.next().and_then(parse_hex_or_dec).unwrap_or(0);
             let len = t.next().and_then(parse_hex_or_dec).unwrap_or(0);
-            // Stash "idx val idx val ..." (DECIMAL) for the next `return $output`.
+            // Stash "idx val idx val ..." (decimal) for the next `return $output`.
             let mut s = String::new();
             for i in 0..len {
                 if i > 0 { s.push(' '); }
@@ -246,7 +246,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     eprintln!("[gdb] pre-booting {} instructions to steady state...", preboot);
     let parse_env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
     let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
-    // Only pay the per-instruction disasm-formatting cost if the windowed trace is on.
+    // Pay the per-instruction disasm-formatting cost only when the windowed trace is on.
     cpu.record_disasm = twin_from.is_some();
     let preboot_start = std::time::Instant::now();
     for _ in 0..preboot {
@@ -291,7 +291,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     let rotpc_every = parse_env("SP_EMU_ROTPC");
     let mut rotpc_next = 0u64;
     let mut last_rottrap = u32::MAX;
-    // SP_EMU_ROTDUMP="0xADDR:LEN" dumps that RoT RAM range every ~8s (for task-table introspection).
+    // SP_EMU_ROTDUMP="0xADDR:LEN" dumps that RoT RAM range every ~8s for task-table introspection.
     let rotdump: Option<(u32, u32)> = std::env::var("SP_EMU_ROTDUMP").ok().and_then(|s| {
         let (a, l) = s.split_once(':')?;
         Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, l.parse().ok()?))
@@ -301,34 +301,33 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // Post-preboot: enable the WFI idle-throttle so an idle SP sleeps the host
     // instead of pegging a core (preboot ran with it off, at full spin speed).
     cpu.wfi_throttle = true;
-    // Per idle WFI we sleep this long (ms) instead of spinning. Larger = lower
-    // idle CPU but slower background sim-time (MGS stays snappy regardless — an
-    // incoming packet's eth-irq wakes the SP immediately). 10ms ≈ 4x CPU cut and
-    // all MGS commands verified; tune via SP_EMU_IDLE_MS for denser fleets.
+    // Per idle WFI, sleep this long (ms) instead of spinning. Larger = lower
+    // idle CPU but slower background sim-time; an incoming packet's eth-irq wakes
+    // the SP immediately regardless. 10ms ≈ 4x CPU cut; tune via SP_EMU_IDLE_MS
+    // for denser fleets.
     let idle_ms: u64 = std::env::var("SP_EMU_IDLE_MS").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(10);
 
-    // Eth-service quantum: how many instructions the SP runs between bridge pumps
-    // (the ONLY place TX frames flush out and RX frames poll in). Under sustained
-    // MGS load the SP never goes idle, so the batch never breaks early on
-    // `idle_skip` and every request/reply round-trip pays up to a full batch of
-    // wall-clock latency in each direction. On a contended host (the rack runs
-    // several SP instances next to the whole control plane) a batch's wall-clock
-    // inflates, so a few-hundred-ms MGS attempt budget (e.g. the inventory
-    // collector's GET /ignition) times out -> empty SP inventory. A small quantum
-    // bounds inbound latency; `eth_has_tx`-break (below) bounds outbound. The
-    // preboot loop is separate, so full-speed boot throughput is unaffected.
+    // Eth-service quantum: instructions the SP runs between bridge pumps (the
+    // only place TX frames flush out and RX frames poll in). Under sustained MGS
+    // load the SP never goes idle, so the batch never breaks early on `idle_skip`
+    // and every request/reply round-trip pays up to a full batch of wall-clock
+    // latency in each direction. On a contended host (the rack runs several SP
+    // instances next to the whole control plane) a batch's wall-clock inflates,
+    // so a few-hundred-ms MGS attempt budget (e.g. the inventory collector's
+    // GET /ignition) times out -> empty SP inventory. A small quantum bounds
+    // inbound latency; the `eth_has_tx` break (below) bounds outbound. The preboot
+    // loop is separate, so full-speed boot throughput is unaffected.
     let quantum: u32 = std::env::var("SP_EMU_ETH_QUANTUM").ok()
         .and_then(|s| s.parse().ok()).filter(|&q| q > 0).unwrap_or(4096);
     // TX-break: end the batch the instant the SP queues a reply so it flushes
     // immediately instead of waiting out the rest of the quantum. On by default;
-    // SP_EMU_ETH_TXBREAK=0 disables it (for A/B against the old once-per-batch
-    // behavior). Defaulted off only matters when paired with a large quantum.
+    // SP_EMU_ETH_TXBREAK=0 disables it (A/B against the once-per-batch behavior).
     let txbreak = std::env::var("SP_EMU_ETH_TXBREAK").map(|v| v != "0").unwrap_or(true);
     eprintln!("[gdb] eth-service: quantum={} txbreak={}", quantum, txbreak);
 
     // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the gdb/ocd debug listeners
-    // entirely — MGS only needs the bridge UDP. Otherwise bind them as usual.
+    // entirely — MGS only needs the bridge UDP. Otherwise bind them.
     let listeners = if std::env::var("SP_EMU_NO_DEBUG").is_ok() {
         eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG) — serving the bridge only");
         None
@@ -354,14 +353,13 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         Some((gdb_l, ocd_l))
     };
 
-    // Pump-cadence diagnostics (SP_EMU_PUMPSTATS): the decisive measurement for
-    // "is the SP descheduled by the host, or just running a long batch?". For
-    // each gap between bridge pumps we log the WALL-CLOCK elapsed and the number
-    // of INSTRUCTIONS executed. A long gap with ~quantum instructions executed =
-    // the SP ran a full batch (a smaller quantum / TX-break helps); a long gap
-    // with ~0 instructions = the OS descheduled the whole process (only CPU
-    // priority helps, not the quantum). Logged only for gaps over the threshold
-    // (default 50ms) to avoid spamming the steady state.
+    // Pump-cadence diagnostics (SP_EMU_PUMPSTATS): distinguishes the SP being
+    // descheduled by the host from the SP running a long batch. For each gap
+    // between bridge pumps, log the wall-clock elapsed and the instructions
+    // executed. A long gap with ~quantum instructions = the SP ran a full batch
+    // (a smaller quantum / TX-break helps); a long gap with ~0 instructions = the
+    // OS descheduled the whole process (only CPU priority helps, not the quantum).
+    // Logged only for gaps over the threshold (default 50ms).
     let pumpstats = std::env::var("SP_EMU_PUMPSTATS").is_ok();
     let pump_thresh_us: u128 = std::env::var("SP_EMU_PUMPSTATS_MS").ok()
         .and_then(|s| s.parse().ok()).unwrap_or(50) * 1000;
@@ -369,9 +367,9 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     let mut last_cyc = cpu.cycles;
 
     // Guest-PC sampling profiler (SP_EMU_PCPROF): histogram the executing PC to
-    // find hot firmware (e.g. an SPI/IPC spin loop behind the bulk-ignition
-    // latency). Sampled every 256 instrs; cumulative top-30 dumped every 15s.
-    // Map the PCs to functions offline with the Hubris archive (addr2line/nm).
+    // find hot firmware (e.g. an SPI/IPC spin loop behind bulk-ignition latency).
+    // Sampled every 256 instrs; cumulative top-30 dumped every 15s. Map PCs to
+    // functions offline with the Hubris archive (addr2line/nm).
     let pcprof = std::env::var("SP_EMU_PCPROF").is_ok();
     let mut pchist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let mut pcprof_samp: u64 = 0;
@@ -379,7 +377,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
 
     // On-demand crash dump (SP_EMU_DUMP_DIR): when the file `<dir>/.trigger`
     // appears, write a humility-hydrate-compatible RAM dump to <dir> and swap the
-    // trigger for `.done`. Lets us read the wedged SP's task table with no probe:
+    // trigger for `.done`. Reads a wedged SP's task table with no probe:
     //   touch <dir>/.trigger; zip <dir>; humility -a <ar> hydrate; humility -d tasks
     let dump_dir = std::env::var("SP_EMU_DUMP_DIR").ok();
     let dump_archive_id = std::env::var("SP_EMU_DUMP_ARCHIVE_ID").unwrap_or_default();
@@ -417,18 +415,18 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                 Err(_) => {}
             }
         }
-        // No one waiting: let the SP run so time advances between commands. Stop
-        // the batch early if the SP goes idle (WFI with nothing pending), so we
-        // sleep below instead of spinning through idle nops.
+        // No client waiting: run the SP so time advances between commands. Stop
+        // the batch early if the SP goes idle (WFI with nothing pending), to sleep
+        // below instead of spinning through idle nops.
         // During a reply (phase 2), the RoT has asserted rot-irq and the SP clocks
         // the response back in one CS-asserted window. The response can be much
         // larger than the 16-byte FIFO (e.g. a 512-byte CMPA page), so the RoT must
-        // keep refilling `miso` as the SP drains it. To let that interleave, run the
-        // SP in small bursts (not a full quantum) while a reply is in flight, and —
-        // crucially — yield the instant `miso` drains so the SP never clocks past
-        // what the RoT has produced (reading an empty miso feeds zeros into the
-        // response and corrupts its CRC). Gated on rot_irq so the request phase
-        // (phase 1), where miso is just primed zeros, is completely unaffected.
+        // keep refilling `miso` as the SP drains it. To interleave that, run the SP
+        // in small bursts (not a full quantum) while a reply is in flight, and
+        // yield the instant `miso` drains so the SP never clocks past what the RoT
+        // has produced (reading an empty miso feeds zeros into the response and
+        // corrupts its CRC). Gated on rot_irq so the request phase (phase 1), where
+        // miso is just primed zeros, is unaffected.
         let replying = crate::sprot::link()
             .map(|l| { let l = l.borrow(); l.rot_irq && l.cs }).unwrap_or(false);
         let sp_burst = if replying { 48 } else { quantum };
@@ -442,7 +440,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             cpu.maybe_interrupt(&mut bus);
             if cpu.idle_skip > 0 { break; }
             // Phase-2 lockstep: if the RoT is replying and its TX FIFO (miso) has
-            // drained, stop so the RoT can refill before we clock more.
+            // drained, stop so the RoT can refill before clocking more.
             if let Some(l) = crate::sprot::link() {
                 let l = l.borrow();
                 if l.rot_irq && l.cs && l.miso.is_empty() { break; }
@@ -460,26 +458,26 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         // would never see the RX and the channel would deadlock).
         bus.pump_uart(host);
         // Whether the RoT is mid-exchange (a request in flight or still building a
-        // reply). When true we must NOT sleep the host below: an idle SP parked in
+        // reply). When true, do not sleep the host below: an idle SP parked in
         // wait_rot_irq would otherwise pay a full idle_ms (~20ms) per poll cycle
         // while the RoT works, turning a sprot round-trip (read-cmpa, rot_boot_info)
-        // into seconds. We only sleep when BOTH cores are genuinely quiescent, which
-        // also keeps the two-core instance's idle CPU low so its timeshare priority
-        // doesn't decay (the cause of the multi-second `voxel sp state` latency).
+        // into seconds. Sleep only when both cores are quiescent, which also keeps
+        // the two-core instance's idle CPU low so its timeshare priority doesn't
+        // decay (the cause of the multi-second `voxel sp state` latency).
         let mut rot_busy = false;
         // Step the in-process RoT core a quantum (it mostly idles, waking to
         // answer the SP over the sprot link).
         if let Some((rc, rb)) = rot.as_mut() {
-            // Wake the RoT's FLEXCOMM8 slave (irq 59) whenever it owes us a receive
-            // — i.e. there is an un-processed slave-select assert latched (`ssa`) or
-            // a transfer is currently active (`cs`). Keying off the latched `ssa`,
-            // not just current CS, is essential: the SP can assert->clock->deassert CS
-            // entirely within its own quantum, so by now CS is already de-asserted,
-            // yet the RoT still owes us the receive and is asleep in
-            // sys_recv_notification(SPI_IRQ) — without the IRQ it sleeps forever and
-            // the request is never read. Also wake the SP's spi-core (irq 84) while
-            // CS is asserted, since its transfer loop sleeps when RX momentarily
-            // drains during a multi-FIFO reply.
+            // Wake the RoT's FLEXCOMM8 slave (irq 59) whenever it owes a receive —
+            // i.e. an un-processed slave-select assert is latched (`ssa`) or a
+            // transfer is active (`cs`). Keying off the latched `ssa`, not just
+            // current CS, is required: the SP can assert->clock->deassert CS within
+            // its own quantum, so CS is already de-asserted by now, yet the RoT
+            // still owes the receive and is asleep in sys_recv_notification(SPI_IRQ)
+            // — without the IRQ it sleeps forever and the request is never read.
+            // Also wake the SP's spi-core (irq 84) while CS is asserted, since its
+            // transfer loop sleeps when RX momentarily drains during a multi-FIFO
+            // reply.
             // "sprot active" = an assert is latched (ssa), CS is asserted (cs), or a
             // reply is pending (rot_irq, waiting for the SP to clock phase 2).
             let (ssa_or_cs, cs_now, req_in_flight) = crate::sprot::link()
@@ -488,31 +486,29 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             if ssa_or_cs { rb.pend_irq(59); }
             if cs_now { bus.pend_irq(84); }
             // Stay full-speed only during an actual exchange (clocking, or a request
-            // being processed) — NOT for the RoT's idle housekeeping, so the instance
+            // being processed), not for the RoT's idle housekeeping, so the instance
             // sleeps when quiescent and keeps its scheduling priority.
             rot_busy = ssa_or_cs || req_in_flight;
-            // Let the RoT run many quanta back-to-back so it finishes a request's
+            // Run the RoT many quanta back-to-back so it finishes a request's
             // handler in one go — IPC to update_server, up to 32 flash reads for a
             // CMPA page, building + CRCing the response — and asserts rot-irq before
             // the SP's response-wait times out. With one quantum per outer iteration
             // the SP's poll-timer out-ran the RoT on a large reply (read-cmpa), so the
-            // SP saw a stale irq and retried until timeout. Stopped the instant the
-            // RoT idles (nothing to do — the common case, so no overhead at rest) or
-            // the reply is ready (rot-irq asserted), so the SP isn't starved during
-            // phase-2 clocking (where it ping-pongs with the SP one quantum at a time).
-            // Only grant the big back-to-back budget while an exchange is actually
-            // happening (clocking, or a request being processed). When idle, one
-            // quantum per outer iteration is plenty and keeps CPU near the baseline
-            // single-core instance, so the host scheduler doesn't decay this
-            // instance's priority (the real cause of slow/variable `voxel sp state`).
+            // SP saw a stale irq and retried until timeout. Stop the instant the RoT
+            // idles (the common case, so no overhead at rest) or the reply is ready
+            // (rot-irq asserted), so the SP isn't starved during phase-2 clocking
+            // (where it ping-pongs with the SP one quantum at a time). Grant the big
+            // back-to-back budget only while an exchange is happening; when idle, one
+            // quantum per outer iteration keeps CPU near the baseline single-core
+            // instance so the host scheduler doesn't decay this instance's priority.
             let rot_budget = if ssa_or_cs || req_in_flight { 256 } else { 1 };
             'rot_burst: for _ in 0..rot_budget {
                 let mut rot_idled = false;
                 for _ in 0..quantum {
                     if let Err(t) = rc.step(rb, host) {
-                        // A RoT task that hits an unimplemented/undecodable instruction
-                        // would otherwise re-fault every quantum, silently wedged (the
-                        // kernel never sees a fault exception here). Surface it once.
+                        // A RoT task hitting an unimplemented/undecodable instruction
+                        // would re-fault every quantum, silently wedged (the kernel
+                        // never sees a fault exception here). Surface it once.
                         let tpc = t.pc();
                         if crate::sprot::dbg() && tpc != last_rottrap {
                             last_rottrap = tpc;
@@ -537,10 +533,10 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                 if rot_idled { break; }
                 if crate::sprot::link().map(|l| l.borrow().rot_irq).unwrap_or(false) { break; }
             }
-            // RoT PC sampling: when SP_EMU_ROTPC=N is set, log the RoT pc every N
-            // instructions, but only while a sprot exchange is in flight (CS has
-            // been touched) so the noise is bounded. Used to locate where the RoT
-            // wedges when it reads a request but never replies.
+            // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions,
+            // only while a sprot exchange is in flight (CS has been touched) to
+            // bound the noise. Locates where the RoT wedges when it reads a request
+            // but never replies.
             if let Some(n) = rotpc_every {
                 if rc.cycles >= rotpc_next {
                     rotpc_next = rc.cycles + n;
@@ -562,8 +558,8 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             // Shared-RoT IPC path: no in-process RoT core. Act as the SP's link
             // peer — accumulate the request the SP clocks out, ship it to the
             // shared rot-service on CS-deassert, stuff the reply into `miso` and
-            // raise rot-irq (the EXTI block below wakes the SP). A 16-byte TX FIFO
-            // means we must drain `mosi` as the SP clocks, or a >16B request caps.
+            // raise rot-irq (the EXTI block below wakes the SP). The 16-byte TX FIFO
+            // requires draining `mosi` as the SP clocks, or a >16B request caps.
             if let Some(l) = crate::sprot::link() {
                 let ssd = {
                     let mut lk = l.borrow_mut();
@@ -591,16 +587,16 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                     awaiting_reply = true;
                 } else if awaiting_reply && ssd {
                     // The SP deasserted CS after clocking in the reply -> this sprot
-                    // transaction is complete. Deassert rot-irq and DROP any unread
-                    // reply bytes, so the NEXT request the SP clocks (e.g. the
-                    // caboose's multi-step follow-up read) is captured WHOLE.
+                    // transaction is complete. Deassert rot-irq and drop any unread
+                    // reply bytes, so the next request the SP clocks (e.g. the
+                    // caboose's multi-step follow-up read) is captured whole.
                     //
-                    // Keying end-of-transaction on `miso.is_empty()` was the bug: if
+                    // Keying end-of-transaction on `miso.is_empty()` was a bug: if
                     // the SP left even one reply byte unread, `awaiting_reply` stuck
-                    // true and the HEAD of the next request got eaten by the phase-2
+                    // true and the head of the next request got eaten by the phase-2
                     // `mosi.clear()` above -> a truncated request -> the RoT never
                     // sees a complete frame and grinds in its TX loop forever. The
-                    // SP's CS edge is the real protocol boundary; use it.
+                    // SP's CS edge is the protocol boundary; use it.
                     let mut lk = l.borrow_mut();
                     lk.rot_irq = false;
                     lk.ssa = false;
@@ -616,7 +612,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         // latch the SP's EXTI pending bit and pend the EXTI3 NVIC IRQ (9, routed to
         // the sys task's exti wildcard). The sys task then posts the ROT_IRQ
         // notification and sprot's wait_rot_irq returns at once, instead of waiting
-        // out its fallback poll-timer — which is what made sprot round-trips slow.
+        // out its fallback poll-timer (which made sprot round-trips slow).
         {
             let now_irq = crate::sprot::link().map(|l| l.borrow().rot_irq).unwrap_or(false);
             if now_irq != prev_rot_irq {
@@ -660,10 +656,10 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             }
             pcprof_last = std::time::Instant::now();
         }
-        // Only sleep if we're GENUINELY idle: the SP hit WFI with nothing pending
-        // AND pump_eth didn't just inject an MGS packet to handle. Under real MGS
-        // load (continuous sensor polling) there's almost always a pending packet,
-        // so we stay full-speed and responsive; we only sleep when MGS is quiet.
+        // Sleep only when genuinely idle: the SP hit WFI with nothing pending and
+        // pump_eth didn't just inject an MGS packet to handle. Under real MGS load
+        // (continuous sensor polling) there's almost always a pending packet, so
+        // the loop stays full-speed and responsive; sleep only when MGS is quiet.
         if cpu.idle_skip > 0 {
             cpu.idle_skip = 0;
             if !bus.any_pending_irq() && !rot_busy {

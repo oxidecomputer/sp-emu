@@ -7,9 +7,8 @@
 
 set -euo pipefail
 
-# Resolve everything relative to this repo (the dir this script lives in), so the
-# demo works no matter where the checkout is or where it's launched from. Override
-# any of SPEMU / SP_EMU_FLASH in the environment to point elsewhere.
+# Resolve paths relative to this script's directory; works regardless of checkout
+# location or launch directory. Override SPEMU / SP_EMU_FLASH in the environment.
 
 HERE="$(cd -- "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd -P)"
 ROOT="$(cd -- "$HERE/.." >/dev/null 2>&1 && pwd -P)"
@@ -17,7 +16,7 @@ ROOT="$(cd -- "$HERE/.." >/dev/null 2>&1 && pwd -P)"
 SPEMU="${SPEMU:-$ROOT/target/release/sp-emu}"
 SP_BASE="${SP_BASE:-33310}"
 LOG="${LOG:-/tmp/sp-emu-demo.log}"
-# The flash image (gimlet-c in slot A) lives at the repo root by convention.
+# Flash image (gimlet-c in slot A); located at the repo root by convention.
 export SP_EMU_FLASH="${SP_EMU_FLASH:-$ROOT/sp-flash.bin}"
 
 if [ ! -s "$SP_EMU_FLASH" ]; then

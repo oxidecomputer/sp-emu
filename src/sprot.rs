@@ -1,6 +1,6 @@
 //! In-process sprot bridge: connects the emulated SP (STM32H7) to the emulated
-//! RoT (LPC55) over their SPI link, so the SP's REAL `drv-stm32h7-sprot-server`
-//! talks to the RoT's REAL `drv-lpc55-sprot-server`.
+//! RoT (LPC55) over their SPI link, so the SP's real `drv-stm32h7-sprot-server`
+//! talks to the RoT's real `drv-lpc55-sprot-server`.
 //!
 //! Wiring (all single-threaded — SP and RoT cores interleave in `gdb::serve`):
 //!   - SP `SPI4` master  @ 0x4001_3400  (this crate's `SpiMaster`)
@@ -32,29 +32,29 @@ pub struct SprotLink {
     pub cs: bool,           // chip select asserted (SP PE4 low)
     pub rot_irq: bool,      // RoT asserting rot-irq (P0_18 low)
     // Sticky SPI slave-select latches. Set by the SP-side CS driver (soc.rs, the
-    // PE4 GPIO write) on each CS edge, NOT by the RoT polling `cs`. This is the
-    // fix for the two-core interleaving race: the SP can assert->clock->deassert CS
-    // entirely within its own quantum before the RoT ever runs, so an RoT that
-    // derives SSA/SSD from edge-detecting `cs` at register-access time misses the
-    // edges and `wait_for_csn_asserted` hangs (or fires inconsistently across
-    // boots). Latching on the SP side — which always observes its own writes —
-    // plus `mosi`/`miso` buffering makes the handshake deterministic regardless of
-    // how the cores interleave. On real silicon these flags are latched in the
-    // SPI block independent of the CPU; this mirrors that. Cleared by the RoT via
-    // STAT write-1-clear (ssa/ssd) or consumed on the first FIFORD read (sot).
+    // PE4 GPIO write) on each CS edge, not by the RoT polling `cs`. Fixes the
+    // two-core interleaving race: the SP can assert/clock/deassert CS entirely
+    // within its own quantum before the RoT ever runs, so an RoT that derives
+    // SSA/SSD from edge-detecting `cs` at register-access time misses the edges and
+    // `wait_for_csn_asserted` hangs (or fires inconsistently across boots). Latching
+    // on the SP side, which always observes its own writes, plus `mosi`/`miso`
+    // buffering makes the handshake deterministic regardless of how the cores
+    // interleave. On real silicon these flags are latched in the SPI block
+    // independent of the CPU; this mirrors that. Cleared by the RoT via STAT
+    // write-1-clear (ssa/ssd) or consumed on the first FIFORD read (sot).
     pub ssa: bool,         // slave-select asserted latch (CS went low/asserted)
     pub ssd: bool,         // slave-select de-asserted latch (CS went high)
     pub sot_pending: bool, // next FIFORD frame carries Start-Of-Transfer
     // SP-side EXTI pending latch for the ROT_IRQ line (PE3 = EXTI line 3). Set by
     // the serve loop when the RoT toggles rot-irq, surfaced on the SP's EXTI
     // CPUPR1 register so the SP's sys task delivers the ROT_IRQ notification and
-    // sprot's wait_rot_irq wakes immediately — instead of polling out a timer
-    // (which made every sprot round-trip pay a multi-ms-to-second timeout).
+    // sprot's wait_rot_irq wakes immediately, instead of polling out a timer (which
+    // made every sprot round-trip pay a multi-ms-to-second timeout).
     pub sp_rot_irq_pending: bool,
     // True from when the RoT starts receiving a request (first FIFORD read) until
-    // it signals the reply (rot-irq asserted). Used by the serve loop to NOT sleep
+    // it signals the reply (rot-irq asserted). Used by the serve loop to not sleep
     // the host while the RoT is actively processing a request, so the round-trip
-    // runs full-speed — WITHOUT pegging the CPU during the RoT's idle housekeeping
+    // runs full-speed, without pegging the CPU during the RoT's idle housekeeping
     // (which an over-broad "RoT ran a full quantum" heuristic did, decaying the
     // instance's scheduling priority and making `voxel sp state` slow/variable).
     pub request_in_flight: bool,
@@ -117,7 +117,7 @@ impl Mmio for SpiMaster {
                 if !self.rx.is_empty() { sr |= 1 << 0; }
                 // RXWNE(15) = a full 32-bit word (>=4 bytes); RXPLVL(14:13) = the
                 // 0..3 trailing bytes otherwise. The driver's can_rx_byte() reads
-                // both, so getting these bits right is what lets it drain the tail.
+                // both, so these bits must be correct for it to drain the tail.
                 if self.rx.len() >= 4 { sr |= 1 << 15; }
                 else { sr |= ((self.rx.len() as u32) & 0x3) << 13; }
                 if self.tsize != 0 && self.sent >= self.tsize { sr |= (1 << 3) | (1 << 12); }
@@ -196,7 +196,7 @@ impl Mmio for RotSpiSlave {
                        // first byte = upper (see read_u16_with_sot / get_u16).
                 let (hi, lo, sot) = {
                     let mut lk = self.link.borrow_mut();
-                    // A request is now being received; stays "in flight" (keeping the
+                    // A request is now being received; stays in flight (keeping the
                     // host full-speed) until the RoT asserts rot-irq with the reply.
                     lk.request_in_flight = true;
                     let hi = lk.mosi.pop_front().unwrap_or(0) as u32;
@@ -265,11 +265,11 @@ impl Mmio for LpcGpio {
         match off & !3 {
             0x2100 => self.p0, // PIN[0]
             0x2104 => {
-                // PIN[1]: bit 1 = CHIP_SELECT (P1_1), the SP's RoT chip-select, which
-                // is active-low. The RoT's wait_for_csn_deasserted spins until it
-                // reads this pin HIGH, so it MUST reflect the SP's CS (link.cs):
-                // asserted -> 0, de-asserted -> 1. Without this the RoT would never
-                // observe CS go high and would loop forever after a transfer.
+                // PIN[1]: bit 1 = CHIP_SELECT (P1_1), the SP's RoT chip-select,
+                // active-low. The RoT's wait_for_csn_deasserted spins until it reads
+                // this pin high, so it must reflect the SP's CS (link.cs): asserted
+                // -> 0, de-asserted -> 1. Without this the RoT never observes CS go
+                // high and loops forever after a transfer.
                 let cs = self.link.borrow().cs;
                 if cs { 0 } else { 1 << 1 }
             }
@@ -305,12 +305,12 @@ impl Mmio for LpcGpio {
 // drv-stm32h7-sprot-server's `wait_rot_irq` can sleep until the RoT signals a
 // reply, rather than polling. The sys ISR reads CPUPR1 (0x88) to find pending
 // lines, AND-masks with CPUIMR1 (0x80, the enable mask it wrote), posts the
-// owning task's notification, then write-1-clears the pending bit. We model
-// CPUPR1 bit 3 from the shared rot-irq pending latch (set by the serve loop on a
-// rot-irq edge, which also pends NVIC IRQ 9 = exti3); every other EXTI register
-// is plain store/return so the sys task's edge/enable config reads back. Without
-// this, EXTI fell into the catch-all and CPUPR1 never set, so the SP always
-// waited out its fallback timer — the cause of slow/variable `voxel sp state`.
+// owning task's notification, then write-1-clears the pending bit. CPUPR1 bit 3 is
+// modeled from the shared rot-irq pending latch (set by the serve loop on a
+// rot-irq edge, which also pends NVIC IRQ 9 = exti3); every other EXTI register is
+// plain store/return so the sys task's edge/enable config reads back. Without this,
+// EXTI fell into the catch-all and CPUPR1 never set, so the SP always waited out
+// its fallback timer, the cause of slow/variable `voxel sp state`.
 pub struct SpExti {
     link: Link,
     regs: std::collections::HashMap<u32, u32>,

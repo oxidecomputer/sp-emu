@@ -4,18 +4,17 @@
 #
 #   ./run-sidecar.sh            # boot the sidecar on ports 33300 (switch0) / 33301 (switch1)
 #
-# This boots the `sidecar-c-emu` image: the production sidecar firmware built
-# with the `emulator` feature on drv-sidecar-seq-server, which skips the
-# hardware bring-up the emulator can't drive (VPD EEPROM, idt8a34003 clock gen,
-# front-IO board, Tofino power sequencer) and injects a canned MAC/identity so
-# the sequencer reaches its dispatch loop reporting A2. a4x2's Tofino data plane
-# is SoftNPU (software P4), so the SP only needs to answer MGS.
+# Boots the `sidecar-c-emu` image: production sidecar firmware built with the
+# `emulator` feature on drv-sidecar-seq-server, which skips hardware bring-up the
+# emulator can't drive (VPD EEPROM, idt8a34003 clock gen, front-IO board, Tofino
+# power sequencer) and injects a canned MAC/identity so the sequencer reaches its
+# dispatch loop reporting A2. a4x2's Tofino data plane is SoftNPU (software P4),
+# so the SP only needs to answer MGS.
 
 set -euo pipefail
 
-# Resolve everything relative to this repo (the dir this script lives in), so the
-# demo works no matter where the checkout is or where it's launched from. Override
-# any of SPEMU / SP_EMU_FLASH in the environment to point elsewhere.
+# Resolve paths relative to this script's directory; works regardless of checkout
+# location or launch directory. Override SPEMU / SP_EMU_FLASH in the environment.
 HERE="$(cd -- "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd -P)"
 ROOT="$(cd -- "$HERE/.." >/dev/null 2>&1 && pwd -P)"
 
@@ -23,7 +22,7 @@ SPEMU="${SPEMU:-$ROOT/target/release/sp-emu}"
 SP_BASE="${SP_BASE:-33300}"
 LOG="${LOG:-/tmp/sp-emu-sidecar.log}"
 export SP_EMU_BOARD=sidecar
-# The flash image (sidecar-c-emu in slot A) lives at the repo root by convention.
+# Flash image (sidecar-c-emu in slot A); located at the repo root by convention.
 export SP_EMU_FLASH="${SP_EMU_FLASH:-$ROOT/sidecar-flash.bin}"
 
 if [ ! -s "$SP_EMU_FLASH" ]; then

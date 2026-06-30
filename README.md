@@ -94,7 +94,9 @@ The `demo/` directory wraps all of this in scripts:
 
 - `demo/run-sp.sh` boots a gimlet SP and waits until it is reachable; `demo/mgs`
   and `demo/tasks` talk to it.
-- `demo/run-fleet.sh` brings up several SPs plus a shared RoT over the sprot link.
+- `demo/run-sp-rot.sh` boots a gimlet SP together with an emulated RoT over the
+  sprot link, so `mgs state` returns real RoT boot-info instead of `rot: Err(...)`.
+- `demo/run-fleet.sh` brings up several SPs.
 - `demo/i2c-sniff.sh` streams every I2C transaction the firmware makes.
 - `demo/i2c-device.sh` answers as the SP's I2C devices, so you can inject a value
   (a temperature, say) and read it back through Hubris over MGS.

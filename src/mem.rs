@@ -2,8 +2,8 @@
 //!
 //! Two kinds of regions: flat RAM/flash (backed by a `Vec<u8>`) and MMIO
 //! peripherals (a `dyn Mmio`). Anything unmapped is logged and returns 0 / is
-//! swallowed — during bringup we want the trace to keep moving and *show* us the
-//! unmodeled accesses, not fault on the first one.
+//! swallowed, so the trace keeps moving and surfaces unmodeled accesses rather
+//! than faulting on the first one.
 
 use anyhow::{bail, Result};
 
@@ -45,9 +45,9 @@ pub struct Bus {
     /// harness, which can't mirror peripheral semantics). Reset by the caller.
     pub mmio_hit: bool,
     /// Set whenever a peripheral device is accessed; lets `collect_irqs` skip the
-    /// all-device IRQ poll on the (vast majority of) instructions that touch no
-    /// device. Sound because every modeled device raises its IRQ only in response
-    /// to an MMIO access (TIM16 arming, I2C/SPI transactions) — none autonomously.
+    /// all-device IRQ poll on instructions that touch no device. Sound because
+    /// every modeled device raises its IRQ only in response to an MMIO access
+    /// (TIM16 arming, I2C/SPI transactions) — none autonomously.
     dev_touched: bool,
     /// When true, record every memory write (for the differential harness to
     /// replay into the reference model, incl. writes from skipped instructions).
@@ -162,8 +162,8 @@ impl Bus {
     }
 
     /// VSC85x2 management PHY register read (over MDIO). net's vsc85xx driver
-    /// reads the PHY ID, revision, and an 8051-patch CRC; returning the values
-    /// that make `init_sgmii` accept the chip and SKIP the firmware download.
+    /// reads the PHY ID, revision, and an 8051-patch CRC; returns the values
+    /// that make `init_sgmii` accept the chip and skip the firmware download.
     fn phy_read(&self, page: u16, reg: u8) -> u16 {
         match (page, reg) {
             // BMCR (reg 0): the soft-reset bit (15) self-clears when reset completes;
@@ -218,20 +218,20 @@ impl Bus {
     }
 
     /// Walk the TX descriptor ring from `tx_next`, emitting every descriptor the
-    /// driver has handed us (OWN bit set), and hand ownership back. Mirrors the
-    /// Synopsys DMA: tdes0=buffer addr, tdes2=length, tdes3 bit31=OWN.
+    /// driver owns (OWN bit set), and hand ownership back. Mirrors the Synopsys
+    /// DMA: tdes0=buffer addr, tdes2=length, tdes3 bit31=OWN.
     fn eth_tx_walk(&mut self) {
         let base = self.eth_reg(DMACTXDLAR);
         let ring_len = (self.eth_reg(DMACTXRLR) & 0xFFFF) + 1;
         let mut sent = false;
         // Scan the whole ring in order, emitting every descriptor the driver owns
         // (OWN set) and handing it back. Scanning all (rather than tracking a
-        // position) keeps us robust to the VLAN layout's 2-descriptors-per-slot
+        // position) is robust to the VLAN layout's 2-descriptors-per-slot
         // indexing, and guarantees `can_send()` sees a free TX ring afterwards.
         for i in 0..ring_len {
             let d = base.wrapping_add(i.wrapping_mul(16));
             let tdes3 = self.read32(d + 12);
-            if tdes3 & (1 << 31) == 0 { continue; } // driver owns it -> nothing to send
+            if tdes3 & (1 << 31) == 0 { continue; } // driver owns it: nothing to send
             self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN — back to the driver
             // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
             // insert into the following packet. Not a packet itself — don't emit.
@@ -284,9 +284,9 @@ impl Bus {
 
     /// True if the SP has queued one or more frames for transmit but the serve
     /// loop hasn't flushed them to the bridge yet. The serve loop polls this to
-    /// break its instruction batch the instant a reply is ready, so a round-trip
-    /// costs ~one small quantum instead of waiting out a full batch (the eth
-    /// latency that, under rack contention, blows MGS's per-attempt budget).
+    /// break its instruction batch as soon as a reply is ready, so a round-trip
+    /// costs ~one small quantum instead of a full batch (the eth latency that,
+    /// under rack contention, exceeds MGS's per-attempt budget).
     pub fn eth_has_tx(&self) -> bool { !self.eth.tx_frames.is_empty() }
 
     /// Glue between the ETH DMA and the host network bridge: forward transmitted
@@ -295,10 +295,10 @@ impl Bus {
     pub fn pump_eth(&mut self, host: &mut dyn crate::host::HostIo) {
         for f in self.eth_take_tx() { host.eth_tx(&f); }
         // Drain the host network into the bridge once, then deliver only as many
-        // frames as the RX ring can accept right now. Checking ring space BEFORE
+        // frames as the RX ring can accept right now. Checking ring space before
         // popping means a frame is never lost to a full ring — it stays queued in
-        // the bridge (governed solely by the bridge's flow-fair backlog cap) and
-        // is delivered on a later pump once the SP frees a descriptor.
+        // the bridge (governed by the bridge's flow-fair backlog cap) and is
+        // delivered on a later pump once the SP frees a descriptor.
         host.eth_poll();
         while self.eth_rx_has_space() {
             match host.eth_rx() {
@@ -337,9 +337,9 @@ impl Bus {
         if ring_dbg {
             eprintln!("[rx-ok] rx_next={} ringlen={} d={:#x} cyc={}", self.eth.rx_next, ring_len, d, self.cur_cyc);
         }
-        // The bridge hands us a tagged wire frame. The MAC strips the 802.1Q tag
+        // The bridge supplies a tagged wire frame. The MAC strips the 802.1Q tag
         // and reports the VID in RDES0 (RS0V); net drops frames lacking a valid
-        // VID. The buffer net reads is the untagged frame (MAC strips the tag).
+        // VID, and reads the untagged frame from the buffer.
         let tagged = frame.len() >= 16 && u16::from_be_bytes([frame[12], frame[13]]) == VLAN_TPID;
         let vid = if tagged { u16::from_be_bytes([frame[14], frame[15]]) & 0xFFF } else { 0 };
         let untagged: Vec<u8>;
@@ -431,7 +431,7 @@ impl Bus {
     pub fn collect_irqs(&mut self) {
         // Poll devices only if one was accessed since the last collect — no modeled
         // device raises an IRQ without an MMIO access, so this is exact, not lossy,
-        // and skips ~15-20 virtual take_irq() calls on every compute-only instruction.
+        // and skips ~15-20 take_irq() calls on every compute-only instruction.
         if self.dev_touched {
             self.dev_touched = false;
             let mut raised = [0u16; 8];

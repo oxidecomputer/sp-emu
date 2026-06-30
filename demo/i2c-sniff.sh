@@ -4,14 +4,14 @@
 # Box-local: flashes a hubris image, boots a standalone sp-emu with
 # SP_EMU_I2C_BRIDGE pointed at `sp-emu i2c-sniff`, and live-streams one line per
 # bus transaction as the SP brings the board up. Ends with a per-device summary.
-# Prints each fully-expanded command it runs, transcript style.
+# Prints each fully-expanded command, transcript style.
 # Usage: demo-i2c-sniff.sh [hubris-image.zip]
 #
 set -u
 HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 SP="${SPEMU:-$(cd "$HERE/.." >/dev/null 2>&1 && pwd -P)/target/release/sp-emu}"
 
-# The hubris image is from the separate hubris repo: pass it as arg 1 or set $IMG.
+# Hubris image is from the separate hubris repo: pass it as arg 1 or set $IMG.
 IMG="${1:-${IMG:-}}"
 SNIFFSOCK="[::1]:9100"
 TRACE=/tmp/i2c-demo-trace.log

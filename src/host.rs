@@ -1,9 +1,9 @@
-//! Host-integration boundary
+//! Host-integration boundary.
 //!
-//! Phase 1 exposes just a serial/console sink. Phase 2 (networking, so a switch
-//! zone can talk to the emulated SP) adds a tap method here. Keeping the core
-//! behind this trait is precisely what lets the emulator develop on macOS today
-//! and later drop onto illumos/Helios by swapping only this shim
+//! Phase 1 exposes a serial/console sink. Phase 2 (networking, letting a switch
+//! zone talk to the emulated SP) adds a tap method here. Keeping the core behind
+//! this trait lets the emulator run on macOS today and later target
+//! illumos/Helios by swapping only this shim.
 
 pub trait HostIo {
     /// Emit one byte from an emulated UART / semihosting console.
@@ -34,7 +34,7 @@ pub trait HostIo {
     fn host_uart_rx(&mut self) -> Option<u8> { None }
 }
 
-/// Default host: forward emulated console bytes to our stdout. Ethernet frames
+/// Default host: forward emulated console bytes to stdout. Ethernet frames
 /// are dropped unless `$SP_EMU_ETHDBG` is set, in which case TX frames are logged.
 pub struct StdoutHost;
 

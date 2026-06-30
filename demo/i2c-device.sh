@@ -3,21 +3,21 @@
 # demo-i2c-device.sh - a local socket acts as an I2C device for the emulated SP.
 # Box-local: a `sp-emu i2c-device` server injects a chosen response for
 # one device/register (defers the rest to the built-in model so the SP boots),
-# the SP delegates its I2C reads to it, and we watch the SP consume the value.
-# Prints each fully-expanded command it runs, transcript style.
+# the SP delegates its I2C reads to it, and the SP is observed consuming the value.
+# Prints each fully-expanded command, transcript style.
 #
 # Usage:
 #   demo-i2c-device.sh [inject-spec]                 show the SP reading the injection
 #   demo-i2c-device.sh --read-sensor [inject-spec]   ALSO read the value back through
 #                                                    Hubris's sensor API over MGS
-# Default inject-spec: 0x48/0x00=0x4000  (front TMP117 TempResult = ~128 C, for the lolz).
+# Default inject-spec: 0x48/0x00=0x4000  (front TMP117 TempResult = ~128 C).
 
 set -u
 
-# Resolve the sp-emu binary relative to this script (demo/ -> repo root), so the
-# demo works wherever the repo lives. faux-mgs is in the separate
-# management-gateway-service repo: set $FAUX to your build of it (only needed for
-# --read-sensor). The hubris image is a separate repo too; override with $IMG.
+# Resolve the sp-emu binary relative to this script (demo/ -> repo root); works
+# regardless of repo location. faux-mgs is in the separate management-gateway-service
+# repo: set $FAUX to that build (only needed for --read-sensor). The hubris image is
+# a separate repo too; override with $IMG.
 
 HERE="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd -P)"
 SP="${SPEMU:-$(cd "$HERE/.." >/dev/null 2>&1 && pwd -P)/target/release/sp-emu}"
@@ -41,7 +41,7 @@ rm -f "$LOG" "$FLASH"
 pkill -f "$SP i2c-device" 2>/dev/null; pkill -f "$SP i2c-sniff" 2>/dev/null
 pkill -f "$SP gdb a 340000000" 2>/dev/null; sleep 1
 
-run() { echo "\$ $*"; }   # print the fully-expanded command, then we run it
+run() { echo "\$ $*"; }   # print the fully-expanded command before running it
 
 run "SP_EMU_FLASH=$FLASH $SP flash a $IMG"
 SP_EMU_FLASH="$FLASH" "$SP" flash a "$IMG" 2>&1 || { echo flash failed; exit 1; }

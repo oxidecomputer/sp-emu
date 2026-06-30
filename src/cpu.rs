@@ -1,6 +1,6 @@
 //! Cortex-M7 (ARMv7E-M) CPU core: state, fetch/decode/step, the Thumb-2
 //! execution set Hubris uses, IT blocks, the M-profile system registers, and
-//! the exception entry/return + SVC machinery needed to reach the first task.
+//! the exception entry/return + SVC machinery to reach the first task.
 //!
 //! Decode is `yaxpeax-arm`. Execution semantics are hand-written.
 //! yaxpeax decodes M-profile MRS/MSR with A-profile semantics, so those two are
@@ -69,10 +69,10 @@ pub struct Cpu {
     pub last_disasm: String,
     decoder: InstDecoder,
     /// PC-keyed decode cache. Hubris executes in place from immutable flash, so
-    /// the decode of an instruction at a given flash PC never changes — caching it
+    /// the decode of an instruction at a given flash PC never changes; caching it
     /// removes the per-instruction fetch (two RAM reads) + yaxpeax decode, the
-    /// dominant cost in the hot loop. Only flash-window PCs are cached (the running
-    /// image is never self-modified; the flash-update path writes the OTHER slot).
+    /// dominant hot-loop cost. Only flash-window PCs are cached: the running
+    /// image is never self-modified, and the flash-update path writes the other slot.
     dcache: std::collections::HashMap<u32, Rc<Decoded>>,
     syst_csr: u32, // cached SYST_CSR (refreshed periodically in maybe_tick)
     syst_rvr: u32, // cached SYST_RVR reload value (>=1)
@@ -173,7 +173,7 @@ impl Cpu {
         // Fetch + decode, via the PC-keyed cache for flash code (the common case).
         let dec: Rc<Decoded> = if (FLASH_LO..FLASH_HI).contains(&pc) {
             match self.dcache.get(&pc) {
-                Some(d) => d.clone(), // Rc bump — cheap; decouples from the &mut self execute below
+                Some(d) => d.clone(), // Rc bump; decouples from the &mut self execute below
                 None => { let d = Rc::new(self.fetch_decode(pc, bus)); self.dcache.insert(pc, d.clone()); d }
             }
         } else {
@@ -197,9 +197,9 @@ impl Cpu {
         let res = match &dec.inst {
             Some(inst) => {
                 let len = dec.len;
-                // Formatting the disassembly is a heap alloc per instruction, only
-                // do it when something actually reads last_disasm (trace/diff). In
-                // production this is the single biggest per-instruction cost removed.
+                // Formatting the disassembly is a heap alloc per instruction; only
+                // do it when last_disasm is read (trace/diff). In production this is
+                // the largest per-instruction cost removed.
                 if self.record_disasm { self.last_disasm = format!("{}", inst); }
                 self.pc = pc.wrapping_add(len);
                 if cond_ok {
@@ -229,13 +229,12 @@ impl Cpu {
         res
     }
 
-    /// Fetch the instruction at `pc` and decode it (the work the dcache memoizes).
     /// ARMv8-M load-acquire / store-release (LDA/STL + B/H + LDAEX/STLEX), which
     /// yaxpeax's ARMv7 decoder rejects. The LPC55 RoT (Cortex-M33) uses these for
     /// atomics/sync. On a single-core emulator the acquire/release/exclusive
-    /// semantics are trivially satisfied, so they reduce to plain loads/stores
-    /// (exclusives always succeed). hw1 = 1110_1000_110L_Rnnn (0xE8C0 store,
-    /// 0xE8D0 load); hw2[11:8]=1111, hw2[7:4] = size/exclusive selector.
+    /// semantics reduce to plain loads/stores (exclusives always succeed).
+    /// hw1 = 1110_1000_110L_Rnnn (0xE8C0 store, 0xE8D0 load); hw2[11:8]=1111,
+    /// hw2[7:4] = size/exclusive selector.
     fn try_v8m(&mut self, raw: u32, pc: u32, bus: &mut Bus) -> bool {
         let hw1 = (raw & 0xFFFF) as u16;
         let hw2 = ((raw >> 16) & 0xFFFF) as u16;
@@ -304,14 +303,13 @@ impl Cpu {
             Opcode::DSB | Opcode::DMB | Opcode::ISB | Opcode::YIELD | Opcode::WFE => Ok(()),
             Opcode::WFI => {
                 // Wait-for-interrupt. When idle-throttling is enabled (the gdb
-                // serve loop, post-preboot) and nothing is pending to wake us,
-                // skip the idle spin: record the instructions we'd otherwise burn
-                // down to the next SysTick so the run loop can sleep the host
-                // instead of pegging a core, and collapse the countdown so the
-                // tick fires promptly. Preboot/run/diff keep wfi_throttle=false,
-                // so WFI stays a plain nop there (full-speed boot, no behavior
-                // change). The core still wakes immediately on a real IRQ
-                // (eth-irq from an injected MGS packet, etc.).
+                // serve loop, post-preboot) and nothing is pending, skip the idle
+                // spin: record the instructions otherwise burned down to the next
+                // SysTick so the run loop can sleep the host instead of pegging a
+                // core, and collapse the countdown so the tick fires promptly.
+                // Preboot/run/diff keep wfi_throttle=false, so WFI is a plain nop
+                // there (full-speed boot). The core still wakes immediately on a
+                // real IRQ (e.g. eth-irq from an injected MGS packet).
                 if self.wfi_throttle && self.systick > 1 && !bus.any_pending_irq() {
                     self.idle_skip = self.systick;
                     self.systick = 1;
@@ -498,13 +496,13 @@ impl Cpu {
             Opcode::STRH => self.store(ops, bus, 2, raw, len),
             Opcode::LDRD => self.load_double(ops, bus),
             Opcode::STRD => self.store_double(ops, bus),
-            // Unprivileged load/store (LDR*T/STR*T). yaxpeax also MIS-decodes some
+            // Unprivileged load/store (LDR*T/STR*T). yaxpeax also mis-decodes some
             // 32-bit T2 imm12 byte/half/word loads-stores as these "T" variants
             // (e.g. `strb r4,[sp,#3612]` -> `strbt`), so handle them identically to
-            // the privileged form — the emulator doesn't enforce MPU privilege, and
+            // the privileged form: the emulator doesn't enforce MPU privilege, and
             // store()/load() recompute the address from raw bits via mem_addr32,
-            // ignoring yaxpeax's (wrong) operands. Skipping these silently dropped a
-            // byte store -> corrupted net's socket handle -> garbage waker -> spin.
+            // ignoring yaxpeax's wrong operands. Skipping these dropped a byte
+            // store -> corrupted net's socket handle -> garbage waker -> spin.
             Opcode::STRBT => self.store(ops, bus, 1, raw, len),
             Opcode::STRHT => self.store(ops, bus, 2, raw, len),
             Opcode::STRT => self.store(ops, bus, 4, raw, len),
@@ -636,7 +634,9 @@ impl Cpu {
                     self.set_nz(r2); self.c = c1 || c2; self.v = (((a ^ !b) & (a ^ r2)) >> 31) & 1 != 0; }
                 Alu::Sub => self.flags_sub(a, b),
                 Alu::Rsb => self.flags_sub(b, a),
-                Alu::Sbc => { let b2 = b.wrapping_add(1 - cin); self.flags_sub(a, b2); }
+                // SBC = a + ~b + cin; flags from that addition (mirrors Adc).
+                Alu::Sbc => { let (r1, c1) = a.overflowing_add(!b); let (r2, c2) = r1.overflowing_add(cin);
+                    self.set_nz(r2); self.c = c1 || c2; self.v = (((a ^ b) & (a ^ r2)) >> 31) & 1 != 0; }
                 _ => self.set_nz(res),
             }
         }
@@ -807,7 +807,7 @@ impl Cpu {
         // Defer loading PC: a popped EXC_RETURN triggers an exception return that
         // changes the active stack pointer, and the writeback must be applied to
         // the current SP bank before that switch, otherwise it clobbers the SP
-        // the exception return just set. (This bites `pop {..,pc}` exception exits.)
+        // the exception return just set. Affects `pop {..,pc}` exception exits.
         let mut pc_val: Option<u32> = None;
         for i in 0..16u8 {
             if mask & (1 << i) != 0 {
@@ -874,9 +874,9 @@ impl Cpu {
 
     fn build_xpsr(&self) -> u32 {
         // ITSTATE is split across the EPSR field of xPSR: ITSTATE[7:2] -> bits
-        // [15:10], ITSTATE[1:0] -> bits [26:25]. This MUST be included so that an
-        // async interrupt taken mid-IT-block stacks the IT state and the
-        // interrupted task resumes its conditional run correctly on return.
+        // [15:10], ITSTATE[1:0] -> bits [26:25]. Must be included so an async
+        // interrupt taken mid-IT-block stacks the IT state and the interrupted
+        // task resumes its conditional run correctly on return.
         let it_hi = ((self.itstate >> 2) & 0x3F) as u32; // ITSTATE[7:2]
         let it_lo = (self.itstate & 0x3) as u32;          // ITSTATE[1:0]
         ((self.n as u32) << 31) | ((self.z as u32) << 30) | ((self.c as u32) << 29)
@@ -894,10 +894,9 @@ impl Cpu {
     }
 
     /// Drive the SysTick timer one instruction. When it underflows and the
-    /// timer interrupt is enabled, take the SysTick exception (vector 15) — but
+    /// timer interrupt is enabled, take the SysTick exception (vector 15), but
     /// only from thread mode with interrupts unmasked (the kernel runs SysTick
-    /// at the lowest priority, so it never preempts a handler). Returns whether
-    /// it fired (so the caller can record the stacked frame in diff mode).
+    /// at the lowest priority, so it never preempts a handler).
     pub fn maybe_tick(&mut self, bus: &mut Bus) {
         // SYST_CSR (enable/tickint) and SYST_RVR (reload) are configured once at
         // boot and ~never change, yet reading them through the full bus dispatch
@@ -922,8 +921,8 @@ impl Cpu {
 
     /// Deliver a pending NVIC interrupt, if any is enabled and unmasked. Like
     /// `maybe_tick`, called once per instruction. Hubris runs all IRQs below the
-    /// kernel's SVCall/PendSV/SysTick (priority 0), so we only preempt thread
-    /// mode (never a running handler) and honor PRIMASK/FAULTMASK/BASEPRI.
+    /// kernel's SVCall/PendSV/SysTick (priority 0), so only thread mode is
+    /// preempted (never a running handler), honoring PRIMASK/FAULTMASK/BASEPRI.
     pub fn maybe_interrupt(&mut self, bus: &mut Bus) {
         bus.collect_irqs();
         if self.mode != Mode::Thread || self.primask || self.faultmask { return; }
@@ -967,7 +966,7 @@ impl Cpu {
             eprintln!();
         }
         // Dump syscalls made from net's code range (flash 0x08008000-0x08017fff)
-        // so we can see the bogus buffer pointer it hands the kernel. r11=sysnum;
+        // to expose the bogus buffer pointer it hands the kernel. r11=sysnum;
         // for Recv the args are r4=buf r5=len r6=notif r7=sender; for Send/Reply
         // they're in r4-r7 too. Gated by SP_EMU_SVCDBG.
         if vecnum == 11 && crate::dbg::svc()
@@ -992,8 +991,8 @@ impl Cpu {
         let fpca = self.control & 4 != 0;
         let words = if fpca { 26 } else { 8 };
         let frame_base = self.r[SP].wrapping_sub(4 * words);
-        // Trace exceptions taken from a task's code (thread mode) so we can find
-        // a return that restores a corrupt PC. Gated by $SP_EMU_EXCDBG.
+        // Trace exceptions taken from a task's code (thread mode) to locate a
+        // return that restores a corrupt PC. Gated by $SP_EMU_EXCDBG.
         if self.mode == Mode::Thread && fpca && crate::dbg::exc() {
             eprintln!("[exc-ent] vec={} from_pc={:#010x} fpca={} it={:#04x} sp={:#010x} frame={:#010x} cyc={}",
                 vecnum, return_addr, fpca, self.itstate, self.r[SP], frame_base, self.cycles);
@@ -1039,8 +1038,8 @@ impl Cpu {
         let r3 = bus.read32(base + 12); let r12 = bus.read32(base + 16); let lr = bus.read32(base + 20);
         let pc = bus.read32(base + 24); let xpsr = bus.read32(base + 28);
         // Crash detector: a stacked return PC must point into flash (code). If it
-        // doesn't, either the exception frame was clobbered or the SP we restored
-        // from is wrong; dump the frame + context to pinpoint it.
+        // doesn't, either the exception frame was clobbered or the restored SP
+        // is wrong; dump the frame + context to pinpoint it.
         if !(0x0800_0000..0x0820_0000).contains(&pc) && self.bad_ret_dumps < 6 {
             self.bad_ret_dumps += 1;
             eprintln!("[exc-ret BAD] return PC={:#010x} (not flash!) exc={:#x} from_psp={} base={:#010x} lr={:#010x} xpsr={:#010x} cyc={}",
@@ -1359,8 +1358,8 @@ fn shift_c(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> (u32, bool) {
 }
 
 /// Decode a Thumb B/BL/BLX branch target straight from the instruction word.
-/// yaxpeax's BranchThumbOffset is inconsistent across encodings, so we don't
-/// use it. All targets are PC-relative with PC = instruction address + 4.
+/// yaxpeax's BranchThumbOffset is inconsistent across encodings and is unused
+/// here. All targets are PC-relative with PC = instruction address + 4.
 fn thumb_branch_target(raw: u32, pc: u32, len: u32) -> u32 {
     let hw1 = raw & 0xFFFF;
     if len == 2 {
