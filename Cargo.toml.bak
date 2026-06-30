@@ -1,0 +1,18 @@
+[package]
+name = "sp-emu"
+version = "0.0.1"
+edition = "2021"
+default-run = "sp-emu"
+description = "Native-Rust Cortex-M emulator for booting Oxide Hubris on emulated SPs/RoTs"
+
+[dependencies]
+yaxpeax-arch = "0.3"
+yaxpeax-arm = "0.4"
+object = { version = "0.36", default-features = false, features = ["read", "elf", "std"] }
+anyhow = "1"
+# Host-side only (the `flash` subcommand): read Hubris build archives, which are
+# zip files with bzip2-compressed entries. Not part of the emulator runtime.
+zip = { version = "2", default-features = false, features = ["bzip2", "deflate"] }
+
+[profile.release]
+debug = true

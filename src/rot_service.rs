@@ -266,8 +266,13 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
                     let _ = resp_tx.send(resp);
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    // No request in flight: keep the RoT alive in its receive loop.
-                    run_quantum(&mut rc, &mut rb, &mut host, 2048);
+                    // Keep stepping so the RoT finishes teardown and reads follow-up
+                    // requests, but once it goes idle stop spinning so an idle rot-serve
+                    // doesn't peg a core (a rack of N RoTs would starve the SP cores).
+                    let idled = run_quantum(&mut rc, &mut rb, &mut host, 2048);
+                    if idled {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => break,
             }
