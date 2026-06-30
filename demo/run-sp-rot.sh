@@ -93,8 +93,8 @@ done
 echo
 echo "online: [::1]:${SP_BASE} (switch0)  [::1]:$((SP_BASE+1)) (switch1); RoT at ${ROT_ADDR}"
 echo
-run "./mgs discover"
-run "./mgs state"
-run "./mgs inventory"
-run "./tasks"
-run "kill ${PID} ${ROT_PID}"
+echo "    ./mgs discover"
+echo "    ./mgs state"
+echo "    ./mgs inventory"
+echo "    ./tasks"
+echo "    kill ${PID} ${ROT_PID}"

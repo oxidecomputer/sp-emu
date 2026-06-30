@@ -49,8 +49,8 @@ done
 echo
 echo "online: [::1]:${SP_BASE} (switch0)  [::1]:$((SP_BASE+1)) (switch1)"
 echo
-run "SP_PORT=${SP_BASE} ./mgs discover"
-run "SP_PORT=$((SP_BASE+1)) ./mgs discover"
-run "SP_PORT=${SP_BASE} ./mgs state"
-run "SP_PORT=${SP_BASE} ./mgs inventory"
-run "kill ${PID}"
+echo "    SP_PORT=${SP_BASE} ./mgs discover"
+echo "    SP_PORT=$((SP_BASE+1)) ./mgs discover"
+echo "    SP_PORT=${SP_BASE} ./mgs state"
+echo "    SP_PORT=${SP_BASE} ./mgs inventory"
+echo "    kill ${PID}"
