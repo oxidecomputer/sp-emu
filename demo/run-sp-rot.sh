@@ -35,6 +35,8 @@ export SP_EMU_FLASH="${SP_EMU_FLASH:-$ROOT/sp-flash.bin}"
 # RoT image: first positional arg, else ROT_IMAGE.
 ROT_IMAGE="${1:-${ROT_IMAGE:-}}"
 
+run() { printf '$ %s\n' "$*"; }   # echo a command before running it
+
 if [ ! -s "$SP_EMU_FLASH" ]; then
   echo "[!] Flash image $SP_EMU_FLASH is missing/empty. Flash gimlet-c into slot A first:"
   echo "    $SPEMU flash a <hubris>/target/gimlet-c/dist/default/build-gimlet-c-image-default.zip"
@@ -57,33 +59,28 @@ if [ "$MAGIC2" != "504b" ] && [ "$SP_HI" != "20" ] && [ "$SP_HI" != "30" ]; then
   exit 1
 fi
 
-# Start the shared RoT first so its socket is listening before the SP connects.
-echo "[*] Starting emulated LPC55 RoT (oxide-rot-1 firmware) on ${ROT_ADDR}."
+# Start the RoT first so its socket is listening before the SP connects.
 : > "$ROT_LOG"
+run "${SPEMU} rot-serve ${ROT_ADDR} ${ROT_IMAGE} &"
 "$SPEMU" rot-serve "$ROT_ADDR" "$ROT_IMAGE" > "$ROT_LOG" 2>&1 &
 ROT_PID=$!
-echo "    pid ${ROT_PID}   (full log: ${ROT_LOG})"
-printf "    waiting for the RoT to bind its socket"
+echo "pid ${ROT_PID}, log ${ROT_LOG}"
+printf "waiting for the RoT to bind "
 until grep -q "rotsvc] listening on" "$ROT_LOG" 2>/dev/null; do
   if ! kill -0 "$ROT_PID" 2>/dev/null; then echo; echo "[!] RoT exited early — see ${ROT_LOG}"; exit 1; fi
   printf "."
   sleep 1
 done
 echo " ok"
-
-# Boot the SP, pointed at the RoT over the sprot link.
-echo "[*] Booting emulated gimlet SP: Hubris gimlet-c firmware on an"
-echo "    emulated STM32H753 (Cortex-M7). Binding MGS ports ${SP_BASE} (switch0)"
-echo "    and $((SP_BASE+1)) (switch1), with the RoT attached at ${ROT_ADDR}."
+echo
 : > "$SP_LOG"
+run "SP_EMU_BRIDGE=[::1]:${SP_BASE} SP_EMU_ROT_SERVICE=${ROT_ADDR} ${SPEMU} gdb a 340000000 &"
 SP_EMU_BRIDGEDBG=1 SP_EMU_BRIDGE="[::1]:${SP_BASE}" SP_EMU_ROT_SERVICE="$ROT_ADDR" \
   "$SPEMU" gdb a 340000000 > "$SP_LOG" 2>&1 &
 PID=$!
-echo "    pid ${PID}   (full log: ${SP_LOG})"
-echo "[*] Booting the kernel + 30+ tasks and bringing up the network — this is"
-echo "    real firmware, so it takes ~60-90s. Watching for the SP to appear..."
-printf "    "
-until grep -q "learned SP vid 0x301" "$SP_LOG" 2>/dev/null; do
+echo "pid ${PID}, log ${SP_LOG}"
+printf "waiting for the SP (~60-90s) "
+until grep -qE '\[sp-emu\] online|learned SP vid 0x301' "$SP_LOG" 2>/dev/null; do
   if ! kill -0 "$PID" 2>/dev/null; then
     echo; echo "[!] SP exited early — see ${SP_LOG}"; kill "$ROT_PID" 2>/dev/null || true; exit 1
   fi
@@ -94,14 +91,10 @@ until grep -q "learned SP vid 0x301" "$SP_LOG" 2>/dev/null; do
   sleep 2
 done
 echo
-echo "[+] SP + RoT ONLINE. The emulated gimlet is on the (virtual) management network,"
-echo "    with a live root-of-trust over the sprot link."
-echo "    Reach it with MGS at  [::1]:${SP_BASE}  (switch0)  or  [::1]:$((SP_BASE+1))  (switch1)."
+echo "online: [::1]:${SP_BASE} (switch0)  [::1]:$((SP_BASE+1)) (switch1); RoT at ${ROT_ADDR}"
 echo
-echo "    Now run, from this demo dir:"
-echo "        ./mgs discover     # MGS finds the SP"
-echo "        ./mgs state        # power state, MAC, firmware id — RoT status now OK, not Err"
-echo "        ./mgs inventory    # full gimlet component tree"
-echo "        ./tasks            # live Hubris task table (humility)"
-echo
-echo "    Stop both with:  kill ${PID} ${ROT_PID}"
+run "./mgs discover"
+run "./mgs state"
+run "./mgs inventory"
+run "./tasks"
+run "kill ${PID} ${ROT_PID}"
