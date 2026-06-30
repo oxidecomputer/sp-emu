@@ -1,11 +1,11 @@
 //! LPC55 (Cortex-M33 / ARMv8-M) SoC for the emulated Root-of-Trust, running the
-//! real `oxide-rot-1` Hubris firmware. Memory map mirrors chips/lpc55/memory.toml.
-//! Peripherals are modeled iteratively, driven by the firmware's accesses — the
+//! `oxide-rot-1` Hubris firmware. Memory map mirrors chips/lpc55/memory.toml.
+//! Peripherals are modeled iteratively, driven by the firmware's accesses, the
 //! same bring-up method used for the STM32H7 SP (see soc.rs).
 use crate::mem::{Bus, Mmio};
 
-/// Hubris RoT image slot A base (chips/lpc55/memory.toml `flash.a`). We skip the
-/// LPC55 boot ROM + stage0/bootleby and load the hubris image directly here.
+/// Hubris RoT image slot A base (chips/lpc55/memory.toml `flash.a`). Skips the
+/// LPC55 boot ROM + stage0/bootleby and loads the hubris image directly here.
 pub const IMAGE_A_BASE: u32 = 0x0001_0000;
 
 pub fn install_memory(bus: &mut Bus) {
@@ -21,14 +21,14 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
     bus.add_device(0xE000_E000, 0x1000, Box::new(Scs::new()));
     // LPC55 flash controller (0x40034000): blank-check + read-word so
     // lpc55-rot-startup's FlashSlot::new can find the programmed image span.
-    // Added BEFORE the catch-all so it owns 0x40034xxx.
+    // Added before the catch-all so it owns 0x40034xxx.
     bus.add_device(0x4003_4000, 0x1000, Box::new(LpcFlash::new(image.to_vec(), IMAGE_A_BASE)));
     // Sprot bridge endpoints on the RoT side: the FLEXCOMM8 SPI slave (0x4009F000,
     // chip.toml [flexcomm8]) and the GPIO block (0x4008C000, chip.toml [gpio]) that
     // carries ROT_IRQ (P0_18, RoT->SP) and CHIP_SELECT (P1_1, SP->RoT). These MUST
-    // be added BEFORE the catch-all RegFiles below: dev_for() returns the FIRST
+    // be added before the catch-all RegFiles below: dev_for() returns the first
     // device whose range covers an address, and the lpc55-periph-hi catch-all
-    // (0x40035000..0x40100000) otherwise swallows both ranges — leaving the RoT's
+    // (0x40035000..0x40100000) otherwise swallows both ranges, leaving the RoT's
     // SSA/SSD reads and rot-irq writes hitting a dead store/return stub, so it
     // never sees a request and never signals a reply. Gated on the bridge being
     // enabled so the standalone `sp-emu rot` mode (no link) is unaffected.
@@ -47,7 +47,7 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
     bus.write32(0x4000_0380, 0);
 }
 
-/// Minimal LPC55 flash controller model. The flash *content* is the memory-mapped
+/// Minimal LPC55 flash controller model. The flash content is the memory-mapped
 /// RAM at 0x0; this models the command/status path so blank-check (programmed vs
 /// erased detection) and single-word reads complete. Registers: CMD@0x00,
 /// STARTA@0x10, STOPA@0x14, DATAW0..3@0x80, INT_STATUS@0xFE0 (FAIL=bit0, DONE=bit2),
@@ -76,7 +76,7 @@ impl LpcFlash {
         const FAIL: u32 = 1 << 0;
         const DONE: u32 = 1 << 2;
         // Skip the BlankCheck (5) flood the startup does scanning for the image;
-        // we only care about ReadSingleWord (3) etc. on the update_server path.
+        // only ReadSingleWord (3) etc. on the update_server path matters.
         if crate::sprot::dbg() && cmd != 5 { eprintln!("[flash] CMD={} starta={:#x} stopa={:#x}", cmd, self.starta, self.stopa); }
         match cmd {
             5 => {

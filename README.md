@@ -1,26 +1,26 @@
 # sp-emu
 
-A native-Rust emulator that boots real, unmodified Oxide Hubris firmware for a
+A native-Rust emulator that boots unmodified Oxide Hubris firmware for a
 service processor (SP) and root of trust (RoT), with no hardware or RTOS
 underneath. It models enough of the STM32H7 (the SP) and LPC55 (the RoT) that the
 production firmware images come up on their own, bring up their networks, and
-answer the management gateway (MGS) over UDP the way a real board does.
+answer the management gateway (MGS) over UDP.
 
 ## What it can do
 
 - Boots the production gimlet-c and sidecar SP images on an emulated STM32H753
   (Cortex-M7), from the reset vector through the kernel and 30-plus Hubris tasks.
 - Boots the oxide-rot-1 RoT image on an emulated LPC55 (Cortex-M33).
-- Answers MGS over UDP on loopback, on both switch uplink ports, the same way real
+- Answers MGS over UDP on loopback, on both switch uplink ports, the same way Oxide
   hardware does: `discover`, `state`, `inventory`, `read-sensor-value`,
   `power-state`, `rot-boot-info`, caboose reads, dumps, and the rest of the
   faux-mgs surface.
 - Lets `humility` attach to the running firmware over a GDB-RSP or OpenOCD
   listener: live task table, per-task stack backtraces, `readmem`, ringbufs.
-- Runs the SP and RoT together over an emulated sprot SPI link, so the real
-  `drv-stm32h7-sprot-server` on the SP talks to the real `drv-lpc55-sprot-server`
-  on the RoT. The RoT publishes genuine boot-state measurements (sha3-256 of the
-  flashed image), so `rot-boot-info` returns real digests instead of zeros.
+- Runs the SP and RoT together over an emulated sprot SPI link, so
+  `drv-stm32h7-sprot-server` on the emulated SP talks to `drv-lpc55-sprot-server`
+  on the emulated RoT. The RoT publishes boot-state measurements (sha3-256 of the
+  flashed image), so `rot-boot-info` returns digests instead of zeros.
 - Sniffs, or stands in for, the SP's I2C devices over a socket, so you can watch
   the bus traffic the firmware generates or inject your own sensor, VPD, and
   FRUID values from a process written in any language.
@@ -94,7 +94,9 @@ The `demo/` directory wraps all of this in scripts:
 
 - `demo/run-sp.sh` boots a gimlet SP and waits until it is reachable; `demo/mgs`
   and `demo/tasks` talk to it.
-- `demo/run-fleet.sh` brings up several SPs plus a shared RoT over the sprot link.
+- `demo/run-sp-rot.sh` boots a gimlet SP together with an emulated RoT over the
+  sprot link, so `mgs state` returns real RoT boot-info instead of `rot: Err(...)`.
+- `demo/run-fleet.sh` brings up several SPs.
 - `demo/i2c-sniff.sh` streams every I2C transaction the firmware makes.
 - `demo/i2c-device.sh` answers as the SP's I2C devices, so you can inject a value
   (a temperature, say) and read it back through Hubris over MGS.
