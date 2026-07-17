@@ -73,6 +73,9 @@ pub struct Bus {
     // TIM5 free-running counter base — the instruction count (`cur_cyc`) at the
     // last CNT reset. See the TIM5 handling in read32/write32.
     tim5_base: u64,
+    // TIM5 config registers (CR1/PSC/ARR/...), stored so they read back what
+    // was written. CNT and EGR are handled specially in read32/write32.
+    tim5_regs: [u32; TIM5_NREGS],
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
@@ -132,6 +135,7 @@ const TIM5_BASE: u32 = 0x4000_0C00;
 const TIM5_END: u32 = 0x4000_1000; // base + 0x400
 const TIM5_CNT: u32 = 0x4000_0C24; // 32-bit up-counter (offset 0x24)
 const TIM5_EGR: u32 = 0x4000_0C14; // event generation; UG (bit0) latches/resets
+const TIM5_NREGS: usize = ((TIM5_END - TIM5_BASE) / 4) as usize;
 
 impl Default for Bus {
     fn default() -> Self {
@@ -148,7 +152,7 @@ impl Bus {
             dev_touched: false, eth: EthDma::default(),
             uart_tx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
             uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
-            tim5_base: 0 }
+            tim5_base: 0, tim5_regs: [0; TIM5_NREGS] }
     }
 
     /// Consume a pending PendSV (the deferred context-switch request).
@@ -551,18 +555,19 @@ impl Bus {
             self.mmio_hit = true;
             return self.eth_read(addr - ETH_BASE);
         }
-        if (TIM5_BASE..TIM5_END).contains(&addr) {
-            self.mmio_hit = true;
-            // CNT: ticks since the last reset. Other TIM5 registers read back 0 —
-            // the startup driver writes ARR/PSC/CR1/CNT but only reads CNT.
-            return if addr & !3 == TIM5_CNT {
-                self.cur_cyc.wrapping_sub(self.tim5_base) as u32
-            } else {
-                0
-            };
-        }
         if let Some((r, off)) = self.ram_for(addr, 4) {
             u32::from_le_bytes(r.data[off..off + 4].try_into().unwrap())
+        } else if (TIM5_BASE..TIM5_END).contains(&addr) {
+            // Checked after the RAM lookup so RAM accesses skip the range test;
+            // before dev_for so it takes precedence over the RegFile catch-all.
+            self.mmio_hit = true;
+            // CNT: ticks since the last reset. Other registers echo the last
+            // write; EGR is write-only and reads 0.
+            if addr & !3 == TIM5_CNT {
+                self.cur_cyc.wrapping_sub(self.tim5_base) as u32
+            } else {
+                self.tim5_regs[((addr & !3) - TIM5_BASE) as usize / 4]
+            }
         } else if let Some((d, off)) = self.dev_for(addr) {
             d.dev.read(off & !3)
         } else {
@@ -603,24 +608,22 @@ impl Bus {
             self.eth_write(addr - ETH_BASE, val);
             return;
         }
-        if (TIM5_BASE..TIM5_END).contains(&addr) {
-            self.mmio_hit = true;
-            // Honor CNT resets so reads count from the reset point: a CNT write
-            // (driver seeds 0) or EGR.UG (latches PSC/ARR and clears the counter)
-            // rebase to the current instruction count. All other writes (ARR, PSC,
-            // CR1 enable) are swallowed — the counter free-runs regardless.
-            match addr & !3 {
-                TIM5_CNT => self.tim5_base = self.cur_cyc.wrapping_sub(val as u64),
-                TIM5_EGR if val & 1 != 0 => self.tim5_base = self.cur_cyc,
-                _ => {}
-            }
-            return;
-        }
         // Record only writes that actually land in RAM (the reference model can't
         // see emu's device/unmapped writes, so replaying them would desync it).
         if self.rec && self.ram_for(addr, 4).is_some() { self.writes.push((addr, val, 4)); }
         if let Some((r, off)) = self.ram_for(addr, 4) {
             r.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        } else if (TIM5_BASE..TIM5_END).contains(&addr) {
+            self.mmio_hit = true;
+            // A CNT write (driver seeds 0) or EGR.UG (latches PSC/ARR and clears
+            // the counter) rebases to the current instruction count. Other
+            // registers are stored for read-back; the counter free-runs
+            // regardless of CR1/PSC/ARR.
+            match addr & !3 {
+                TIM5_CNT => self.tim5_base = self.cur_cyc.wrapping_sub(val as u64),
+                TIM5_EGR => if val & 1 != 0 { self.tim5_base = self.cur_cyc },
+                a => self.tim5_regs[(a - TIM5_BASE) as usize / 4] = val,
+            }
         } else if let Some((d, off)) = self.dev_for(addr) {
             d.dev.write(off & !3, val);
         } else {
@@ -728,6 +731,18 @@ mod tests {
             assert!(iters < 10_000, "delay loop did not terminate — CNT not advancing");
         }
         assert!(iters >= micros);
+    }
+
+    #[test]
+    fn tim5_cfg_regs_echo_writes() {
+        let mut bus = bus_with_catchall();
+        let (cr1, psc) = (TIM5_BASE, TIM5_BASE + 0x28);
+        bus.write32(cr1, 1);
+        bus.write32(psc, 63);
+        assert_eq!(bus.read32(cr1), 1, "config registers read back the last write");
+        assert_eq!(bus.read32(psc), 63);
+        bus.write32(TIM5_EGR, 1);
+        assert_eq!(bus.read32(TIM5_EGR), 0, "EGR is write-only");
     }
 
     #[test]
