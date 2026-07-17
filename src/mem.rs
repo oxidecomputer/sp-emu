@@ -70,6 +70,12 @@ pub struct Bus {
     // non-empty (host input is async, outside the dev-touched IRQ poll).
     pub uart_tx: crate::soc::UartQueue, // SP -> host
     pub uart_rx: crate::soc::UartQueue, // host -> SP
+    // TIM5 free-running counter base — the instruction count (`cur_cyc`) at the
+    // last CNT reset. See the TIM5 handling in read32/write32.
+    tim5_base: u64,
+    // TIM5 config registers (CR1/PSC/ARR/...), stored so they read back what
+    // was written. CNT and EGR are handled specially in read32/write32.
+    tim5_regs: [u32; TIM5_NREGS],
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
@@ -113,6 +119,24 @@ const VLAN_TPID: u16 = 0x8100;
 const NVIC_LO: u32 = 0xE000_E100;
 const NVIC_HI: u32 = 0xE000_E500;
 
+// ---- TIM5 (0x4000_0C00): the one free-running peripheral ------------------
+// hubris drv-stm32h7-startup (after #2571, "Conscript TIM5 for early boot")
+// builds TIM5 into a 32-bit 1 MHz rolling timer and polls TIM5_CNT for
+// `blocking_delay_micros` during early boot. Unlike every other modeled
+// peripheral — which advances only when the firmware touches it (see the
+// `dev_touched` note above) — this counter must advance on its own, or the
+// early-boot delay loop spins forever and the kernel never starts. sp-emu has
+// no wall clock, but the firmware only ever measures CNT *deltas*, so the
+// counter is driven off the retired-instruction count (`cur_cyc`): one
+// instruction per tick is enough to make every delay elapse promptly. Modeled
+// in the Bus (like the Ethernet DMA) because it needs Bus-level state
+// (`cur_cyc`), which a standalone `Mmio` device can't reach.
+const TIM5_BASE: u32 = 0x4000_0C00;
+const TIM5_END: u32 = 0x4000_1000; // base + 0x400
+const TIM5_CNT: u32 = 0x4000_0C24; // 32-bit up-counter (offset 0x24)
+const TIM5_EGR: u32 = 0x4000_0C14; // event generation; UG (bit0) latches/resets
+const TIM5_NREGS: usize = ((TIM5_END - TIM5_BASE) / 4) as usize;
+
 impl Default for Bus {
     fn default() -> Self {
         Self::new()
@@ -127,7 +151,8 @@ impl Bus {
             nvic_en: [0; 8], nvic_pend: [0; 8], nvic_prio: [0; 256], pend_pendsv: false,
             dev_touched: false, eth: EthDma::default(),
             uart_tx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
-            uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())) }
+            uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
+            tim5_base: 0, tim5_regs: [0; TIM5_NREGS] }
     }
 
     /// Consume a pending PendSV (the deferred context-switch request).
@@ -532,6 +557,17 @@ impl Bus {
         }
         if let Some((r, off)) = self.ram_for(addr, 4) {
             u32::from_le_bytes(r.data[off..off + 4].try_into().unwrap())
+        } else if (TIM5_BASE..TIM5_END).contains(&addr) {
+            // Checked after the RAM lookup so RAM accesses skip the range test;
+            // before dev_for so it takes precedence over the RegFile catch-all.
+            self.mmio_hit = true;
+            // CNT: ticks since the last reset. Other registers echo the last
+            // write; EGR is write-only and reads 0.
+            if addr & !3 == TIM5_CNT {
+                self.cur_cyc.wrapping_sub(self.tim5_base) as u32
+            } else {
+                self.tim5_regs[((addr & !3) - TIM5_BASE) as usize / 4]
+            }
         } else if let Some((d, off)) = self.dev_for(addr) {
             d.dev.read(off & !3)
         } else {
@@ -577,6 +613,17 @@ impl Bus {
         if self.rec && self.ram_for(addr, 4).is_some() { self.writes.push((addr, val, 4)); }
         if let Some((r, off)) = self.ram_for(addr, 4) {
             r.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        } else if (TIM5_BASE..TIM5_END).contains(&addr) {
+            self.mmio_hit = true;
+            // A CNT write (driver seeds 0) or EGR.UG (latches PSC/ARR and clears
+            // the counter) rebases to the current instruction count. Other
+            // registers are stored for read-back; the counter free-runs
+            // regardless of CR1/PSC/ARR.
+            match addr & !3 {
+                TIM5_CNT => self.tim5_base = self.cur_cyc.wrapping_sub(val as u64),
+                TIM5_EGR => if val & 1 != 0 { self.tim5_base = self.cur_cyc },
+                a => self.tim5_regs[(a - TIM5_BASE) as usize / 4] = val,
+            }
         } else if let Some((d, off)) = self.dev_for(addr) {
             d.dev.write(off & !3, val);
         } else {
@@ -605,5 +652,108 @@ impl Bus {
             let w = self.read32(addr & !3);
             self.write32(addr & !3, (w & !(0xffu32 << sh)) | ((val as u32) << sh));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Stands in for soc's RegFile catch-all (store/return over the whole
+    // peripheral space). TIM5 must be served by the Bus interception, not this
+    // device — the original bug was TIM5_CNT falling through to the catch-all and
+    // reading back whatever was last written, so it never incremented.
+    struct Sentinel;
+    impl Mmio for Sentinel {
+        fn name(&self) -> &str { "sentinel" }
+        fn read(&mut self, _off: u32) -> u32 { 0xDEAD_BEEF }
+        fn write(&mut self, _off: u32, _val: u32) {}
+    }
+
+    fn bus_with_catchall() -> Bus {
+        let mut bus = Bus::new();
+        bus.log_unmapped = false;
+        bus.add_device(0x4000_0000, 0x2000_0000, Box::new(Sentinel));
+        bus
+    }
+
+    #[test]
+    fn tim5_cnt_free_runs_and_beats_catchall() {
+        let mut bus = bus_with_catchall();
+        bus.cur_cyc = 0;
+        bus.write32(TIM5_CNT, 0); // startup driver seeds CNT = 0
+        assert_eq!(bus.read32(TIM5_CNT), 0, "reads the counter, not the catch-all sentinel");
+        assert_ne!(bus.read32(TIM5_CNT), 0xDEAD_BEEF);
+        bus.cur_cyc = 500; // 500 retired instructions later
+        assert_eq!(bus.read32(TIM5_CNT), 500, "CNT advances 1:1 with the instruction count");
+    }
+
+    #[test]
+    fn tim5_cnt_write_rebases() {
+        let mut bus = bus_with_catchall();
+        bus.cur_cyc = 1000;
+        bus.write32(TIM5_CNT, 42);
+        assert_eq!(bus.read32(TIM5_CNT), 42, "CNT reads back the seeded value");
+        bus.cur_cyc = 1050;
+        assert_eq!(bus.read32(TIM5_CNT), 92, "then keeps counting from there");
+    }
+
+    #[test]
+    fn tim5_egr_ug_resets_counter() {
+        let mut bus = bus_with_catchall();
+        bus.cur_cyc = 7777;
+        bus.write32(TIM5_EGR, 1); // EGR.UG latches PSC/ARR and clears CNT
+        assert_eq!(bus.read32(TIM5_CNT), 0);
+        bus.cur_cyc = 7877;
+        assert_eq!(bus.read32(TIM5_CNT), 100);
+        bus.write32(TIM5_EGR, 0); // EGR without UG is a no-op on the counter
+        assert_eq!(bus.read32(TIM5_CNT), 100);
+    }
+
+    // The regression that motivated the fix: drv-stm32h7-startup's
+    // RollingTimer::blocking_delay_micros captures a start CNT, then spins reading
+    // CNT until the wrapping delta reaches the requested micros. With a
+    // non-advancing CNT (the old catch-all) this loop never exits and early boot
+    // hangs forever. Here it must terminate.
+    #[test]
+    fn tim5_blocking_delay_terminates() {
+        let mut bus = bus_with_catchall();
+        bus.cur_cyc = 123;
+        bus.write32(TIM5_CNT, 0);
+        let start = bus.read32(TIM5_CNT);
+        let micros = 200u32;
+        let mut iters = 0u32;
+        loop {
+            bus.cur_cyc += 1; // retire one instruction per poll
+            let now = bus.read32(TIM5_CNT);
+            iters += 1;
+            if now.wrapping_sub(start) >= micros { break; }
+            assert!(iters < 10_000, "delay loop did not terminate — CNT not advancing");
+        }
+        assert!(iters >= micros);
+    }
+
+    #[test]
+    fn tim5_cfg_regs_echo_writes() {
+        let mut bus = bus_with_catchall();
+        let (cr1, psc) = (TIM5_BASE, TIM5_BASE + 0x28);
+        bus.write32(cr1, 1);
+        bus.write32(psc, 63);
+        assert_eq!(bus.read32(cr1), 1, "config registers read back the last write");
+        assert_eq!(bus.read32(psc), 63);
+        bus.write32(TIM5_EGR, 1);
+        assert_eq!(bus.read32(TIM5_EGR), 0, "EGR is write-only");
+    }
+
+    #[test]
+    fn tim5_wrapping_delta_survives_rollover() {
+        let mut bus = bus_with_catchall();
+        bus.cur_cyc = 0;
+        bus.write32(TIM5_CNT, u32::MAX - 5); // seed CNT just below the 32-bit rollover
+        let start = bus.read32(TIM5_CNT);
+        assert_eq!(start, u32::MAX - 5);
+        bus.cur_cyc = 10; // ten ticks later, wrapped past zero
+        let now = bus.read32(TIM5_CNT);
+        assert_eq!(now.wrapping_sub(start), 10, "the firmware's wrapping-sub delta is correct across rollover");
     }
 }
