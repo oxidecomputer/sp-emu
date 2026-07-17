@@ -76,6 +76,57 @@ pub fn archive_flash_ron(path: &str) -> Option<String> {
     String::from_utf8(archive_entry(&raw, "img/flash.ron").ok()?).ok()
 }
 
+/// SP UDP socket table (name, port) from the archive's app.toml
+/// `[config.net.sockets.*]` sections. None for a raw binary.
+pub fn archive_sockets(path: &str) -> Option<Vec<(String, u16)>> {
+    let raw = std::fs::read(path).ok()?;
+    if !raw.starts_with(b"PK") {
+        return None;
+    }
+    let toml = String::from_utf8(archive_entry(&raw, "app.toml").ok()?).ok()?;
+    Some(parse_sockets(&toml))
+}
+
+/// Minimal line scan of xtask-generated app.toml: section headers select the
+/// socket name; a `port = N` key inside records it.
+fn parse_sockets(toml: &str) -> Vec<(String, u16)> {
+    let mut out = Vec::new();
+    let mut cur: Option<String> = None;
+    for line in toml.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("[config.net.sockets.") {
+            cur = rest.strip_suffix(']').map(str::to_string);
+        } else if t.starts_with('[') {
+            cur = None;
+        } else if let (Some(name), Some((k, v))) = (cur.as_ref(), t.split_once('=')) {
+            if k.trim() == "port" {
+                if let Ok(p) = v.trim().parse::<u16>() {
+                    out.push((name.clone(), p));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Path of the per-slot socket-table record next to the flash file.
+pub fn sockets_path(nvm_path: &str, slot: char) -> String {
+    format!("{nvm_path}.{}.sockets.json", slot.to_ascii_lowercase())
+}
+
+/// Record the socket table at flash time so well-known-port mode can bind
+/// what the image actually serves.
+pub fn save_sockets(nvm_path: &str, slot: char, sockets: &[(String, u16)]) -> Result<()> {
+    let p = sockets_path(nvm_path, slot);
+    let json = serde_json::to_string_pretty(sockets)?;
+    std::fs::write(&p, json).with_context(|| format!("write {p}"))
+}
+
+pub fn load_sockets(nvm_path: &str, slot: char) -> Option<Vec<(String, u16)>> {
+    let text = std::fs::read_to_string(sockets_path(nvm_path, slot)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Program an image into a slot: erase the bank, then write the image at its base.
 pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
     let off = slot_offset(slot)?;
@@ -103,4 +154,45 @@ pub fn slot_programmed(nvm: &[u8], slot: char) -> Result<bool> {
     let sp = u32::from_le_bytes(nvm[off..off + 4].try_into().unwrap());
     // RAM lives at 0x20000000.. on the STM32H7; erased flash gives 0xFFFFFFFF.
     Ok(sp != 0xFFFF_FFFF && (0x2000_0000..0x4000_0000).contains(&sp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_socket_sections() {
+        let toml = r#"
+[kernel]
+name = "gimlet"
+
+[config.net.sockets.echo]
+kind = "udp"
+owner = {name = "udpecho", notification = "socket"}
+port = 7
+tx = { packets = 3, bytes = 1024 }
+
+[config.net.sockets.control_plane_agent]
+kind = "udp"
+port = 11111
+
+[config.net.sockets.ereport]
+port = 57005
+
+[tasks.net]
+priority = 3
+"#;
+        let s = parse_sockets(toml);
+        assert_eq!(s, vec![
+            ("echo".to_string(), 7),
+            ("control_plane_agent".to_string(), 11111),
+            ("ereport".to_string(), 57005),
+        ]);
+    }
+
+    #[test]
+    fn non_socket_ports_ignored() {
+        let s = parse_sockets("[tasks.net]\nport = 99\n");
+        assert!(s.is_empty());
+    }
 }

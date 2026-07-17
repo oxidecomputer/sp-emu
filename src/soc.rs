@@ -1005,13 +1005,22 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
         .map(|p| ((p.wrapping_sub(33300)) / 10) as u8)
         .unwrap_or(0);
     // MAC0: 128-MAC block. sidecar base ...45:30; gimlets ...45:21/22/23.
+    // SP_EMU_BASE_MAC / SP_EMU_SERIAL / SP_EMU_MAC_COUNT / SP_EMU_MAC_STRIDE
+    // (set explicitly or by the fleet manifest) override the port derivation.
     let mac_last = if sidecar { 0x30 } else { 0x20u8.wrapping_add(idx) };
+    let base_mac = std::env::var("SP_EMU_BASE_MAC").ok()
+        .and_then(|s| crate::fleet::parse_mac(&s).ok())
+        .unwrap_or([0x0e, 0x1d, 0xb7, 0xfe, 0x45, mac_last]);
+    let env_num = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u16>().ok());
+    let mac_count = env_num("SP_EMU_MAC_COUNT").unwrap_or(128);
+    let mac_stride = env_num("SP_EMU_MAC_STRIDE").unwrap_or(1) as u8;
     let mut mac0 = Vec::new();
-    mac0.extend_from_slice(&[0x0e, 0x1d, 0xb7, 0xfe, 0x45, mac_last]); // base_mac
-    mac0.extend_from_slice(&128u16.to_le_bytes());                    // count
-    mac0.push(1);                                                     // stride
+    mac0.extend_from_slice(&base_mac);
+    mac0.extend_from_slice(&mac_count.to_le_bytes());
+    mac0.push(mac_stride);
     // BARC: 0XV2 barcode "version:part(<=11):rev:serial(<=11)".
-    let serial = if sidecar { "BRM42220001".to_string() } else { format!("BRM4422000{}", idx) };
+    let serial = std::env::var("SP_EMU_SERIAL").ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| if sidecar { "BRM42220001".to_string() } else { format!("BRM4422000{}", idx) });
     let barc = format!("0XV2:913-0000019:002:{}", serial);
     let mut fru0 = tlvc_chunk(b"MAC0", &mac0);
     fru0.extend_from_slice(&tlvc_chunk(b"BARC", barc.as_bytes()));

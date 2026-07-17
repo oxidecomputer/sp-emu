@@ -132,7 +132,40 @@ impl Bridge {
             }
         }
         eprintln!("[bridge] point MGS/faux-mgs at {} (switch0) or its +1 port (switch1)", base);
-        Ok(Bridge {
+        Ok(Self::with_socks(socks))
+    }
+
+    /// Well-known-port mode (fleet manifest): bind each SP socket at its real
+    /// port, one bind per switch view. `addrs` empty = wildcard, switch0 view
+    /// only (two views on one wildcard would collide per port).
+    pub fn new_wellknown(
+        addrs: &[std::net::IpAddr],
+        vids: &[u16],
+        sockets: &[(String, u16)],
+    ) -> std::io::Result<Self> {
+        let views: Vec<(std::net::IpAddr, u16)> = if addrs.is_empty() {
+            vec![(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), vids[0])]
+        } else {
+            addrs.iter().copied().zip(vids.iter().copied()).collect()
+        };
+        if addrs.is_empty() && vids.len() > 1 {
+            eprintln!("[bridge] no instance address: wildcard bind, switch0 view only");
+        }
+        let mut socks = Vec::new();
+        for (view, (addr, vid)) in views.iter().enumerate() {
+            for (name, port) in sockets {
+                let a = SocketAddr::new(*addr, *port);
+                let sock = UdpSocket::bind(a)?;
+                sock.set_nonblocking(true)?;
+                eprintln!("[bridge] {name} on {a} (switch{view} view, vid {vid:#x})");
+                socks.push(BoundSock { sock, vid: *vid, sp_port: *port });
+            }
+        }
+        Ok(Self::with_socks(socks))
+    }
+
+    fn with_socks(socks: Vec<BoundSock>) -> Self {
+        Bridge {
             serial: StdoutHost,
             socks,
             my_mac: [0x0e, 0x00, 0x00, 0x00, 0x00, 0x01],
@@ -152,7 +185,7 @@ impl Bridge {
                     Err(e) => { eprintln!("[bridge] host-uart connect {p} failed: {e}"); None }
                 }
             }),
-        })
+        }
     }
 
     fn dbg(&self) -> bool {
@@ -240,8 +273,8 @@ impl Bridge {
     fn handle_udp_tx(&mut self, vid: u16, udp: &[u8]) {
         if udp.len() < 8 { return; }
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
-        // Only relay the SP's management socket; ignore broadcast/echo chatter.
-        if src_port != SP_PORT && src_port != EREPORT_PORT { return; }
+        // Only relay bound SP sockets; unbound broadcast/echo chatter is dropped.
+        let Some(sock_idx) = self.socks.iter().position(|s| s.vid == vid && s.sp_port == src_port) else { return };
         // Route the reply to the specific MGS client that sent the request: the
         // SP echoes that client's ephemeral port as the UDP destination port
         // (poll_host injects requests with the real client port as the UDP
@@ -258,9 +291,7 @@ impl Bridge {
             let hex: String = payload.iter().map(|b| format!("{:02x}", b)).collect();
             eprintln!("[bridge] SP->MGS vid {:#x} {} bytes -> {} payload={}", vid, payload.len(), peer, hex);
         }
-        if let Some(bs) = self.socks.iter().find(|s| s.vid == vid && s.sp_port == src_port) {
-            let _ = bs.sock.send_to(payload, peer);
-        }
+        let _ = self.socks[sock_idx].sock.send_to(payload, peer);
         // Round-trip latency through the emulator: request-injected -> reply-sent.
         if let Some(t) = self.last_req_at.take() {
             let us = t.elapsed().as_micros();

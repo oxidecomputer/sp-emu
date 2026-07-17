@@ -20,6 +20,7 @@ mod bridge;
 mod cpu;
 mod dbg;
 mod flash;
+mod fleet;
 mod gdb;
 mod host;
 mod mem;
@@ -34,10 +35,75 @@ use cpu::{Cpu, Trap};
 use host::{HostIo, StdoutHost};
 use mem::Bus;
 
-/// Build the host I/O backend: a network bridge when `$SP_EMU_BRIDGE` is set
-/// (its value is the bind address, default `[::1]:11111`), else plain stdout.
-fn make_host() -> Box<dyn HostIo> {
-    match std::env::var("SP_EMU_BRIDGE") {
+/// A fleet-manifest selection (--name/--index): the resolved instance plus
+/// the socket table recorded when the slot was flashed.
+struct WellKnown {
+    r: fleet::Resolved,
+    sockets: Vec<(String, u16)>,
+}
+
+/// Selector flags shared by run/gdb. Config file also via $SP_EMU_CONFIG.
+struct WkArgs {
+    name: Option<String>,
+    index: Option<u32>,
+    config: Option<String>,
+}
+
+/// Pull --name/--index/--config out of `args`; everything else passes through.
+fn split_selectors(args: &[String]) -> Result<(WkArgs, Vec<String>)> {
+    let mut sel = WkArgs { name: None, index: None, config: std::env::var("SP_EMU_CONFIG").ok() };
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--name" => sel.name = Some(it.next().context("--name needs a value")?.clone()),
+            "--index" => sel.index = Some(it.next().context("--index needs a value")?.parse()?),
+            "--config" => sel.config = Some(it.next().context("--config needs a value")?.clone()),
+            _ => rest.push(a.clone()),
+        }
+    }
+    Ok((sel, rest))
+}
+
+/// Resolve a selection into a bridge-ready instance. None when no selector was
+/// given (the env-driven path). SP_EMU_BRIDGE and a selector together is an
+/// error: the two addressing modes are exclusive.
+fn resolve_wellknown(sel: &WkArgs, slot: char) -> Result<Option<WellKnown>> {
+    if sel.name.is_none() && sel.index.is_none() {
+        return Ok(None);
+    }
+    if std::env::var_os("SP_EMU_BRIDGE").is_some() {
+        bail!("--name/--index selects well-known-port mode, which conflicts with SP_EMU_BRIDGE; unset one");
+    }
+    let m = fleet::load(sel.config.as_deref())?;
+    let mut r = fleet::resolve(fleet::select(&m, sel.name.as_deref(), sel.index)?)?;
+    fleet::apply_env(&r);
+    // Re-read vids so an explicit SP_EMU_VID0/1 wins (hex, as bridge::new parses).
+    let env_vid = |k: &str, d: u16| std::env::var(k).ok()
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(d);
+    for (i, v) in r.vids.iter_mut().enumerate() {
+        *v = env_vid(&format!("SP_EMU_VID{i}"), *v);
+    }
+    let sockets = flash::load_sockets(&nvm_path(), slot).unwrap_or_else(|| {
+        eprintln!("[sp-emu] no recorded socket table for slot {slot} (flash from a build archive to record one); binding defaults");
+        fleet::DEFAULT_SOCKETS.iter().map(|(n, p)| (n.to_string(), *p)).collect()
+    });
+    eprintln!("[sp-emu] instance {} (board {}, serial {}, {} sockets)",
+        r.inst.name, r.inst.board, r.inst.serial, sockets.len());
+    Ok(Some(WellKnown { r, sockets }))
+}
+
+/// Build the host I/O backend. Well-known-port mode when a manifest instance
+/// was selected; else a bridge when `$SP_EMU_BRIDGE` is set (its value is the
+/// bind address, default `[::1]:11111`); else plain stdout.
+fn make_host(wk: Option<&WellKnown>) -> Result<Box<dyn HostIo>> {
+    if let Some(wk) = wk {
+        let b = bridge::Bridge::new_wellknown(&wk.r.addrs, &wk.r.vids, &wk.sockets)
+            .with_context(|| format!("bind well-known ports for {}", wk.r.inst.name))?;
+        return Ok(Box::new(b));
+    }
+    Ok(match std::env::var("SP_EMU_BRIDGE") {
         Ok(v) => {
             let bind = if v.is_empty() || v == "1" { "[::1]:11111".to_string() } else { v };
             match bridge::Bridge::new(&bind) {
@@ -46,7 +112,7 @@ fn make_host() -> Box<dyn HostIo> {
             }
         }
         Err(_) => Box::new(StdoutHost),
-    }
+    })
 }
 
 fn nvm_path() -> String {
@@ -61,6 +127,7 @@ fn main() -> Result<()> {
         Some("info") => cmd_info(),
         Some("run") => cmd_run(&args[1..]),
         Some("gdb") => cmd_gdb(&args[1..]),
+        Some("manifest") => cmd_manifest(&args[1..]),
         Some("rot") => cmd_rot(&args[1..]),
         Some("rot-serve") => cmd_rot_serve(&args[1..]),
         Some("i2c-sniff") => {
@@ -75,7 +142,7 @@ fn main() -> Result<()> {
         Some(p) if std::path::Path::new(p).exists() => {
             let max = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
             let image = std::fs::read(p).with_context(|| format!("read {p}"))?;
-            boot(&image, flash::FLASH_BASE, max)
+            boot(&image, flash::FLASH_BASE, max, None)
         }
         _ => {
             eprintln!("usage:");
@@ -84,6 +151,9 @@ fn main() -> Result<()> {
             eprintln!("  sp-emu info                      show slot reset vectors");
             eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot");
             eprintln!("  sp-emu gdb [a|b] [preboot]       boot a slot, then serve a GDB stub for humility");
+            eprintln!("  sp-emu manifest [--config f]     print the fleet manifest (built-in or file)");
+            eprintln!("  run/gdb selectors: --name NAME | --index N [--config fleet.json]");
+            eprintln!("                                   well-known-port mode with manifest identity");
             eprintln!("  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone");
             eprintln!("  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here");
             eprintln!("  sp-emu i2c-device [addr] [spec]  act AS I2C devices for an emulator (SP_EMU_I2C_DEVICE);");
@@ -113,6 +183,14 @@ fn cmd_flash(args: &[String]) -> Result<()> {
     let reset_pc = u32::from_le_bytes(image[4..8].try_into().unwrap_or_default()) & !1;
     let path = nvm_path();
     flash::program_slot(&path, slot, &image)?;
+    // Record the archive's SP socket table for well-known-port mode.
+    match flash::archive_sockets(&args[1]) {
+        Some(sockets) if !sockets.is_empty() => {
+            flash::save_sockets(&path, slot, &sockets)?;
+            eprintln!("[flash] recorded {} SP sockets from app.toml", sockets.len());
+        }
+        _ => { let _ = std::fs::remove_file(flash::sockets_path(&path, slot)); }
+    }
     println!(
         "flashed {} bytes into slot {} (base {:#010x}, reset PC {:#010x}) of {}",
         image.len(),
@@ -128,7 +206,19 @@ fn cmd_erase(args: &[String]) -> Result<()> {
     let slot = slot_arg(args.first().context("usage: sp-emu erase <a|b>")?)?;
     let path = nvm_path();
     flash::erase_slot(&path, slot)?;
+    let _ = std::fs::remove_file(flash::sockets_path(&path, slot));
     println!("erased slot {} of {}", slot.to_ascii_uppercase(), path);
+    Ok(())
+}
+
+/// manifest [--config f]: parse and print the fleet manifest.
+fn cmd_manifest(args: &[String]) -> Result<()> {
+    let (sel, rest) = split_selectors(args)?;
+    if !rest.is_empty() {
+        bail!("usage: sp-emu manifest [--config fleet.json]");
+    }
+    let m = fleet::load(sel.config.as_deref())?;
+    println!("{}", serde_json::to_string_pretty(&m.instances)?);
     Ok(())
 }
 
@@ -152,16 +242,18 @@ fn cmd_info() -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    // run [a|b] [max]
+    // run [a|b] [max] [--name N | --index I] [--config f]
+    let (sel, args) = split_selectors(args)?;
     let mut slot = 'a';
     let mut max = 5_000_000u64;
-    for a in args {
+    for a in &args {
         if let Ok(c) = slot_arg(a) {
             slot = c;
         } else if let Ok(n) = a.parse::<u64>() {
             max = n;
         }
     }
+    let wk = resolve_wellknown(&sel, slot)?;
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
     if !flash::slot_programmed(&nvm, slot)? {
@@ -169,18 +261,20 @@ fn cmd_run(args: &[String]) -> Result<()> {
             slot.to_ascii_uppercase(), slot);
     }
     eprintln!("[sp] booting from slot {} ({})", slot.to_ascii_uppercase(), path);
-    boot(&nvm, flash::slot_base(slot)?, max)
+    boot(&nvm, flash::slot_base(slot)?, max, wk.as_ref())
 }
 
 /// gdb [a|b] [preboot] — boot a slot to steady state, then serve a GDB stub on
 /// 127.0.0.1:3333 for humility to attach to.
 fn cmd_gdb(args: &[String]) -> Result<()> {
+    let (sel, args) = split_selectors(args)?;
     let mut slot = 'a';
     let mut preboot = 3_000_000u64;
-    for a in args {
+    for a in &args {
         if let Ok(c) = slot_arg(a) { slot = c; }
         else if let Ok(n) = a.parse::<u64>() { preboot = n; }
     }
+    let wk = resolve_wellknown(&sel, slot)?;
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
     if !flash::slot_programmed(&nvm, slot)? {
@@ -199,7 +293,7 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
         _ => None,
     };
     let rot_client = rot_service.map(|a| { eprintln!("[rot] SP_EMU_ROT_SERVICE={a}"); rot_service::RotClient::connect(&a) });
-    let mut host = make_host();
+    let mut host = make_host(wk.as_ref())?;
     gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
 }
 
@@ -289,7 +383,7 @@ fn cmd_rot(args: &[String]) -> Result<()> {
     let (mut cpu, mut bus) = build_rot_core(&image)?;
     let trace = std::env::var("SP_EMU_TRACE").is_ok();
     cpu.record_disasm = trace;
-    let mut host = make_host();
+    let mut host = make_host(None)?;
     let mut stopped = false;
     let mut idle_hits: u64 = 0;
     let mut first_idle = false;
@@ -343,12 +437,12 @@ fn setup(image: &[u8], boot_base: u32) -> Result<(Cpu, Bus)> {
 }
 
 /// Load `image` at FLASH_BASE, reset from `boot_base`'s vector table, and run.
-fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
+fn boot(image: &[u8], boot_base: u32, max: u64, wk: Option<&WellKnown>) -> Result<()> {
     let trace = std::env::var("SP_EMU_TRACE").is_ok();
     let parse_env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
     let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
     let (mut cpu, mut bus) = setup(image, boot_base)?;
-    let mut host = make_host();
+    let mut host = make_host(wk)?;
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
     use std::io::Write;
