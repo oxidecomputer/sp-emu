@@ -1953,7 +1953,9 @@ impl Mmio for Scs {
         let i = (off / 4) as usize & 0x3ff;
         match off {
             0x010 => self.regs[i] | (1 << 16), // SYST_CSR: report COUNTFLAG set
-            0xD00 => 0x4110_FC27,              // CPUID (Cortex-M7 r1p1-ish)
+            // CPUID for STM32H753 = Cortex-M7 r1p1: implementer 0x41, variant 0x1,
+            // architecture 0xF (ARMv7-M), partno 0xC27 (Cortex-M7), revision 0x1.
+            0xD00 => 0x411F_C271,
             _ => self.regs[i],
         }
     }
