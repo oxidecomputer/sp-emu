@@ -80,7 +80,11 @@ pub fn archive_flash_ron(path: &str) -> Option<String> {
 pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
     let off = slot_offset(slot)?;
     if image.len() > BANK_SIZE {
-        bail!("image is {} bytes, exceeds {} KB bank size", image.len(), BANK_SIZE / 1024);
+        bail!(
+            "image is {} bytes, exceeds {} KB bank size",
+            image.len(),
+            BANK_SIZE / 1024
+        );
     }
     let mut nvm = load_nvm(path)?;
     nvm[off..off + BANK_SIZE].fill(ERASED);

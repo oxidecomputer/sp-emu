@@ -19,15 +19,17 @@
 mod bridge;
 mod cpu;
 mod dbg;
+mod debugport;
 mod flash;
 mod gdb;
+mod glasgow;
 mod host;
-mod mem;
-mod soc;
-mod lpc55;
-mod sprot;
-mod rot_service;
 mod i2c_bridge;
+mod lpc55;
+mod mem;
+mod rot_service;
+mod soc;
+mod sprot;
 
 use anyhow::{bail, Context, Result};
 use cpu::{Cpu, Trap};
@@ -39,10 +41,17 @@ use mem::Bus;
 fn make_host() -> Box<dyn HostIo> {
     match std::env::var("SP_EMU_BRIDGE") {
         Ok(v) => {
-            let bind = if v.is_empty() || v == "1" { "[::1]:11111".to_string() } else { v };
+            let bind = if v.is_empty() || v == "1" {
+                "[::1]:11111".to_string()
+            } else {
+                v
+            };
             match bridge::Bridge::new(&bind) {
                 Ok(b) => Box::new(b),
-                Err(e) => { eprintln!("[bridge] bind {bind} failed: {e}; falling back to stdout"); Box::new(StdoutHost) }
+                Err(e) => {
+                    eprintln!("[bridge] bind {bind} failed: {e}; falling back to stdout");
+                    Box::new(StdoutHost)
+                }
             }
         }
         Err(_) => Box::new(StdoutHost),
@@ -73,7 +82,10 @@ fn main() -> Result<()> {
         }
         // Legacy: `sp-emu <image.bin> [max]` boots a flat image without a slot.
         Some(p) if std::path::Path::new(p).exists() => {
-            let max = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
+            let max = args
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5_000_000);
             let image = std::fs::read(p).with_context(|| format!("read {p}"))?;
             boot(&image, flash::FLASH_BASE, max)
         }
@@ -84,10 +96,14 @@ fn main() -> Result<()> {
             eprintln!("  sp-emu info                      show slot reset vectors");
             eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot");
             eprintln!("  sp-emu gdb [a|b] [preboot]       boot a slot, then serve a GDB stub for humility");
-            eprintln!("  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone");
+            eprintln!(
+                "  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone"
+            );
             eprintln!("  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here");
             eprintln!("  sp-emu i2c-device [addr] [spec]  act AS I2C devices for an emulator (SP_EMU_I2C_DEVICE);");
-            eprintln!("                                   spec: addr/reg=val  or  addr@eeprom-file");
+            eprintln!(
+                "                                   spec: addr/reg=val  or  addr@eeprom-file"
+            );
             Ok(())
         }
     }
@@ -142,10 +158,19 @@ fn cmd_info() -> Result<()> {
         if flash::slot_programmed(&nvm, slot)? {
             let sp = u32::from_le_bytes(nvm[off..off + 4].try_into().unwrap());
             let pc = u32::from_le_bytes(nvm[off + 4..off + 8].try_into().unwrap()) & !1;
-            println!("  slot {} @ {:#010x}: programmed  (SP={:#010x} reset PC={:#010x})",
-                slot.to_ascii_uppercase(), base, sp, pc);
+            println!(
+                "  slot {} @ {:#010x}: programmed  (SP={:#010x} reset PC={:#010x})",
+                slot.to_ascii_uppercase(),
+                base,
+                sp,
+                pc
+            );
         } else {
-            println!("  slot {} @ {:#010x}: empty", slot.to_ascii_uppercase(), base);
+            println!(
+                "  slot {} @ {:#010x}: empty",
+                slot.to_ascii_uppercase(),
+                base
+            );
         }
     }
     Ok(())
@@ -165,10 +190,17 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
     if !flash::slot_programmed(&nvm, slot)? {
-        bail!("slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
-            slot.to_ascii_uppercase(), slot);
+        bail!(
+            "slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
+            slot.to_ascii_uppercase(),
+            slot
+        );
     }
-    eprintln!("[sp] booting from slot {} ({})", slot.to_ascii_uppercase(), path);
+    eprintln!(
+        "[sp] booting from slot {} ({})",
+        slot.to_ascii_uppercase(),
+        path
+    );
     boot(&nvm, flash::slot_base(slot)?, max)
 }
 
@@ -178,14 +210,20 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     let mut slot = 'a';
     let mut preboot = 3_000_000u64;
     for a in args {
-        if let Ok(c) = slot_arg(a) { slot = c; }
-        else if let Ok(n) = a.parse::<u64>() { preboot = n; }
+        if let Ok(c) = slot_arg(a) {
+            slot = c;
+        } else if let Ok(n) = a.parse::<u64>() {
+            preboot = n;
+        }
     }
     let path = nvm_path();
     let mut nvm = flash::load_nvm(&path)?;
     if !flash::slot_programmed(&nvm, slot)? {
-        bail!("slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
-            slot.to_ascii_uppercase(), slot);
+        bail!(
+            "slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
+            slot.to_ascii_uppercase(),
+            slot
+        );
     }
     // Present a caboose in the inactive bank too, so wicketd's inventory poll
     // caches it instead of re-reading NoCaboose forever (see mirror docs).
@@ -194,14 +232,25 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
     // in-process RoT core), or an in-process RoT core (SP_EMU_ROT_FLASH, the
     // two-core path). The service wins if both are set.
-    let rot_service = std::env::var("SP_EMU_ROT_SERVICE").ok().filter(|s| !s.is_empty());
-    if rot_service.is_some() || std::env::var("SP_EMU_ROT_FLASH").is_ok() { sprot::enable(); }
+    let rot_service = std::env::var("SP_EMU_ROT_SERVICE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if rot_service.is_some() || std::env::var("SP_EMU_ROT_FLASH").is_ok() {
+        sprot::enable();
+    }
     let (cpu, bus) = setup(&nvm, flash::slot_base(slot)?)?;
     let rot = match (&rot_service, std::env::var("SP_EMU_ROT_FLASH")) {
-        (None, Ok(p)) => { eprintln!("[rot] SP_EMU_ROT_FLASH={p}"); let img = flash::load_image(&p)?; Some(build_rot_core(&img)?) }
+        (None, Ok(p)) => {
+            eprintln!("[rot] SP_EMU_ROT_FLASH={p}");
+            let img = flash::load_image(&p)?;
+            Some(build_rot_core(&img)?)
+        }
         _ => None,
     };
-    let rot_client = rot_service.map(|a| { eprintln!("[rot] SP_EMU_ROT_SERVICE={a}"); rot_service::RotClient::connect(&a) });
+    let rot_client = rot_service.map(|a| {
+        eprintln!("[rot] SP_EMU_ROT_SERVICE={a}");
+        rot_service::RotClient::connect(&a)
+    });
     let mut host = make_host();
     gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
 }
@@ -218,7 +267,13 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     publish_rot_bootstate(&mut bus, image);
     let initial_sp = bus.read32(base);
     let reset_pc = bus.read32(base + 4) & !1;
-    eprintln!("[rot] RoT core: loaded {} bytes @ {:#010x}; SP={:#010x} PC={:#010x}", image.len(), base, initial_sp, reset_pc);
+    eprintln!(
+        "[rot] RoT core: loaded {} bytes @ {:#010x}; SP={:#010x} PC={:#010x}",
+        image.len(),
+        base,
+        initial_sp,
+        reset_pc
+    );
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
     cpu.wfi_throttle = true;
@@ -250,7 +305,9 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
         // Pad up to the next flash-page boundary with 0xff, as the RoT measures
         // all programmed pages including the 0xff tail of the final page.
         let rem = bytes.len() % FLASH_PAGE;
-        if rem != 0 { h.update(vec![0xffu8; FLASH_PAGE - rem]); }
+        if rem != 0 {
+            h.update(vec![0xffu8; FLASH_PAGE - rem]);
+        }
         h.finalize().into()
     };
     let digest_a = page_hash(image);
@@ -258,9 +315,9 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
 
     let mut blob: Vec<u8> = Vec::with_capacity(149);
     blob.extend_from_slice(&0u32.to_le_bytes()); // HandoffDataHeader.version
-    blob.extend_from_slice(b"whatwhatwhat");     // HandoffDataHeader.magic
+    blob.extend_from_slice(b"whatwhatwhat"); // HandoffDataHeader.magic
     blob.push(0u8); // RotBootStateV2.active = RotSlot::A
-    // a/b/stage0/stage0next: digest[32] + status (Ok(()) = discriminant 0).
+                    // a/b/stage0/stage0next: digest[32] + status (Ok(()) = discriminant 0).
     for d in [&digest_a, &digest_erased, &digest_erased, &digest_erased] {
         blob.extend_from_slice(d);
         blob.push(0u8); // Result::Ok(())
@@ -270,25 +327,40 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
     for (i, b) in blob.iter().enumerate() {
         bus.write8(UPDATE_RANGE_BASE + i as u32, *b);
     }
-    eprintln!("[rot] published RotBootStateV2 handoff @ {:#010x} ({} bytes); slot-A sha3-256 = {}",
-        UPDATE_RANGE_BASE, blob.len(),
-        digest_a.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    eprintln!(
+        "[rot] published RotBootStateV2 handoff @ {:#010x} ({} bytes); slot-A sha3-256 = {}",
+        UPDATE_RANGE_BASE,
+        blob.len(),
+        digest_a
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    );
 }
 
 /// rot-serve <listen-addr> <oxide-rot-1 image|archive> — run one shared RoT that
 /// answers sprot request frames over a socket (frame-level IPC), so every SP can
 /// share it instead of each emulating its own RoT core. See `rot_service`.
 fn cmd_rot_serve(args: &[String]) -> Result<()> {
-    let listen = args.first().context("usage: rot-serve <listen-addr> <rot-image>")?;
-    let image_path = args.get(1).context("usage: rot-serve <listen-addr> <rot-image>")?;
+    let listen = args
+        .first()
+        .context("usage: rot-serve <listen-addr> <rot-image>")?;
+    let image_path = args
+        .get(1)
+        .context("usage: rot-serve <listen-addr> <rot-image>")?;
     let image = flash::load_image(image_path)?;
     rot_service::run(listen, &image)
 }
 
 fn cmd_rot(args: &[String]) -> Result<()> {
-    let path = args.first().context("usage: sp-emu rot <oxide-rot-1 image.bin|archive.zip> [max]")?;
+    let path = args
+        .first()
+        .context("usage: sp-emu rot <oxide-rot-1 image.bin|archive.zip> [max]")?;
     let image = flash::load_image(path)?;
-    let max = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(20_000_000);
+    let max = args
+        .get(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(20_000_000);
     let (mut cpu, mut bus) = build_rot_core(&image)?;
     let trace = std::env::var("SP_EMU_TRACE").is_ok();
     cpu.record_disasm = trace;
@@ -299,23 +371,38 @@ fn cmd_rot(args: &[String]) -> Result<()> {
     for i in 0..max {
         let pc = cpu.pc;
         if cpu.step(&mut bus, host.as_mut()).is_err() {
-            eprintln!("[rot] STOP (trap) at pc={:#010x} [{}] after {} insns", pc, cpu.last_disasm, i);
+            eprintln!(
+                "[rot] STOP (trap) at pc={:#010x} [{}] after {} insns",
+                pc, cpu.last_disasm, i
+            );
             stopped = true;
             break;
         }
-        if trace { eprintln!("{:08x}: {}", pc, cpu.last_disasm); }
+        if trace {
+            eprintln!("{:08x}: {}", pc, cpu.last_disasm);
+        }
         cpu.maybe_tick(&mut bus);
         cpu.maybe_interrupt(&mut bus);
         if cpu.idle_skip > 0 {
-            if !first_idle { first_idle = true; eprintln!("[rot] reached WFI/idle at pc={:#010x} after {} insns", pc, i); }
+            if !first_idle {
+                first_idle = true;
+                eprintln!(
+                    "[rot] reached WFI/idle at pc={:#010x} after {} insns",
+                    pc, i
+                );
+            }
             idle_hits += 1;
             cpu.idle_skip = 0;
         }
     }
-    if !stopped { eprintln!("[rot] ran to max ({} insns)", max); }
+    if !stopped {
+        eprintln!("[rot] ran to max ({} insns)", max);
+    }
     eprintln!("[rot] idle/WFI hits = {}", idle_hits);
-    eprintln!("[rot] final PC={:#010x}, cycles={}, unmapped r/w={}/{}",
-        cpu.pc, cpu.cycles, bus.unmapped_reads, bus.unmapped_writes);
+    eprintln!(
+        "[rot] final PC={:#010x}, cycles={}, unmapped r/w={}/{}",
+        cpu.pc, cpu.cycles, bus.unmapped_reads, bus.unmapped_writes
+    );
     Ok(())
 }
 
@@ -326,12 +413,19 @@ fn setup(image: &[u8], boot_base: u32) -> Result<(Cpu, Bus)> {
     soc::install_memory(&mut bus);
     soc::install_peripherals(&mut bus);
     bus.load(flash::FLASH_BASE, image)?;
-    eprintln!("[boot] loaded {} bytes of flash @ {:#010x}", image.len(), flash::FLASH_BASE);
+    eprintln!(
+        "[boot] loaded {} bytes of flash @ {:#010x}",
+        image.len(),
+        flash::FLASH_BASE
+    );
 
     // Cortex-M reset protocol: SP = vector[0], reset PC = vector[1].
     let initial_sp = bus.read32(boot_base);
     let reset_pc = bus.read32(boot_base + 4) & !1;
-    eprintln!("[boot] reset from {:#010x}: SP = {:#010x}, PC = {:#010x}", boot_base, initial_sp, reset_pc);
+    eprintln!(
+        "[boot] reset from {:#010x}: SP = {:#010x}, PC = {:#010x}",
+        boot_base, initial_sp, reset_pc
+    );
 
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
@@ -355,7 +449,8 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
     use std::io::Write;
-    let mut diff = std::env::var("SP_EMU_DIFF").ok()
+    let mut diff = std::env::var("SP_EMU_DIFF")
+        .ok()
         .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("diff file")));
     bus.rec = diff.is_some();
     // Per-instruction disasm formatting is a heap alloc; only enable it when a
@@ -369,7 +464,9 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
         bus.writes.clear();
         match cpu.step(&mut bus, host.as_mut()) {
             Ok(()) => {
-                if trace { eprintln!("{:08x}: {}", pc, cpu.last_disasm); }
+                if trace {
+                    eprintln!("{:08x}: {}", pc, cpu.last_disasm);
+                }
                 if let (Some(lo), Some(hi)) = (twin_from, twin_to) {
                     if cpu.cycles >= lo && cpu.cycles <= hi {
                         eprintln!("c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
@@ -383,20 +480,34 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
                     // is not skipped; only state Unicorn cannot mirror is.
                     let skip = (bus.mmio_hit || exc || cpu.last_it || cpu.last_sys) as u8;
                     let _ = write!(f, "{:08x}", pc);
-                    for k in 0..15 { let _ = write!(f, " {:08x}", cpu.r[k]); }
+                    for k in 0..15 {
+                        let _ = write!(f, " {:08x}", cpu.r[k]);
+                    }
                     let _ = write!(f, " {:08x} {:08x} {} S", cpu.pc, cpu.apsr(), skip);
-                    for sr in &cpu.s { let _ = write!(f, " {:08x}", sr); }
+                    for sr in &cpu.s {
+                        let _ = write!(f, " {:08x}", sr);
+                    }
                     let _ = write!(f, " W");
-                    for (a, v, sz) in &bus.writes { let _ = write!(f, " {:x}:{:x}:{}", a, v, sz); }
+                    for (a, v, sz) in &bus.writes {
+                        let _ = write!(f, " {:x}:{:x}:{}", a, v, sz);
+                    }
                     let _ = writeln!(f);
                 }
             }
-            Err(Trap::Unimplemented { pc, bytes, len, disasm }) => {
+            Err(Trap::Unimplemented {
+                pc,
+                bytes,
+                len,
+                disasm,
+            }) => {
                 eprintln!("\n=== STOP: unimplemented instruction ===");
                 eprintln!("  pc     : {:#010x}", pc);
                 eprintln!("  disasm : {}", disasm);
                 eprintln!("  bytes  : {:02x?}", &bytes[..len as usize]);
-                eprintln!("  (executed {} instructions before this gap)", cpu.cycles - 1);
+                eprintln!(
+                    "  (executed {} instructions before this gap)",
+                    cpu.cycles - 1
+                );
                 break;
             }
             Err(Trap::Decode { pc }) => {
@@ -413,11 +524,16 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
         if diff.is_none() {
             cpu.maybe_tick(&mut bus);
             cpu.maybe_interrupt(&mut bus);
-            if cpu.cycles & 0xFFF == 0 { bus.pump_eth(host.as_mut()); bus.pump_uart(host.as_mut()); }
+            if cpu.cycles & 0xFFF == 0 {
+                bus.pump_eth(host.as_mut());
+                bus.pump_uart(host.as_mut());
+            }
         }
     }
 
-    eprintln!("\n[done] {} instructions, unmapped reads={} writes={}",
-        cpu.cycles, bus.unmapped_reads, bus.unmapped_writes);
+    eprintln!(
+        "\n[done] {} instructions, unmapped reads={} writes={}",
+        cpu.cycles, bus.unmapped_reads, bus.unmapped_writes
+    );
     Ok(())
 }

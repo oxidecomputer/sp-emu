@@ -79,16 +79,25 @@ pub fn arm_rot_trace(n: u32) {
 pub fn rot_trace_tick() -> bool {
     use std::sync::atomic::Ordering;
     let v = ROT_TRACE.load(Ordering::SeqCst);
-    if v > 0 { ROT_TRACE.store(v - 1, Ordering::SeqCst); true } else { false }
+    if v > 0 {
+        ROT_TRACE.store(v - 1, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
 }
 
 thread_local! {
     static LINK: RefCell<Option<Link>> = const { RefCell::new(None) };
 }
 /// Enable the bridge for this run (called once, before building the buses).
-pub fn enable() { LINK.with(|l| *l.borrow_mut() = Some(Rc::new(RefCell::new(SprotLink::default())))); }
+pub fn enable() {
+    LINK.with(|l| *l.borrow_mut() = Some(Rc::new(RefCell::new(SprotLink::default()))));
+}
 /// The shared link, if the bridge is enabled.
-pub fn link() -> Option<Link> { LINK.with(|l| l.borrow().clone()) }
+pub fn link() -> Option<Link> {
+    LINK.with(|l| l.borrow().clone())
+}
 
 // ---- SP side: STM32H7 SPI4 master ------------------------------------------
 
@@ -104,43 +113,86 @@ pub struct SpiMaster {
     n_sr: u64,
 }
 impl SpiMaster {
-    pub fn new(link: Link) -> Self { SpiMaster { link, tsize: 0, sent: 0, rx: VecDeque::new(), spe: false, n_sr: 0 } }
+    pub fn new(link: Link) -> Self {
+        SpiMaster {
+            link,
+            tsize: 0,
+            sent: 0,
+            rx: VecDeque::new(),
+            spe: false,
+            n_sr: 0,
+        }
+    }
 }
 impl Mmio for SpiMaster {
-    fn name(&self) -> &str { "SPI4-sprot" }
+    fn name(&self) -> &str {
+        "SPI4-sprot"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x14 => {
                 // SR: TXP(1) always (tx space), RXP(0)/RXWNE(15)/RXPLVL(11:10) from
                 // the rx fifo, EOT(3)/TXC(12) once TSIZE bytes have been clocked.
                 let mut sr = 1 << 1;
-                if !self.rx.is_empty() { sr |= 1 << 0; }
+                if !self.rx.is_empty() {
+                    sr |= 1 << 0;
+                }
                 // RXWNE(15) = a full 32-bit word (>=4 bytes); RXPLVL(14:13) = the
                 // 0..3 trailing bytes otherwise. The driver's can_rx_byte() reads
                 // both, so these bits must be correct for it to drain the tail.
-                if self.rx.len() >= 4 { sr |= 1 << 15; }
-                else { sr |= ((self.rx.len() as u32) & 0x3) << 13; }
-                if self.tsize != 0 && self.sent >= self.tsize { sr |= (1 << 3) | (1 << 12); }
+                if self.rx.len() >= 4 {
+                    sr |= 1 << 15;
+                } else {
+                    sr |= ((self.rx.len() as u32) & 0x3) << 13;
+                }
+                if self.tsize != 0 && self.sent >= self.tsize {
+                    sr |= (1 << 3) | (1 << 12);
+                }
                 self.n_sr += 1;
                 if dbg() && self.n_sr % 5000 == 1 {
-                    eprintln!("[spi] SR#{} = {:#06x} (sent={} tsize={} rx={})", self.n_sr, sr, self.sent, self.tsize, self.rx.len());
+                    eprintln!(
+                        "[spi] SR#{} = {:#06x} (sent={} tsize={} rx={})",
+                        self.n_sr,
+                        sr,
+                        self.sent,
+                        self.tsize,
+                        self.rx.len()
+                    );
                 }
                 sr
             }
-            0x30 => { let b = self.rx.pop_front().unwrap_or(0) as u32; if dbg() { eprintln!("[spi] RXDR -> {:#04x}", b); } b } // RXDR
+            0x30 => {
+                let b = self.rx.pop_front().unwrap_or(0) as u32;
+                if dbg() {
+                    eprintln!("[spi] RXDR -> {:#04x}", b);
+                }
+                b
+            } // RXDR
             _ => 0,
         }
     }
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
-            0x00 => { // CR1: SPE bit0 (transfer-active edge resets counters)
+            0x00 => {
+                // CR1: SPE bit0 (transfer-active edge resets counters)
                 let spe = val & 1 != 0;
-                if spe && !self.spe { self.sent = 0; self.rx.clear(); }
+                if spe && !self.spe {
+                    self.sent = 0;
+                    self.rx.clear();
+                }
                 self.spe = spe;
-                if dbg() { eprintln!("[spi] CR1={:#x} SPE={}", val, spe); }
+                if dbg() {
+                    eprintln!("[spi] CR1={:#x} SPE={}", val, spe);
+                }
             }
-            0x04 => { self.tsize = val & 0xFFFF; if dbg() { eprintln!("[spi] CR2 TSIZE={}", self.tsize); } } // CR2.TSIZE
-            0x20 => { // TXDR: clock one byte out + one in
+            0x04 => {
+                self.tsize = val & 0xFFFF;
+                if dbg() {
+                    eprintln!("[spi] CR2 TSIZE={}", self.tsize);
+                }
+            } // CR2.TSIZE
+            0x20 => {
+                // TXDR: clock one byte out + one in
                 let mut lk = self.link.borrow_mut();
                 // The RoT's FLEXCOMM8 RX FIFO is 8 frames (16 bytes) deep. On real
                 // hardware, bytes clocked in while the FIFO is full are dropped
@@ -148,12 +200,16 @@ impl Mmio for SpiMaster {
                 // (when it doesn't see rot-irq) pile unbounded bytes into `mosi`,
                 // and the RoT's `while has_entry { read_fifo }` drain never ends —
                 // the receive loop livelocks and never delivers the request.
-                if lk.mosi.len() < SPROT_FIFO_BYTES { lk.mosi.push_back((val & 0xFF) as u8); }
+                if lk.mosi.len() < SPROT_FIFO_BYTES {
+                    lk.mosi.push_back((val & 0xFF) as u8);
+                }
                 let inb = lk.miso.pop_front().unwrap_or(0);
                 drop(lk);
                 self.rx.push_back(inb);
                 self.sent = self.sent.wrapping_add(1);
-                if dbg() { eprintln!("[spi] TXDR <- {:#04x} (sent={})", val & 0xFF, self.sent); }
+                if dbg() {
+                    eprintln!("[spi] TXDR <- {:#04x} (sent={})", val & 0xFF, self.sent);
+                }
             }
             _ => {}
         }
@@ -169,31 +225,52 @@ pub struct RotSpiSlave {
     n_stat: u32,
 }
 impl RotSpiSlave {
-    pub fn new(link: Link) -> Self { RotSpiSlave { link, n_ford: 0, n_fwr: 0, n_stat: 0 } }
+    pub fn new(link: Link) -> Self {
+        RotSpiSlave {
+            link,
+            n_ford: 0,
+            n_fwr: 0,
+            n_stat: 0,
+        }
+    }
 }
 impl Mmio for RotSpiSlave {
-    fn name(&self) -> &str { "FLEXCOMM8-sprot" }
+    fn name(&self) -> &str {
+        "FLEXCOMM8-sprot"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x408 | 0x428 => { // STAT / INTSTAT: SSA(4), SSD(5) — read from the link latches
+            0x408 | 0x428 => {
+                // STAT / INTSTAT: SSA(4), SSD(5) — read from the link latches
                 let lk = self.link.borrow();
                 let v = (if lk.ssa { 1 << 4 } else { 0 }) | (if lk.ssd { 1 << 5 } else { 0 });
                 self.n_stat += 1;
                 if dbg() && self.n_stat <= 60 {
-                    eprintln!("[rot] {} #{} -> ssa={} ssd={} (cs={})",
-                        if off & !3 == 0x408 {"STAT"} else {"INTSTAT"}, self.n_stat, lk.ssa, lk.ssd, lk.cs);
+                    eprintln!(
+                        "[rot] {} #{} -> ssa={} ssd={} (cs={})",
+                        if off & !3 == 0x408 { "STAT" } else { "INTSTAT" },
+                        self.n_stat,
+                        lk.ssa,
+                        lk.ssd,
+                        lk.cs
+                    );
                 }
                 v
             }
-            0xE04 => { // FIFOSTAT: TXNOTFULL(5) until 8 frames (16 bytes) queued,
-                       // RXNOTEMPTY(6) once a full 16-bit frame (>=2 bytes) is available.
+            0xE04 => {
+                // FIFOSTAT: TXNOTFULL(5) until 8 frames (16 bytes) queued,
+                // RXNOTEMPTY(6) once a full 16-bit frame (>=2 bytes) is available.
                 let lk = self.link.borrow();
-                (if lk.miso.len() < SPROT_FIFO_BYTES { 1 << 5 } else { 0 })
-                    | (if lk.mosi.len() >= 2 { 1 << 6 } else { 0 })
+                (if lk.miso.len() < SPROT_FIFO_BYTES {
+                    1 << 5
+                } else {
+                    0
+                }) | (if lk.mosi.len() >= 2 { 1 << 6 } else { 0 })
             }
-            0xE30 => { // FIFORD: 16-bit frame (RXDATA[15:0]) + SOT(20). The SP clocks
-                       // 8-bit frames; the RoT packs two wire bytes per FIFO entry,
-                       // first byte = upper (see read_u16_with_sot / get_u16).
+            0xE30 => {
+                // FIFORD: 16-bit frame (RXDATA[15:0]) + SOT(20). The SP clocks
+                // 8-bit frames; the RoT packs two wire bytes per FIFO entry,
+                // first byte = upper (see read_u16_with_sot / get_u16).
                 let (hi, lo, sot) = {
                     let mut lk = self.link.borrow_mut();
                     // A request is now being received; stays in flight (keeping the
@@ -204,13 +281,27 @@ impl Mmio for RotSpiSlave {
                     // SOT is latched on CS assert (soc.rs) and consumed by the first
                     // FIFORD read of the transfer; the firmware checks it to detect
                     // a desynchronized exchange.
-                    let sot = if lk.sot_pending { lk.sot_pending = false; 1 << 20 } else { 0 };
+                    let sot = if lk.sot_pending {
+                        lk.sot_pending = false;
+                        1 << 20
+                    } else {
+                        0
+                    };
                     (hi, lo, sot)
                 };
                 let frame = (hi << 8) | lo;
                 self.n_ford += 1;
-                if self.n_ford == 1 && dbg() { arm_rot_trace(40000); }
-                if dbg() { eprintln!("[rot] FIFORD#{} -> {:#06x}{}", self.n_ford, frame, if sot != 0 {" SOT"} else {""}); }
+                if self.n_ford == 1 && dbg() {
+                    arm_rot_trace(40000);
+                }
+                if dbg() {
+                    eprintln!(
+                        "[rot] FIFORD#{} -> {:#06x}{}",
+                        self.n_ford,
+                        frame,
+                        if sot != 0 { " SOT" } else { "" }
+                    );
+                }
                 frame | sot
             }
             _ => 0,
@@ -218,26 +309,42 @@ impl Mmio for RotSpiSlave {
     }
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
-            0x408 => { // STAT write-1-clear
+            0x408 => {
+                // STAT write-1-clear
                 let mut lk = self.link.borrow_mut();
-                if val & (1 << 4) != 0 { lk.ssa = false; }
-                if val & (1 << 5) != 0 { lk.ssd = false; }
+                if val & (1 << 4) != 0 {
+                    lk.ssa = false;
+                }
+                if val & (1 << 5) != 0 {
+                    lk.ssd = false;
+                }
                 if dbg() && self.n_stat <= 60 {
-                    eprintln!("[rot] STAT-clr val={:#x} (ssa->{} ssd->{})", val, lk.ssa, lk.ssd);
+                    eprintln!(
+                        "[rot] STAT-clr val={:#x} (ssa->{} ssd->{})",
+                        val, lk.ssa, lk.ssd
+                    );
                 }
             }
-            0xE00 => { // FIFOCFG: EMPTYTX(16) drains TX (miso), EMPTYRX(17) drains RX (mosi)
+            0xE00 => {
+                // FIFOCFG: EMPTYTX(16) drains TX (miso), EMPTYRX(17) drains RX (mosi)
                 let mut lk = self.link.borrow_mut();
-                if val & (1 << 16) != 0 { lk.miso.clear(); }
-                if val & (1 << 17) != 0 { lk.mosi.clear(); }
+                if val & (1 << 16) != 0 {
+                    lk.miso.clear();
+                }
+                if val & (1 << 17) != 0 {
+                    lk.mosi.clear();
+                }
             }
-            0xE20 => { // FIFOWR: 16-bit frame, upper byte first on the wire (get_u16)
+            0xE20 => {
+                // FIFOWR: 16-bit frame, upper byte first on the wire (get_u16)
                 let frame = (val & 0xFFFF) as u16;
                 let mut lk = self.link.borrow_mut();
                 lk.miso.push_back((frame >> 8) as u8);
                 lk.miso.push_back((frame & 0xFF) as u8);
                 self.n_fwr += 1;
-                if dbg() && self.n_fwr <= 64 { eprintln!("[rot] FIFOWR#{} <- {:#06x}", self.n_fwr, frame); }
+                if dbg() && self.n_fwr <= 64 {
+                    eprintln!("[rot] FIFOWR#{} <- {:#06x}", self.n_fwr, frame);
+                }
             }
             _ => {}
         }
@@ -246,21 +353,39 @@ impl Mmio for RotSpiSlave {
 
 // ---- RoT side: LPC55 GPIO (only to surface P0_18 = rot-irq) -----------------
 
-pub struct LpcGpio { link: Link, p0: u32 }
+pub struct LpcGpio {
+    link: Link,
+    p0: u32,
+}
 impl LpcGpio {
-    pub fn new(link: Link) -> Self { LpcGpio { link, p0: 0xFFFF_FFFF } }
+    pub fn new(link: Link) -> Self {
+        LpcGpio {
+            link,
+            p0: 0xFFFF_FFFF,
+        }
+    }
     fn refresh(&mut self) {
         let asserted = (self.p0 >> 18) & 1 == 0;
         let mut lk = self.link.borrow_mut();
-        if asserted != lk.rot_irq && dbg() { eprintln!("[sprot] rot-irq {} (P0_18={})", if asserted {"ASSERT"} else {"deassert"}, (self.p0>>18)&1); }
+        if asserted != lk.rot_irq && dbg() {
+            eprintln!(
+                "[sprot] rot-irq {} (P0_18={})",
+                if asserted { "ASSERT" } else { "deassert" },
+                (self.p0 >> 18) & 1
+            );
+        }
         // Reply is ready: the request is no longer "in flight" (the SP will now be
         // woken via EXTI to clock the response).
-        if asserted { lk.request_in_flight = false; }
+        if asserted {
+            lk.request_in_flight = false;
+        }
         lk.rot_irq = asserted;
     }
 }
 impl Mmio for LpcGpio {
-    fn name(&self) -> &str { "LPC55-GPIO" }
+    fn name(&self) -> &str {
+        "LPC55-GPIO"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x2100 => self.p0, // PIN[0]
@@ -271,7 +396,11 @@ impl Mmio for LpcGpio {
                 // -> 0, de-asserted -> 1. Without this the RoT never observes CS go
                 // high and loops forever after a transfer.
                 let cs = self.link.borrow().cs;
-                if cs { 0 } else { 1 << 1 }
+                if cs {
+                    0
+                } else {
+                    1 << 1
+                }
             }
             _ => 0,
         }
@@ -280,18 +409,40 @@ impl Mmio for LpcGpio {
         // LPC55 GPIO: B byte regs @0x0 (off=pin), W word regs @0x1000 (off=pin*4),
         // PIN[0]@0x2100, SET[0]@0x2200, CLR[0]@0x2280, NOT[0]@0x2300.
         match off & !3 {
-            0x2100 => { self.p0 = val; self.refresh(); }
-            0x2200 => { self.p0 |= val; self.refresh(); }
-            0x2280 => { self.p0 &= !val; self.refresh(); }
-            0x2300 => { self.p0 ^= val; self.refresh(); }
-            o if o < 0x20 => { // B[0][pin] byte register (offset = pin index)
-                let pin = o & 0x1F;
-                if val & 0xFF != 0 { self.p0 |= 1 << pin; } else { self.p0 &= !(1 << pin); }
+            0x2100 => {
+                self.p0 = val;
                 self.refresh();
             }
-            o if (0x1000..0x1080).contains(&o) => { // W[0][pin] word register
+            0x2200 => {
+                self.p0 |= val;
+                self.refresh();
+            }
+            0x2280 => {
+                self.p0 &= !val;
+                self.refresh();
+            }
+            0x2300 => {
+                self.p0 ^= val;
+                self.refresh();
+            }
+            o if o < 0x20 => {
+                // B[0][pin] byte register (offset = pin index)
+                let pin = o & 0x1F;
+                if val & 0xFF != 0 {
+                    self.p0 |= 1 << pin;
+                } else {
+                    self.p0 &= !(1 << pin);
+                }
+                self.refresh();
+            }
+            o if (0x1000..0x1080).contains(&o) => {
+                // W[0][pin] word register
                 let pin = (o - 0x1000) / 4;
-                if val != 0 { self.p0 |= 1 << pin; } else { self.p0 &= !(1 << pin); }
+                if val != 0 {
+                    self.p0 |= 1 << pin;
+                } else {
+                    self.p0 &= !(1 << pin);
+                }
                 self.refresh();
             }
             _ => {}
@@ -316,15 +467,26 @@ pub struct SpExti {
     regs: std::collections::HashMap<u32, u32>,
 }
 impl SpExti {
-    pub fn new(link: Link) -> Self { SpExti { link, regs: std::collections::HashMap::new() } }
+    pub fn new(link: Link) -> Self {
+        SpExti {
+            link,
+            regs: std::collections::HashMap::new(),
+        }
+    }
 }
 impl Mmio for SpExti {
-    fn name(&self) -> &str { "SP-EXTI" }
+    fn name(&self) -> &str {
+        "SP-EXTI"
+    }
     fn read(&mut self, off: u32) -> u32 {
         let off = off & !3;
         if off == 0x88 {
             // CPUPR1: bit 3 (EXTI line 3 = PE3 = ROT_IRQ) from the pending latch.
-            let p = if self.link.borrow().sp_rot_irq_pending { ROT_IRQ_EXTI_BIT } else { 0 };
+            let p = if self.link.borrow().sp_rot_irq_pending {
+                ROT_IRQ_EXTI_BIT
+            } else {
+                0
+            };
             return (self.regs.get(&off).copied().unwrap_or(0) & !ROT_IRQ_EXTI_BIT) | p;
         }
         *self.regs.get(&off).unwrap_or(&0)
@@ -333,7 +495,9 @@ impl Mmio for SpExti {
         let off = off & !3;
         if off == 0x88 {
             // Write-1-clear the ROT_IRQ pending latch.
-            if val & ROT_IRQ_EXTI_BIT != 0 { self.link.borrow_mut().sp_rot_irq_pending = false; }
+            if val & ROT_IRQ_EXTI_BIT != 0 {
+                self.link.borrow_mut().sp_rot_irq_pending = false;
+            }
             return;
         }
         self.regs.insert(off, val);

@@ -15,7 +15,9 @@ pub trait Mmio {
     fn write(&mut self, off: u32, val: u32);
     /// Poll for a peripheral interrupt to raise. Returns an IRQ number to set
     /// pending in the NVIC (consumed — returns it once per event). Default: none.
-    fn take_irq(&mut self) -> Option<u16> { None }
+    fn take_irq(&mut self) -> Option<u16> {
+        None
+    }
 }
 
 struct Ram {
@@ -85,7 +87,7 @@ const ETH_BASE: u32 = 0x4002_8000;
 const ETH_END: u32 = 0x4002_A000;
 const ETH_IRQ: u16 = 61;
 const UART7_IRQ: u16 = 82; // host-sp-comms USART (UART7) global interrupt (H7)
-// Register offsets relative to ETH_BASE.
+                           // Register offsets relative to ETH_BASE.
 const MACMDIOAR: u32 = 0x0200; // MDIO address/control; MB (bit0) = busy, self-clears
 const DMAMR: u32 = 0x1000; // DMA mode; SWR (bit0) = soft reset, self-clears
 const DMAISR: u32 = 0x1008; // interrupt summary; dc0is (bit0) = channel-0 interrupt
@@ -102,11 +104,11 @@ const BUFSZ: u32 = 1536; // drv/stm32h7-eth ring::BUFSZ
 #[derive(Default)]
 struct EthDma {
     regs: std::collections::HashMap<u32, u32>,
-    rx_next: u32, // index into the RX descriptor ring
-    tx_frames: Vec<Vec<u8>>, // frames emitted by the SP, awaiting the host bridge
-    irq: bool, // ETH IRQ (61) pending (set on TX/RX completion)
+    rx_next: u32,             // index into the RX descriptor ring
+    tx_frames: Vec<Vec<u8>>,  // frames emitted by the SP, awaiting the host bridge
+    irq: bool,                // ETH IRQ (61) pending (set on TX/RX completion)
     pending_vid: Option<u16>, // VID from the last TX VLAN context descriptor
-    mdio_page: u16, // VSC85x2 PHY page selected via reg 31 (PAGE)
+    mdio_page: u16,           // VSC85x2 PHY page selected via reg 31 (PAGE)
 }
 
 const MACMDIODR: u32 = 0x0204; // MDIO data register (read/write payload)
@@ -145,14 +147,32 @@ impl Default for Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        let watch = std::env::var("SP_EMU_WATCH").ok()
+        let watch = std::env::var("SP_EMU_WATCH")
+            .ok()
             .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-        Bus { rams: Vec::new(), devs: Vec::new(), unmapped_reads: 0, unmapped_writes: 0, log_unmapped: true, watch, cur_pc: 0, cur_cyc: 0, mmio_hit: false, rec: false, writes: Vec::new(),
-            nvic_en: [0; 8], nvic_pend: [0; 8], nvic_prio: [0; 256], pend_pendsv: false,
-            dev_touched: false, eth: EthDma::default(),
+        Bus {
+            rams: Vec::new(),
+            devs: Vec::new(),
+            unmapped_reads: 0,
+            unmapped_writes: 0,
+            log_unmapped: true,
+            watch,
+            cur_pc: 0,
+            cur_cyc: 0,
+            mmio_hit: false,
+            rec: false,
+            writes: Vec::new(),
+            nvic_en: [0; 8],
+            nvic_pend: [0; 8],
+            nvic_prio: [0; 256],
+            pend_pendsv: false,
+            dev_touched: false,
+            eth: EthDma::default(),
             uart_tx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
             uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
-            tim5_base: 0, tim5_regs: [0; TIM5_NREGS] }
+            tim5_base: 0,
+            tim5_regs: [0; TIM5_NREGS],
+        }
     }
 
     /// Consume a pending PendSV (the deferred context-switch request).
@@ -172,7 +192,9 @@ impl Bus {
 
     // ---- Ethernet MAC/DMA -------------------------------------------------
 
-    fn eth_reg(&self, off: u32) -> u32 { *self.eth.regs.get(&(off & !3)).unwrap_or(&0) }
+    fn eth_reg(&self, off: u32) -> u32 {
+        *self.eth.regs.get(&(off & !3)).unwrap_or(&0)
+    }
 
     fn eth_read(&mut self, off: u32) -> u32 {
         let v = self.eth_reg(off);
@@ -200,9 +222,20 @@ impl Bus {
             (1, 25) => 0x29e8, // VERIPHY_CTRL_REG2: 8051 CRC == EXPECTED_CRC -> skip patch
             // MICRO_PAGE: the driver writes a command (bit15=go) and polls until
             // bit15 clears (done) with bit14 clear (no error) -> mask both off.
-            (16, 18) => *self.eth.regs.get(&(0x1_0000 | (16u32 << 8) | 18)).unwrap_or(&0) as u16 & 0x3FFF,
+            (16, 18) => {
+                *self
+                    .eth
+                    .regs
+                    .get(&(0x1_0000 | (16u32 << 8) | 18))
+                    .unwrap_or(&0) as u16
+                    & 0x3FFF
+            }
             (16, 30) => 0x0001, // EXTENDED_REVISION: tesla_e == 1
-            _ => *self.eth.regs.get(&(0x1_0000 | (page as u32) << 8 | reg as u32)).unwrap_or(&0) as u16,
+            _ => *self
+                .eth
+                .regs
+                .get(&(0x1_0000 | (page as u32) << 8 | reg as u32))
+                .unwrap_or(&0) as u16,
         }
     }
 
@@ -211,20 +244,34 @@ impl Bus {
         // MDIO transaction: writing MACMDIOAR with MB performs a PHY read/write.
         if off == MACMDIOAR && val & 1 != 0 {
             let (goc, rda) = ((val >> 2) & 3, ((val >> 16) & 0x1F) as u8);
-            if goc == 0b11 { // read -> latch the result into MACMDIODR
+            if goc == 0b11 {
+                // read -> latch the result into MACMDIODR
                 let v = self.phy_read(self.eth.mdio_page, rda);
                 if crate::dbg::mdio() {
-                    eprintln!("[mdio] RD page={} reg={} -> {:#06x}", self.eth.mdio_page, rda, v);
+                    eprintln!(
+                        "[mdio] RD page={} reg={} -> {:#06x}",
+                        self.eth.mdio_page, rda, v
+                    );
                 }
                 self.eth.regs.insert(MACMDIODR, v as u32);
-            } else if goc == 0b01 { // write
+            } else if goc == 0b01 {
+                // write
                 let data = self.eth_reg(MACMDIODR) as u16;
-                if rda == 31 { self.eth.mdio_page = data; } // PAGE select
+                if rda == 31 {
+                    self.eth.mdio_page = data;
+                }
+                // PAGE select
                 else {
                     if crate::dbg::mdio() {
-                        eprintln!("[mdio] WR page={} reg={} <- {:#06x}", self.eth.mdio_page, rda, data);
+                        eprintln!(
+                            "[mdio] WR page={} reg={} <- {:#06x}",
+                            self.eth.mdio_page, rda, data
+                        );
                     }
-                    self.eth.regs.insert(0x1_0000 | (self.eth.mdio_page as u32) << 8 | rda as u32, data as u32);
+                    self.eth.regs.insert(
+                        0x1_0000 | (self.eth.mdio_page as u32) << 8 | rda as u32,
+                        data as u32,
+                    );
                 }
             }
             self.eth.regs.insert(MACMDIOAR, val & !1); // MB clears (op complete)
@@ -236,10 +283,14 @@ impl Bus {
                 let cur = self.eth_reg(DMACSR);
                 self.eth.regs.insert(DMACSR, cur & !val);
             }
-            _ => { self.eth.regs.insert(off, val); }
+            _ => {
+                self.eth.regs.insert(off, val);
+            }
         }
         // Writing the TX tail pointer hands new descriptors to the DMA -> transmit.
-        if off == DMACTXDTPR && !self.rec { self.eth_tx_walk(); }
+        if off == DMACTXDTPR && !self.rec {
+            self.eth_tx_walk();
+        }
     }
 
     /// Walk the TX descriptor ring from `tx_next`, emitting every descriptor the
@@ -256,22 +307,33 @@ impl Bus {
         for i in 0..ring_len {
             let d = base.wrapping_add(i.wrapping_mul(16));
             let tdes3 = self.read32(d + 12);
-            if tdes3 & (1 << 31) == 0 { continue; } // driver owns it: nothing to send
+            if tdes3 & (1 << 31) == 0 {
+                continue;
+            } // driver owns it: nothing to send
             self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN — back to the driver
-            // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
-            // insert into the following packet. Not a packet itself — don't emit.
+                                                      // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
+                                                      // insert into the following packet. Not a packet itself — don't emit.
             if tdes3 & (1 << 30) != 0 {
-                if tdes3 & (1 << 16) != 0 { self.eth.pending_vid = Some((tdes3 & 0xFFF) as u16); }
+                if tdes3 & (1 << 16) != 0 {
+                    self.eth.pending_vid = Some((tdes3 & 0xFFF) as u16);
+                }
                 continue;
             }
             let buf = self.read32(d);
             let len = (self.read32(d + 8) & 0x3FFF).min(BUFSZ);
             let mut frame = Vec::with_capacity(len as usize + 4);
-            for i in 0..len { frame.push(self.read8(buf.wrapping_add(i))); }
+            for i in 0..len {
+                frame.push(self.read8(buf.wrapping_add(i)));
+            }
             // The MAC inserts the 802.1Q tag from the context descriptor.
             if let Some(vid) = self.eth.pending_vid.take() {
                 if frame.len() >= 12 {
-                    let tag = [(VLAN_TPID >> 8) as u8, VLAN_TPID as u8, (vid >> 8) as u8, vid as u8];
+                    let tag = [
+                        (VLAN_TPID >> 8) as u8,
+                        VLAN_TPID as u8,
+                        (vid >> 8) as u8,
+                        vid as u8,
+                    ];
                     frame.splice(12..12, tag);
                 }
             }
@@ -287,7 +349,9 @@ impl Bus {
     }
 
     /// Drain frames the SP has transmitted (for the host bridge to forward).
-    pub fn eth_take_tx(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.eth.tx_frames) }
+    pub fn eth_take_tx(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.eth.tx_frames)
+    }
 
     /// Write a humility-`hydrate`-compatible raw memory dump into `dir`: each RAM
     /// region as `0x<base>.bin` plus a `dump.json`. Flash (0x08000000) is omitted
@@ -298,7 +362,9 @@ impl Bus {
     pub fn write_hydrate_dump(&self, dir: &str, archive_id: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         for r in &self.rams {
-            if r.base == 0x0800_0000 { continue; } // flash comes from the archive
+            if r.base == 0x0800_0000 {
+                continue;
+            } // flash comes from the archive
             std::fs::write(format!("{}/0x{:x}.bin", dir, r.base), &r.data)?;
         }
         let json = format!(
@@ -312,13 +378,17 @@ impl Bus {
     /// break its instruction batch as soon as a reply is ready, so a round-trip
     /// costs ~one small quantum instead of a full batch (the eth latency that,
     /// under rack contention, exceeds MGS's per-attempt budget).
-    pub fn eth_has_tx(&self) -> bool { !self.eth.tx_frames.is_empty() }
+    pub fn eth_has_tx(&self) -> bool {
+        !self.eth.tx_frames.is_empty()
+    }
 
     /// Glue between the ETH DMA and the host network bridge: forward transmitted
     /// frames out, and inject any frames the bridge has for us. Called
     /// periodically from the run/gdb loops.
     pub fn pump_eth(&mut self, host: &mut dyn crate::host::HostIo) {
-        for f in self.eth_take_tx() { host.eth_tx(&f); }
+        for f in self.eth_take_tx() {
+            host.eth_tx(&f);
+        }
         // Drain the host network into the bridge once, then deliver only as many
         // frames as the RX ring can accept right now. Checking ring space before
         // popping means a frame is never lost to a full ring — it stays queued in
@@ -327,7 +397,9 @@ impl Bus {
         host.eth_poll();
         while self.eth_rx_has_space() {
             match host.eth_rx() {
-                Some(f) => { self.eth_rx_inject(&f); }
+                Some(f) => {
+                    self.eth_rx_inject(&f);
+                }
                 None => break,
             }
         }
@@ -338,7 +410,9 @@ impl Bus {
     /// in `eth_rx_inject` so the pump can gate delivery without popping a frame.
     fn eth_rx_has_space(&mut self) -> bool {
         let base = self.eth_reg(DMACRXDLAR);
-        if base == 0 { return false; }
+        if base == 0 {
+            return false;
+        }
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
         self.read32(d + 12) & (1 << 31) != 0 // RDES3.OWN set -> DMA owns it -> free
     }
@@ -347,12 +421,15 @@ impl Bus {
     /// ETH IRQ. Returns false (frame dropped) if the RX ring is full.
     pub fn eth_rx_inject(&mut self, frame: &[u8]) -> bool {
         let base = self.eth_reg(DMACRXDLAR);
-        if base == 0 { return false; }
+        if base == 0 {
+            return false;
+        }
         let ring_len = (self.eth_reg(DMACRXRLR) & 0xFFFF) + 1;
         let ring_dbg = crate::dbg::rx();
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
         let rdes3 = self.read32(d + 12);
-        if rdes3 & (1 << 31) == 0 { // driver still owns it -> ring full (DMA can't write)
+        if rdes3 & (1 << 31) == 0 {
+            // driver still owns it -> ring full (DMA can't write)
             if ring_dbg {
                 eprintln!("[rx-drop] ring full: rx_next={} ringlen={} d={:#x} rdes3={:#x} (OWN clear) cyc={}",
                     self.eth.rx_next, ring_len, d, rdes3, self.cur_cyc);
@@ -360,25 +437,44 @@ impl Bus {
             return false;
         }
         if ring_dbg {
-            eprintln!("[rx-ok] rx_next={} ringlen={} d={:#x} cyc={}", self.eth.rx_next, ring_len, d, self.cur_cyc);
+            eprintln!(
+                "[rx-ok] rx_next={} ringlen={} d={:#x} cyc={}",
+                self.eth.rx_next, ring_len, d, self.cur_cyc
+            );
         }
         // The bridge supplies a tagged wire frame. The MAC strips the 802.1Q tag
         // and reports the VID in RDES0 (RS0V); net drops frames lacking a valid
         // VID, and reads the untagged frame from the buffer.
         let tagged = frame.len() >= 16 && u16::from_be_bytes([frame[12], frame[13]]) == VLAN_TPID;
-        let vid = if tagged { u16::from_be_bytes([frame[14], frame[15]]) & 0xFFF } else { 0 };
+        let vid = if tagged {
+            u16::from_be_bytes([frame[14], frame[15]]) & 0xFFF
+        } else {
+            0
+        };
         let untagged: Vec<u8>;
         let data: &[u8] = if tagged {
             untagged = [&frame[..12], &frame[16..]].concat();
             &untagged
-        } else { frame };
+        } else {
+            frame
+        };
         if crate::dbg::eth() {
-            eprintln!("[eth-rx] inject {} bytes vid={:#x} cyc={} d={:#x} untagged={}",
-                data.len(), vid, self.cur_cyc, d, data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+            eprintln!(
+                "[eth-rx] inject {} bytes vid={:#x} cyc={} d={:#x} untagged={}",
+                data.len(),
+                vid,
+                self.cur_cyc,
+                d,
+                data.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            );
         }
         let buf = self.read32(d);
         let len = (data.len() as u32).min(BUFSZ);
-        for i in 0..len { self.write8(buf.wrapping_add(i), data[i as usize]); }
+        for i in 0..len {
+            self.write8(buf.wrapping_add(i), data[i as usize]);
+        }
         // Write back: clear OWN, FD|LD, RS0V (RDES0 valid), length; RDES0 = VID.
         let wb = (1 << 29) | (1 << 28) | (1 << 25) | (len & 0x7FFF);
         self.write32(d, vid as u32);
@@ -407,7 +503,9 @@ impl Bus {
             0xE000_E400..=0xE000_E4EF => {
                 let i = (addr - 0xE000_E400) as usize;
                 let mut v = 0;
-                for b in 0..4 { v |= (self.nvic_prio[i + b] as u32) << (8 * b); }
+                for b in 0..4 {
+                    v |= (self.nvic_prio[i + b] as u32) << (8 * b);
+                }
                 Some(v)
             }
             _ => None,
@@ -419,10 +517,14 @@ impl Bus {
             0xE000_E100..=0xE000_E11C => self.nvic_en[((addr - 0xE000_E100) / 4) as usize] |= val,
             0xE000_E180..=0xE000_E19C => self.nvic_en[((addr - 0xE000_E180) / 4) as usize] &= !val,
             0xE000_E200..=0xE000_E21C => self.nvic_pend[((addr - 0xE000_E200) / 4) as usize] |= val,
-            0xE000_E280..=0xE000_E29C => self.nvic_pend[((addr - 0xE000_E280) / 4) as usize] &= !val,
+            0xE000_E280..=0xE000_E29C => {
+                self.nvic_pend[((addr - 0xE000_E280) / 4) as usize] &= !val
+            }
             0xE000_E400..=0xE000_E4EF => {
                 let i = (addr - 0xE000_E400) as usize;
-                for b in 0..4 { self.nvic_prio[i + b] = (val >> (8 * b)) as u8; }
+                for b in 0..4 {
+                    self.nvic_prio[i + b] = (val >> (8 * b)) as u8;
+                }
             }
             _ => return false,
         }
@@ -434,7 +536,6 @@ impl Bus {
     pub fn pend_irq(&mut self, irq: u16) {
         self.nvic_pend[(irq / 32) as usize] |= 1 << (irq % 32);
     }
-
 
     /// Bridge the host-sp-comms UART (UART7) to the host: drain the SP's TX queue
     /// out to the host, then feed any host input into the SP's RX queue. Mirrors
@@ -463,7 +564,10 @@ impl Bus {
             let mut n = 0;
             for d in self.devs.iter_mut() {
                 if let Some(irq) = d.dev.take_irq() {
-                    if n < raised.len() { raised[n] = irq; n += 1; }
+                    if n < raised.len() {
+                        raised[n] = irq;
+                        n += 1;
+                    }
                 }
             }
             for &irq in &raised[..n] {
@@ -497,13 +601,18 @@ impl Bus {
         None
     }
 
-    pub fn irq_prio(&self, irq: u16) -> u8 { self.nvic_prio[irq as usize] }
+    pub fn irq_prio(&self, irq: u16) -> u8 {
+        self.nvic_prio[irq as usize]
+    }
     pub fn clear_pending(&mut self, irq: u16) {
         self.nvic_pend[(irq / 32) as usize] &= !(1 << (irq % 32));
     }
 
     pub fn add_ram(&mut self, base: u32, size: u32) {
-        self.rams.push(Ram { base, data: vec![0u8; size as usize] });
+        self.rams.push(Ram {
+            base,
+            data: vec![0u8; size as usize],
+        });
     }
 
     pub fn add_device(&mut self, base: u32, size: u32, dev: Box<dyn Mmio>) {
@@ -539,13 +648,20 @@ impl Bus {
             r.data[off..off + bytes.len()].copy_from_slice(bytes);
             Ok(())
         } else {
-            bail!("load: no region covers {:#010x}..{:#010x}", addr, addr as usize + bytes.len());
+            bail!(
+                "load: no region covers {:#010x}..{:#010x}",
+                addr,
+                addr as usize + bytes.len()
+            );
         }
     }
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         if (NVIC_LO..NVIC_HI).contains(&addr) {
-            if let Some(v) = self.nvic_read(addr & !3) { self.mmio_hit = true; return v; }
+            if let Some(v) = self.nvic_read(addr & !3) {
+                self.mmio_hit = true;
+                return v;
+            }
         }
         if addr & !3 == SCB_ICSR {
             self.mmio_hit = true;
@@ -572,7 +688,9 @@ impl Bus {
             d.dev.read(off & !3)
         } else {
             self.unmapped_reads += 1;
-            if self.log_unmapped { eprintln!("[mem] unmapped read32  @ {:#010x}", addr); }
+            if self.log_unmapped {
+                eprintln!("[mem] unmapped read32  @ {:#010x}", addr);
+            }
             0
         }
     }
@@ -594,12 +712,25 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32) {
-        if let Some(w) = self.watch { if addr == w { eprintln!("[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})", addr, val, self.cur_pc, self.cur_cyc); } }
-        if (NVIC_LO..NVIC_HI).contains(&addr)
-            && self.nvic_write(addr & !3, val) { self.mmio_hit = true; return; }
+        if let Some(w) = self.watch {
+            if addr == w {
+                eprintln!(
+                    "[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})",
+                    addr, val, self.cur_pc, self.cur_cyc
+                );
+            }
+        }
+        if (NVIC_LO..NVIC_HI).contains(&addr) && self.nvic_write(addr & !3, val) {
+            self.mmio_hit = true;
+            return;
+        }
         if addr & !3 == SCB_ICSR {
-            if val & (1 << 28) != 0 { self.pend_pendsv = true; }  // PENDSVSET
-            if val & (1 << 27) != 0 { self.pend_pendsv = false; } // PENDSVCLR
+            if val & (1 << 28) != 0 {
+                self.pend_pendsv = true;
+            } // PENDSVSET
+            if val & (1 << 27) != 0 {
+                self.pend_pendsv = false;
+            } // PENDSVCLR
             self.mmio_hit = true;
             return;
         }
@@ -610,7 +741,9 @@ impl Bus {
         }
         // Record only writes that actually land in RAM (the reference model can't
         // see emu's device/unmapped writes, so replaying them would desync it).
-        if self.rec && self.ram_for(addr, 4).is_some() { self.writes.push((addr, val, 4)); }
+        if self.rec && self.ram_for(addr, 4).is_some() {
+            self.writes.push((addr, val, 4));
+        }
         if let Some((r, off)) = self.ram_for(addr, 4) {
             r.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
         } else if (TIM5_BASE..TIM5_END).contains(&addr) {
@@ -621,19 +754,27 @@ impl Bus {
             // regardless of CR1/PSC/ARR.
             match addr & !3 {
                 TIM5_CNT => self.tim5_base = self.cur_cyc.wrapping_sub(val as u64),
-                TIM5_EGR => if val & 1 != 0 { self.tim5_base = self.cur_cyc },
+                TIM5_EGR => {
+                    if val & 1 != 0 {
+                        self.tim5_base = self.cur_cyc
+                    }
+                }
                 a => self.tim5_regs[(a - TIM5_BASE) as usize / 4] = val,
             }
         } else if let Some((d, off)) = self.dev_for(addr) {
             d.dev.write(off & !3, val);
         } else {
             self.unmapped_writes += 1;
-            if self.log_unmapped { eprintln!("[mem] unmapped write32 @ {:#010x} = {:#010x}", addr, val); }
+            if self.log_unmapped {
+                eprintln!("[mem] unmapped write32 @ {:#010x} = {:#010x}", addr, val);
+            }
         }
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
-        if self.rec && self.ram_for(addr, 2).is_some() { self.writes.push((addr, val as u32, 2)); }
+        if self.rec && self.ram_for(addr, 2).is_some() {
+            self.writes.push((addr, val as u32, 2));
+        }
         if let Some((r, off)) = self.ram_for(addr, 2) {
             r.data[off..off + 2].copy_from_slice(&val.to_le_bytes());
         } else {
@@ -644,7 +785,9 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8) {
-        if self.rec && self.ram_for(addr, 1).is_some() { self.writes.push((addr, val as u32, 1)); }
+        if self.rec && self.ram_for(addr, 1).is_some() {
+            self.writes.push((addr, val as u32, 1));
+        }
         if let Some((r, off)) = self.ram_for(addr, 1) {
             r.data[off] = val;
         } else {
@@ -665,8 +808,12 @@ mod tests {
     // reading back whatever was last written, so it never incremented.
     struct Sentinel;
     impl Mmio for Sentinel {
-        fn name(&self) -> &str { "sentinel" }
-        fn read(&mut self, _off: u32) -> u32 { 0xDEAD_BEEF }
+        fn name(&self) -> &str {
+            "sentinel"
+        }
+        fn read(&mut self, _off: u32) -> u32 {
+            0xDEAD_BEEF
+        }
         fn write(&mut self, _off: u32, _val: u32) {}
     }
 
@@ -682,10 +829,18 @@ mod tests {
         let mut bus = bus_with_catchall();
         bus.cur_cyc = 0;
         bus.write32(TIM5_CNT, 0); // startup driver seeds CNT = 0
-        assert_eq!(bus.read32(TIM5_CNT), 0, "reads the counter, not the catch-all sentinel");
+        assert_eq!(
+            bus.read32(TIM5_CNT),
+            0,
+            "reads the counter, not the catch-all sentinel"
+        );
         assert_ne!(bus.read32(TIM5_CNT), 0xDEAD_BEEF);
         bus.cur_cyc = 500; // 500 retired instructions later
-        assert_eq!(bus.read32(TIM5_CNT), 500, "CNT advances 1:1 with the instruction count");
+        assert_eq!(
+            bus.read32(TIM5_CNT),
+            500,
+            "CNT advances 1:1 with the instruction count"
+        );
     }
 
     #[test]
@@ -727,8 +882,13 @@ mod tests {
             bus.cur_cyc += 1; // retire one instruction per poll
             let now = bus.read32(TIM5_CNT);
             iters += 1;
-            if now.wrapping_sub(start) >= micros { break; }
-            assert!(iters < 10_000, "delay loop did not terminate — CNT not advancing");
+            if now.wrapping_sub(start) >= micros {
+                break;
+            }
+            assert!(
+                iters < 10_000,
+                "delay loop did not terminate — CNT not advancing"
+            );
         }
         assert!(iters >= micros);
     }
@@ -739,7 +899,11 @@ mod tests {
         let (cr1, psc) = (TIM5_BASE, TIM5_BASE + 0x28);
         bus.write32(cr1, 1);
         bus.write32(psc, 63);
-        assert_eq!(bus.read32(cr1), 1, "config registers read back the last write");
+        assert_eq!(
+            bus.read32(cr1),
+            1,
+            "config registers read back the last write"
+        );
         assert_eq!(bus.read32(psc), 63);
         bus.write32(TIM5_EGR, 1);
         assert_eq!(bus.read32(TIM5_EGR), 0, "EGR is write-only");
@@ -754,6 +918,10 @@ mod tests {
         assert_eq!(start, u32::MAX - 5);
         bus.cur_cyc = 10; // ten ticks later, wrapped past zero
         let now = bus.read32(TIM5_CNT);
-        assert_eq!(now.wrapping_sub(start), 10, "the firmware's wrapping-sub delta is correct across rollover");
+        assert_eq!(
+            now.wrapping_sub(start),
+            10,
+            "the firmware's wrapping-sub delta is correct across rollover"
+        );
     }
 }
