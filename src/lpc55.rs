@@ -82,6 +82,12 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
     bus.write32(0x4000_0280, 3);
     bus.write32(0x4000_0284, 0);
     bus.write32(0x4000_0380, 0);
+    // PUF (base 0x4003_B000): lpc55-rot-startup::puf_check panics unless KEY_INDEX
+    // (1) is blocked and the register is locked in IDXBLK_L (offset 0x20C). The
+    // boot ROM normally configures this; emulate the result. Value bits: bit2 =
+    // index-1 disabled/blocked, bits[31:30]=0b01 = Locked (lpc55-puf is_index_blocked
+    // checks bit index*2; is_locked checks idxblk >> 30 == 1).
+    bus.write32(0x4003_B20C, 0x4000_0004);
 }
 
 /// Minimal LPC55 flash controller model. The flash content is the memory-mapped
