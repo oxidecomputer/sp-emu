@@ -78,9 +78,14 @@ pub struct Bus {
     // TIM5 config registers (CR1/PSC/ARR/...), stored so they read back what
     // was written. CNT and EGR are handled specially in read32/write32.
     tim5_regs: [u32; TIM5_NREGS],
+    /// Set when firmware writes AIRCR.SYSRESETREQ (a system reset request). The
+    /// run loop applies it (re-boot the core from the vector table) and clears it,
+    /// since an `Mmio` device write cannot reach the Cpu.
+    pub reset_pending: bool,
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
+const SCB_AIRCR: u32 = 0xE000_ED0C;
 
 // ---- STM32H7 Ethernet (base 0x4002_8000; DMA block at +0x1000) -------------
 const ETH_BASE: u32 = 0x4002_8000;
@@ -172,6 +177,7 @@ impl Bus {
             uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
             tim5_base: 0,
             tim5_regs: [0; TIM5_NREGS],
+            reset_pending: false,
         }
     }
 
@@ -734,6 +740,15 @@ impl Bus {
             self.mmio_hit = true;
             return;
         }
+        // AIRCR.SYSRESETREQ with the correct write key: firmware self-reset. Flag it
+        // for the run loop to apply (a device write can't reach the Cpu); fall through
+        // so the SCS still stores the register for read-back.
+        if addr & !3 == SCB_AIRCR
+            && (val & 0xFFFF_0000) == 0x05FA_0000
+            && val & (1 << 2) != 0
+        {
+            self.reset_pending = true;
+        }
         if (ETH_BASE..ETH_END).contains(&addr) {
             self.mmio_hit = true;
             self.eth_write(addr - ETH_BASE, val);
@@ -923,5 +938,22 @@ mod tests {
             10,
             "the firmware's wrapping-sub delta is correct across rollover"
         );
+    }
+
+    #[test]
+    fn aircr_sysresetreq_flags_reset() {
+        let mut bus = Bus::new();
+        assert!(!bus.reset_pending);
+        bus.write32(SCB_AIRCR, 0x05FA_0004); // VECTKEY | SYSRESETREQ
+        assert!(bus.reset_pending, "SYSRESETREQ with the key flags a reset");
+    }
+
+    #[test]
+    fn aircr_needs_key_and_req() {
+        let mut bus = Bus::new();
+        bus.write32(SCB_AIRCR, 0x0000_0004); // SYSRESETREQ but no write key
+        assert!(!bus.reset_pending);
+        bus.write32(SCB_AIRCR, 0x05FA_0000); // key but no SYSRESETREQ (e.g. PRIGROUP)
+        assert!(!bus.reset_pending);
     }
 }
