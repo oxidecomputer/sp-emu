@@ -77,7 +77,11 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         if dbg() && it > 0 && it % 40_000 == 0 {
             let nz = first_nonzero(&resp);
             let head: String = match nz {
-                Some(s) => resp[s..].iter().take(20).map(|b| format!("{b:02x}")).collect(),
+                Some(s) => resp[s..]
+                    .iter()
+                    .take(20)
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
                 None => String::from("(all-zero)"),
             };
             eprintln!("[rotsvc] grind it={it} phase2={phase2} resp={} first_nonzero@{:?} head={head} rot_pc={:#010x}",
@@ -152,8 +156,7 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         if phase2 && total.is_none() {
             if let Some(start) = first_nonzero(&resp) {
                 if resp.len() >= start + 6 {
-                    let body_size =
-                        u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
+                    let body_size = u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
                     let t = start + 6 + body_size + 2;
                     if body_size + 8 <= MAX_RESP {
                         total = Some(t);
@@ -198,7 +201,11 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
     }
     if dbg() {
         let hx: String = resp.iter().take(48).map(|b| format!("{b:02x}")).collect();
-        eprintln!("[rotsvc] exchange: req {}B -> resp {}B [{hx}]", req.len(), resp.len());
+        eprintln!(
+            "[rotsvc] exchange: req {}B -> resp {}B [{hx}]",
+            req.len(),
+            resp.len()
+        );
     }
     resp
 }
@@ -248,8 +255,12 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
                 Ok((req, resp_tx)) => {
                     if dbg() {
                         let hx: String = req.iter().map(|b| format!("{b:02x}")).collect();
-                        eprintln!("[rotsvc] req mt={:#04x} len={} hex={hx} cache_hit={}",
-                            req.get(6).copied().unwrap_or(0), req.len(), cache.contains_key(&req));
+                        eprintln!(
+                            "[rotsvc] req mt={:#04x} len={} hex={hx} cache_hit={}",
+                            req.get(6).copied().unwrap_or(0),
+                            req.len(),
+                            cache.contains_key(&req)
+                        );
                     }
                     let resp = if let Some(r) = cache.get(&req) {
                         r.clone()
@@ -331,7 +342,10 @@ pub struct RotClient {
 }
 impl RotClient {
     pub fn connect(addr: &str) -> Self {
-        let mut c = RotClient { addr: addr.to_string(), stream: None };
+        let mut c = RotClient {
+            addr: addr.to_string(),
+            stream: None,
+        };
         c.ensure();
         c
     }

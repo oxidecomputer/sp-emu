@@ -36,7 +36,7 @@ enum Mode {
 
 struct Inner {
     mode: Mode,
-    w: Option<TcpStream>,            // write side: observations (+ queries in device mode)
+    w: Option<TcpStream>, // write side: observations (+ queries in device mode)
     r: Option<BufReader<TcpStream>>, // read side: device-mode query responses
 }
 
@@ -62,7 +62,9 @@ impl I2cBridge {
                     eprintln!("[i2c-device] delegating I2C reads to {addr}");
                     return Self::wrap(Mode::Device, Some(s), r);
                 }
-                Err(e) => eprintln!("[i2c-device] connect {addr} failed: {e}; using the built-in model"),
+                Err(e) => {
+                    eprintln!("[i2c-device] connect {addr} failed: {e}; using the built-in model")
+                }
             }
         }
         if let Some(addr) = env_addr("SP_EMU_I2C_BRIDGE") {
@@ -142,7 +144,9 @@ impl I2cBridge {
         }
         let Inner { w, r, .. } = &mut *g;
         let (w, r) = (w.as_mut()?, r.as_mut()?);
-        writeln!(w, "R {bus} {addr:#04x} {reg:#04x} {idx}").and_then(|_| w.flush()).ok()?;
+        writeln!(w, "R {bus} {addr:#04x} {reg:#04x} {idx}")
+            .and_then(|_| w.flush())
+            .ok()?;
         let mut line = String::new();
         r.read_line(&mut line).ok()?;
         let t = line.trim();
@@ -158,7 +162,9 @@ impl I2cBridge {
         if !matches!(self.0.borrow().mode, Mode::Sniff) {
             return;
         }
-        self.send(&format!("i2c{bus} RD addr={addr:#04x} reg={reg:#04x} idx={idx} -> {byte:#04x}"));
+        self.send(&format!(
+            "i2c{bus} RD addr={addr:#04x} reg={reg:#04x} idx={idx} -> {byte:#04x}"
+        ));
     }
 }
 
@@ -247,8 +253,12 @@ fn parse_override(s: &str) -> anyhow::Result<Override> {
         let bytes = std::fs::read(file.trim()).map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
         return Ok(Override::Image { addr, bytes });
     }
-    let (lhs, val) = s.split_once('=').ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val` or `addr@file`"))?;
-    let (addr, reg) = lhs.split_once('/').ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val`"))?;
+    let (lhs, val) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val` or `addr@file`"))?;
+    let (addr, reg) = lhs
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val`"))?;
     Ok(Override::Reg {
         addr: parse_hex(addr).ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))? as u8,
         reg: parse_hex(reg).ok_or_else(|| anyhow::anyhow!("bad reg in {s:?}"))? as u8,
@@ -263,17 +273,28 @@ fn parse_override(s: &str) -> anyhow::Result<Override> {
 ///   `<addr>/<reg>=<val>`   inject a 16-bit register value (hi byte first)
 ///   `<addr>@<file>`        serve a file as that device's read stream (EEPROM)
 pub fn serve_device(addr: &str, specs: &[String]) -> anyhow::Result<()> {
-    let overrides: Vec<Override> =
-        specs.iter().map(|s| parse_override(s)).collect::<anyhow::Result<_>>()?;
+    let overrides: Vec<Override> = specs
+        .iter()
+        .map(|s| parse_override(s))
+        .collect::<anyhow::Result<_>>()?;
     let l = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-    eprintln!("[i2c-device] listening on {addr} - start the emulator with SP_EMU_I2C_DEVICE={addr}");
+    eprintln!(
+        "[i2c-device] listening on {addr} - start the emulator with SP_EMU_I2C_DEVICE={addr}"
+    );
     for o in &overrides {
         match o {
             Override::Reg { addr, reg, val } => {
-                eprintln!("[i2c-device]   inject {addr:#04x} reg {reg:#04x} = {val:#06x}  ({})", device_name(*addr))
+                eprintln!(
+                    "[i2c-device]   inject {addr:#04x} reg {reg:#04x} = {val:#06x}  ({})",
+                    device_name(*addr)
+                )
             }
             Override::Image { addr, bytes } => {
-                eprintln!("[i2c-device]   serve {} bytes as {addr:#04x}  ({})", bytes.len(), device_name(*addr))
+                eprintln!(
+                    "[i2c-device]   serve {} bytes as {addr:#04x}  ({})",
+                    bytes.len(),
+                    device_name(*addr)
+                )
             }
         }
     }
@@ -303,17 +324,26 @@ pub fn serve_device(addr: &str, specs: &[String]) -> anyhow::Result<()> {
             if f.first() != Some(&"R") || f.len() < 5 {
                 continue;
             }
-            let (addr, reg, idx) = match (parse_hex(f[2]), parse_hex(f[3]), f[4].parse::<usize>().ok()) {
-                (Some(a), Some(r), Some(i)) => (a as u8, r as u8, i),
-                _ => continue,
-            };
+            let (addr, reg, idx) =
+                match (parse_hex(f[2]), parse_hex(f[3]), f[4].parse::<usize>().ok()) {
+                    (Some(a), Some(r), Some(i)) => (a as u8, r as u8, i),
+                    _ => continue,
+                };
             let ans: Option<u8> = overrides.iter().find_map(|o| match o {
-                Override::Reg { addr: a, reg: r, val } if *a == addr && *r == reg => {
-                    Some(if idx == 0 { (*val >> 8) as u8 } else { *val as u8 })
-                }
-                Override::Image { addr: a, bytes } if *a == addr => {
-                    Some(*bytes.get((reg as usize).wrapping_add(idx) % bytes.len().max(1)).unwrap_or(&0))
-                }
+                Override::Reg {
+                    addr: a,
+                    reg: r,
+                    val,
+                } if *a == addr && *r == reg => Some(if idx == 0 {
+                    (*val >> 8) as u8
+                } else {
+                    *val as u8
+                }),
+                Override::Image { addr: a, bytes } if *a == addr => Some(
+                    *bytes
+                        .get((reg as usize).wrapping_add(idx) % bytes.len().max(1))
+                        .unwrap_or(&0),
+                ),
                 _ => None,
             });
             let reply = match ans {

@@ -40,8 +40,8 @@ pub fn install_peripherals(bus: &mut Bus) {
     bus.add_device(0x5802_4400, 0x400, Box::new(Rcc::new()));
     bus.add_device(0x5802_4800, 0x400, Box::new(Pwr::new()));
     bus.add_device(0xE000_E000, 0x1000, Box::new(Scs::new())); // SysTick/NVIC/SCB/CPACR
-    // FLASH controller: config registers are write-then-readback (e.g. ACR
-    // latency), so a plain store/return register file is the correct model.
+                                                               // FLASH controller: config registers are write-then-readback (e.g. ACR
+                                                               // latency), so a plain store/return register file is the correct model.
     bus.add_device(0x5200_2000, 0x100, Box::new(RegFile::new("FLASH")));
 
     // Ethernet MAC/MTL/DMA (0x40028000) is modeled directly in the Bus (src/mem.rs
@@ -53,7 +53,11 @@ pub fn install_peripherals(bus: &mut Bus) {
 
     // SPI4 + the KSZ8463 switch behind it (net's management interface).
     if let Some(lk) = crate::sprot::link() {
-        bus.add_device(0x4001_3400, 0x400, Box::new(crate::sprot::SpiMaster::new(lk))); // SP<->RoT sprot link
+        bus.add_device(
+            0x4001_3400,
+            0x400,
+            Box::new(crate::sprot::SpiMaster::new(lk)),
+        ); // SP<->RoT sprot link
     } else {
         bus.add_device(0x4001_3400, 0x400, Box::new(Spi4::new()));
     }
@@ -64,16 +68,23 @@ pub fn install_peripherals(bus: &mut Bus) {
     // drives the shared SPI2 chip-select (PB5=sequencer, PI0=KSZ8463).
     let spi2_cs: Spi2Cs = Rc::new(Cell::new(0));
     let spi5_cs: Spi5Cs = Rc::new(Cell::new(0));
-    bus.add_device(0x5802_0000, 0x3000, Box::new(GpioBank::new(spi2_cs.clone(), spi5_cs.clone())));
+    bus.add_device(
+        0x5802_0000,
+        0x3000,
+        Box::new(GpioBank::new(spi2_cs.clone(), spi5_cs.clone())),
+    );
 
     // SPI bus wiring differs by board. On gimlet, SPI2 (0x4000_3800) is the iCE40
     // sequencer FPGA + KSZ8463, CS-routed. On the sidecar, SPI2 is monorail's
     // VSC7448 management switch, net's KSZ8463 is on SPI3 (0x4000_3C00), and the
     // mainboard ECP5 (drv-fpga-server) is on SPI5 (0x4001_5000). The sidecar
     // devices are only installed for that board so they don't shadow gimlet's map.
-    if std::env::var("SP_EMU_BOARD").map(|b| b == "sidecar").unwrap_or(false) {
-        bus.add_device(0x4000_3800, 0x400, Box::new(Vsc7448::new()));    // monorail ⇄ VSC7448
-        bus.add_device(0x4000_3C00, 0x400, Box::new(Spi4::new()));       // net ⇄ KSZ8463 (reuse KSZ model)
+    if std::env::var("SP_EMU_BOARD")
+        .map(|b| b == "sidecar")
+        .unwrap_or(false)
+    {
+        bus.add_device(0x4000_3800, 0x400, Box::new(Vsc7448::new())); // monorail ⇄ VSC7448
+        bus.add_device(0x4000_3C00, 0x400, Box::new(Spi4::new())); // net ⇄ KSZ8463 (reuse KSZ model)
         bus.add_device(0x4001_5000, 0x400, Box::new(Spi5::new(spi5_cs)));
     } else {
         bus.add_device(0x4000_3800, 0x400, Box::new(Spi2::new(spi2_cs))); // gimlet sequencer/KSZ
@@ -88,12 +99,22 @@ pub fn install_peripherals(bus: &mut Bus) {
     // One shared I2C bridge socket (SP_EMU_I2C_BRIDGE sniff / SP_EMU_I2C_DEVICE
     // delegate) carries every bus.
     let bridge = crate::i2c_bridge::I2cBridge::from_env();
-    for (i, (base, ev_irq)) in
-        [(0x4000_5400u32, 31u16), (0x4000_5800, 33), (0x4000_5C00, 72), (0x5800_1C00, 95)]
-            .into_iter()
-            .enumerate()
+    for (i, (base, ev_irq)) in [
+        (0x4000_5400u32, 31u16),
+        (0x4000_5800, 33),
+        (0x4000_5C00, 72),
+        (0x5800_1C00, 95),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let dev = I2c::new(ev_irq, sensors.clone(), vpd.clone(), bridge.clone(), (i + 1) as u8);
+        let dev = I2c::new(
+            ev_irq,
+            sensors.clone(),
+            vpd.clone(),
+            bridge.clone(),
+            (i + 1) as u8,
+        );
         bus.add_device(base, 0x400, Box::new(dev));
     }
 
@@ -152,17 +173,35 @@ pub fn install_peripherals(bus: &mut Bus) {
 /// driver arms it as a one-pulse timer (CR1.CEN=1), then blocks on its IRQ
 /// (mdio-timer-irq = IRQ 117). Arming raises the IRQ once, sets SR.UIF, and
 /// self-clears CR1.CEN so the driver's `while cen {}` wait breaks.
-pub struct Tim16 { regs: std::collections::HashMap<u32, u32>, armed: bool }
-impl Tim16 { pub fn new() -> Self { Tim16 { regs: std::collections::HashMap::new(), armed: false } } }
+pub struct Tim16 {
+    regs: std::collections::HashMap<u32, u32>,
+    armed: bool,
+}
+impl Tim16 {
+    pub fn new() -> Self {
+        Tim16 {
+            regs: std::collections::HashMap::new(),
+            armed: false,
+        }
+    }
+}
 impl Mmio for Tim16 {
-    fn name(&self) -> &str { "TIM16" }
-    fn read(&mut self, off: u32) -> u32 { *self.regs.get(&(off & !3)).unwrap_or(&0) }
+    fn name(&self) -> &str {
+        "TIM16"
+    }
+    fn read(&mut self, off: u32) -> u32 {
+        *self.regs.get(&(off & !3)).unwrap_or(&0)
+    }
     fn write(&mut self, off: u32, val: u32) {
         self.regs.insert(off & !3, val);
-        if off & !3 == 0x00 && val & 1 != 0 { self.armed = true; } // CR1.CEN set
+        if off & !3 == 0x00 && val & 1 != 0 {
+            self.armed = true;
+        } // CR1.CEN set
     }
     fn take_irq(&mut self) -> Option<u16> {
-        if !self.armed { return None; }
+        if !self.armed {
+            return None;
+        }
         self.armed = false;
         *self.regs.entry(0x10).or_insert(0) |= 1; // SR.UIF (update interrupt flag)
         *self.regs.entry(0x00).or_insert(0) &= !1; // CR1.CEN self-clears (one-pulse)
@@ -202,7 +241,9 @@ impl Uart7 {
     }
 }
 impl Mmio for Uart7 {
-    fn name(&self) -> &str { "UART7" }
+    fn name(&self) -> &str {
+        "UART7"
+    }
     fn read(&mut self, off: u32) -> u32 {
         let r = off & !3;
         match r {
@@ -219,7 +260,9 @@ impl Mmio for Uart7 {
             0x24 => {
                 let b = self.rx.borrow_mut().pop_front();
                 if self.dbg {
-                    if let Some(b) = b { eprintln!("[uart7] RX {:#04x}", b); }
+                    if let Some(b) = b {
+                        eprintln!("[uart7] RX {:#04x}", b);
+                    }
                 }
                 b.map(|b| b as u32).unwrap_or(0)
             }
@@ -231,7 +274,9 @@ impl Mmio for Uart7 {
         if r == 0x28 {
             // TDR: a transmitted byte -> the host TX queue.
             self.tx.borrow_mut().push_back(val as u8);
-            if self.dbg { eprintln!("[uart7] TX {:#04x}", val & 0xff); }
+            if self.dbg {
+                eprintln!("[uart7] TX {:#04x}", val & 0xff);
+            }
         } else {
             self.regs.insert(r, val);
         }
@@ -272,35 +317,56 @@ pub struct Spi4 {
     regs: std::collections::HashMap<u32, u32>,
     ksz: Ksz8463,
     rx: Vec<u8>,
-    idx: u32,      // byte index within the current SPI transaction
-    cmd: u16,      // accumulated command word (address + write bit)
+    idx: u32, // byte index within the current SPI transaction
+    cmd: u16, // accumulated command word (address + write bit)
     is_write: bool,
-    val: u16,      // register value being read out (response bytes)
-    dlo: u8,       // low data byte captured during a write
+    val: u16, // register value being read out (response bytes)
+    dlo: u8,  // low data byte captured during a write
 }
 impl Spi4 {
     pub fn new() -> Self {
-        Spi4 { regs: std::collections::HashMap::new(), ksz: Ksz8463::default(),
-            rx: Vec::new(), idx: 0, cmd: 0, is_write: false, val: 0, dlo: 0 }
+        Spi4 {
+            regs: std::collections::HashMap::new(),
+            ksz: Ksz8463::default(),
+            rx: Vec::new(),
+            idx: 0,
+            cmd: 0,
+            is_write: false,
+            val: 0,
+            dlo: 0,
+        }
     }
     /// Clock one byte out (and one in) of the KSZ, by position in the 4-byte xfer.
     fn xfer_byte(&mut self, b: u8) -> u8 {
         let pos = self.idx % 4;
         self.idx += 1;
         match pos {
-            0 => { self.cmd = (b as u16) << 8; 0 }
+            0 => {
+                self.cmd = (b as u16) << 8;
+                0
+            }
             1 => {
                 self.cmd |= b as u16;
                 self.is_write = self.cmd & 0x8000 != 0;
                 self.val = self.ksz.read(self.cmd & 0x7FFF);
                 0
             }
-            2 => if self.is_write { self.dlo = b; 0 } else { (self.val & 0xFF) as u8 },
+            2 => {
+                if self.is_write {
+                    self.dlo = b;
+                    0
+                } else {
+                    (self.val & 0xFF) as u8
+                }
+            }
             3 => {
                 if self.is_write {
-                    self.ksz.write(self.cmd & 0x7FFF, ((b as u16) << 8) | self.dlo as u16);
+                    self.ksz
+                        .write(self.cmd & 0x7FFF, ((b as u16) << 8) | self.dlo as u16);
                     0
-                } else { (self.val >> 8) as u8 }
+                } else {
+                    (self.val >> 8) as u8
+                }
             }
             _ => 0,
         }
@@ -322,27 +388,45 @@ fn spi_sr(done_count: u32, tsize: u32, rx_nonempty: bool) -> u32 {
 }
 
 impl Mmio for Spi4 {
-    fn name(&self) -> &str { "SPI4" }
+    fn name(&self) -> &str {
+        "SPI4"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x14 => { // SR
+            0x14 => {
+                // SR
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
                 spi_sr(self.idx, tsize, !self.rx.is_empty())
             }
-            0x30 => if self.rx.is_empty() { 0 } else { self.rx.remove(0) as u32 }, // RXDR: pop
+            0x30 => {
+                if self.rx.is_empty() {
+                    0
+                } else {
+                    self.rx.remove(0) as u32
+                }
+            } // RXDR: pop
             0x20 => 0, // TXDR read (only happens via byte-write RMW) — harmless
             o => *self.regs.get(&o).unwrap_or(&0),
         }
     }
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
-            0x20 => { let rx = self.xfer_byte(val as u8); self.rx.push(rx); } // TXDR
-            0x00 => { // CR1: SPE 0->1 starts a fresh transaction
+            0x20 => {
+                let rx = self.xfer_byte(val as u8);
+                self.rx.push(rx);
+            } // TXDR
+            0x00 => {
+                // CR1: SPE 0->1 starts a fresh transaction
                 let was_spe = self.regs.get(&0).map(|v| v & 1 != 0).unwrap_or(false);
                 self.regs.insert(0, val);
-                if val & 1 != 0 && !was_spe { self.idx = 0; self.rx.clear(); }
+                if val & 1 != 0 && !was_spe {
+                    self.idx = 0;
+                    self.rx.clear();
+                }
             }
-            o => { self.regs.insert(o, val); }
+            o => {
+                self.regs.insert(o, val);
+            }
         }
     }
 }
@@ -365,18 +449,26 @@ pub struct Vsc7448 {
     regs: std::collections::HashMap<u32, u32>,
     vsc: std::collections::HashMap<u32, u32>, // VSC7448 reg file, keyed by 24-bit word addr
     rx: Vec<u8>,
-    idx: u32,        // byte index within the current SPI transaction
+    idx: u32, // byte index within the current SPI transaction
     is_write: bool,
-    waddr: u32,      // accumulated 24-bit word address
-    rval: u32,       // register value being read out
-    wval: u32,       // register value being assembled during a write
-    vscdbg: bool,    // SP_EMU_VSCDBG: trace every VSC7448 register read/write
+    waddr: u32,   // accumulated 24-bit word address
+    rval: u32,    // register value being read out
+    wval: u32,    // register value being assembled during a write
+    vscdbg: bool, // SP_EMU_VSCDBG: trace every VSC7448 register read/write
 }
 impl Vsc7448 {
     pub fn new() -> Self {
-        Vsc7448 { regs: std::collections::HashMap::new(), vsc: std::collections::HashMap::new(),
-            rx: Vec::new(), idx: 0, is_write: false, waddr: 0, rval: 0, wval: 0,
-            vscdbg: std::env::var("SP_EMU_VSCDBG").is_ok() }
+        Vsc7448 {
+            regs: std::collections::HashMap::new(),
+            vsc: std::collections::HashMap::new(),
+            rx: Vec::new(),
+            idx: 0,
+            is_write: false,
+            waddr: 0,
+            rval: 0,
+            wval: 0,
+            vscdbg: std::env::var("SP_EMU_VSCDBG").is_ok(),
+        }
     }
     fn vsc_read(&self, waddr: u32) -> u32 {
         match waddr {
@@ -396,13 +488,26 @@ impl Vsc7448 {
         let pos = self.idx;
         self.idx += 1;
         match pos {
-            0 => { self.is_write = b & 0x80 != 0; self.waddr = ((b & 0x7f) as u32) << 16; 0 }
-            1 => { self.waddr |= (b as u32) << 8; 0 }
+            0 => {
+                self.is_write = b & 0x80 != 0;
+                self.waddr = ((b & 0x7f) as u32) << 16;
+                0
+            }
+            1 => {
+                self.waddr |= (b as u32) << 8;
+                0
+            }
             2 => {
                 self.waddr |= b as u32;
                 if !self.is_write {
                     self.rval = self.vsc_read(self.waddr);
-                    if self.vscdbg { eprintln!("[vsc] R reg={:#010x} val={:#010x}", 0x7100_0000 | (self.waddr << 2), self.rval); }
+                    if self.vscdbg {
+                        eprintln!(
+                            "[vsc] R reg={:#010x} val={:#010x}",
+                            0x7100_0000 | (self.waddr << 2),
+                            self.rval
+                        );
+                    }
                 }
                 0
             }
@@ -419,46 +524,80 @@ impl Vsc7448 {
                         // Store it pre-cleared (preserving ram_ena, bit 0). Full reg addr
                         // = 0x7100_0000 | (word_addr << 2).
                         const RAM_INIT_REGS: [u32; 6] = [
-                            0x717e_03ec, 0x71b5_3528, 0x71c4_3638, // QSYS, REW, VOP
-                            0x71f9_4358, 0x7141_39b8, 0x7145_0008, // ANA_AC, ASM, DSM
+                            0x717e_03ec,
+                            0x71b5_3528,
+                            0x71c4_3638, // QSYS, REW, VOP
+                            0x71f9_4358,
+                            0x7141_39b8,
+                            0x7145_0008, // ANA_AC, ASM, DSM
                         ];
-                        if RAM_INIT_REGS.contains(&(0x7100_0000 | (a << 2))) { v &= !0x2; }
-                        if self.vscdbg { eprintln!("[vsc] W reg={:#010x} val={:#010x}", 0x7100_0000 | (a << 2), v); }
+                        if RAM_INIT_REGS.contains(&(0x7100_0000 | (a << 2))) {
+                            v &= !0x2;
+                        }
+                        if self.vscdbg {
+                            eprintln!(
+                                "[vsc] W reg={:#010x} val={:#010x}",
+                                0x7100_0000 | (a << 2),
+                                v
+                            );
+                        }
                         self.vsc.insert(a, v);
                     }
                     0
                 } else {
                     // read: 1 pad byte at position 3, then 4 data bytes (BE) at 4..8
-                    if pos == 3 { 0 } else { ((self.rval >> ((7 - pos) * 8)) & 0xFF) as u8 }
+                    if pos == 3 {
+                        0
+                    } else {
+                        ((self.rval >> ((7 - pos) * 8)) & 0xFF) as u8
+                    }
                 }
             }
         }
     }
 }
 impl Mmio for Vsc7448 {
-    fn name(&self) -> &str { "VSC7448(SPI2)" }
+    fn name(&self) -> &str {
+        "VSC7448(SPI2)"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x14 => { // SR
+            0x14 => {
+                // SR
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
                 spi_sr(self.idx, tsize, !self.rx.is_empty())
             }
-            0x30 => if self.rx.is_empty() { 0 } else { self.rx.remove(0) as u32 }, // RXDR: pop
+            0x30 => {
+                if self.rx.is_empty() {
+                    0
+                } else {
+                    self.rx.remove(0) as u32
+                }
+            } // RXDR: pop
             0x20 => 0, // TXDR read (only via byte-write RMW) — harmless
             o => *self.regs.get(&o).unwrap_or(&0),
         }
     }
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
-            0x20 => { let rx = self.xfer_byte(val as u8); self.rx.push(rx); } // TXDR
-            0x00 => { // CR1: SPE 0->1 starts a fresh transaction
+            0x20 => {
+                let rx = self.xfer_byte(val as u8);
+                self.rx.push(rx);
+            } // TXDR
+            0x00 => {
+                // CR1: SPE 0->1 starts a fresh transaction
                 let was_spe = self.regs.get(&0).map(|v| v & 1 != 0).unwrap_or(false);
                 self.regs.insert(0, val);
                 if val & 1 != 0 && !was_spe {
-                    self.idx = 0; self.rx.clear(); self.wval = 0; self.is_write = false;
+                    self.idx = 0;
+                    self.rx.clear();
+                    self.wval = 0;
+                    self.is_write = false;
                 }
             }
-            o => { self.regs.insert(o, val); }
+            o => {
+                self.regs.insert(o, val);
+            }
         }
     }
 }
@@ -475,7 +614,7 @@ impl Mmio for Vsc7448 {
 pub struct Spi2 {
     regs: std::collections::HashMap<u32, u32>,
     cs: Spi2Cs,
-    target: u8,   // device latched at SPE (1=seq, 2=ksz)
+    target: u8, // device latched at SPE (1=seq, 2=ksz)
     idx: u32,
     rx: Vec<u8>,
     // sequencer FPGA register file + per-transaction header accumulation
@@ -484,57 +623,128 @@ pub struct Spi2 {
     seq_addr: u16,
     // KSZ8463 (same model as Spi4)
     ksz: Ksz8463,
-    kcmd: u16, kwrite: bool, kval: u16, kdlo: u8,
+    kcmd: u16,
+    kwrite: bool,
+    kval: u16,
+    kdlo: u8,
     dbg_txn: u32,
 }
 impl Spi2 {
     pub fn new(cs: Spi2Cs) -> Self {
-        Spi2 { regs: Default::default(), cs, target: 0, idx: 0, rx: Vec::new(),
-            seq: Default::default(), seq_cmd: 0, seq_addr: 0,
-            ksz: Ksz8463::default(), kcmd: 0, kwrite: false, kval: 0, kdlo: 0, dbg_txn: 0 }
+        Spi2 {
+            regs: Default::default(),
+            cs,
+            target: 0,
+            idx: 0,
+            rx: Vec::new(),
+            seq: Default::default(),
+            seq_cmd: 0,
+            seq_addr: 0,
+            ksz: Ksz8463::default(),
+            kcmd: 0,
+            kwrite: false,
+            kval: 0,
+            kdlo: 0,
+            dbg_txn: 0,
+        }
     }
     fn seq_read(&self, addr: u16) -> u8 {
         match addr {
-            0x0 => 0xDE, 0x1 => 0x01,                  // ID0/ID1 (LE) -> ident 0x01DE = 0x1DE
-            0xa => 0x81, 0xb => 0x39, 0xc => 0x75, 0xd => 0x74, // CS0..3 -> 0x74753981 (LE)
-            0x13 => 0x00,                              // PWR_CTRL -> 0 (A2 resting)
+            0x0 => 0xDE,
+            0x1 => 0x01, // ID0/ID1 (LE) -> ident 0x01DE = 0x1DE
+            0xa => 0x81,
+            0xb => 0x39,
+            0xc => 0x75,
+            0xd => 0x74,  // CS0..3 -> 0x74753981 (LE)
+            0x13 => 0x00, // PWR_CTRL -> 0 (A2 resting)
             a => *self.seq.get(&a).unwrap_or(&0),
         }
     }
     fn xfer(&mut self, b: u8) -> u8 {
-        let pos = self.idx; self.idx += 1;
+        let pos = self.idx;
+        self.idx += 1;
         // Latch the CS target on the first byte: the SPI server sets SPE before
         // asserting the chip-select GPIO, so CS isn't valid until data flows.
-        if pos == 0 { self.target = self.cs.get(); self.dbg_txn = self.dbg_txn.wrapping_add(1); }
+        if pos == 0 {
+            self.target = self.cs.get();
+            self.dbg_txn = self.dbg_txn.wrapping_add(1);
+        }
         let r = self.xfer_inner(b, pos);
         if crate::dbg::spi() && self.dbg_txn < 6 && pos <= 6 {
-            eprintln!("[spi2x] txn={} tgt={} cs={} pos={} in={:#04x} out={:#04x} cmd={} addr={:#x}",
-                self.dbg_txn, self.target, self.cs.get(), pos, b, r, self.seq_cmd, self.seq_addr);
+            eprintln!(
+                "[spi2x] txn={} tgt={} cs={} pos={} in={:#04x} out={:#04x} cmd={} addr={:#x}",
+                self.dbg_txn,
+                self.target,
+                self.cs.get(),
+                pos,
+                b,
+                r,
+                self.seq_cmd,
+                self.seq_addr
+            );
         }
         r
     }
     fn xfer_inner(&mut self, b: u8, pos: u32) -> u8 {
         match self.target {
-            1 => { // sequencer FPGA: 3-byte header then data
+            1 => {
+                // sequencer FPGA: 3-byte header then data
                 match pos {
-                    0 => { self.seq_cmd = b; 0 }
-                    1 => { self.seq_addr = (b as u16) << 8; 0 }
-                    2 => { self.seq_addr |= b as u16; 0 }
+                    0 => {
+                        self.seq_cmd = b;
+                        0
+                    }
+                    1 => {
+                        self.seq_addr = (b as u16) << 8;
+                        0
+                    }
+                    2 => {
+                        self.seq_addr |= b as u16;
+                        0
+                    }
                     n => {
                         let a = self.seq_addr.wrapping_add(n as u16 - 3);
-                        if self.seq_cmd == 1 { self.seq_read(a) }       // Read
-                        else { self.seq.insert(a, b); 0 }               // Write/BitSet/Clear (approx)
+                        if self.seq_cmd == 1 {
+                            self.seq_read(a)
+                        }
+                        // Read
+                        else {
+                            self.seq.insert(a, b);
+                            0
+                        } // Write/BitSet/Clear (approx)
                     }
                 }
             }
-            2 => { // KSZ8463: 4-byte [addr_hi, addr_lo, d0, d1]
+            2 => {
+                // KSZ8463: 4-byte [addr_hi, addr_lo, d0, d1]
                 match pos % 4 {
-                    0 => { self.kcmd = (b as u16) << 8; 0 }
-                    1 => { self.kcmd |= b as u16; self.kwrite = self.kcmd & 0x8000 != 0;
-                           self.kval = self.ksz.read(self.kcmd & 0x7FFF); 0 }
-                    2 => if self.kwrite { self.kdlo = b; 0 } else { (self.kval & 0xFF) as u8 },
-                    _ => { if self.kwrite { self.ksz.write(self.kcmd & 0x7FFF, ((b as u16) << 8) | self.kdlo as u16); 0 }
-                           else { (self.kval >> 8) as u8 } }
+                    0 => {
+                        self.kcmd = (b as u16) << 8;
+                        0
+                    }
+                    1 => {
+                        self.kcmd |= b as u16;
+                        self.kwrite = self.kcmd & 0x8000 != 0;
+                        self.kval = self.ksz.read(self.kcmd & 0x7FFF);
+                        0
+                    }
+                    2 => {
+                        if self.kwrite {
+                            self.kdlo = b;
+                            0
+                        } else {
+                            (self.kval & 0xFF) as u8
+                        }
+                    }
+                    _ => {
+                        if self.kwrite {
+                            self.ksz
+                                .write(self.kcmd & 0x7FFF, ((b as u16) << 8) | self.kdlo as u16);
+                            0
+                        } else {
+                            (self.kval >> 8) as u8
+                        }
+                    }
                 }
             }
             _ => 0,
@@ -542,26 +752,44 @@ impl Spi2 {
     }
 }
 impl Mmio for Spi2 {
-    fn name(&self) -> &str { "SPI2" }
+    fn name(&self) -> &str {
+        "SPI2"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x14 => { // SR
+            0x14 => {
+                // SR
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
                 spi_sr(self.idx, tsize, !self.rx.is_empty())
             }
-            0x30 => if self.rx.is_empty() { 0 } else { self.rx.remove(0) as u32 },
+            0x30 => {
+                if self.rx.is_empty() {
+                    0
+                } else {
+                    self.rx.remove(0) as u32
+                }
+            }
             o => *self.regs.get(&o).unwrap_or(&0),
         }
     }
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
-            0x20 => { let rx = self.xfer(val as u8); self.rx.push(rx); }
-            0x00 => { // CR1: SPE 0->1 latches the CS target and starts a transaction
+            0x20 => {
+                let rx = self.xfer(val as u8);
+                self.rx.push(rx);
+            }
+            0x00 => {
+                // CR1: SPE 0->1 latches the CS target and starts a transaction
                 let was = self.regs.get(&0).map(|v| v & 1 != 0).unwrap_or(false);
                 self.regs.insert(0, val);
-                if val & 1 != 0 && !was { self.idx = 0; self.rx.clear(); } // target latched at 1st byte
+                if val & 1 != 0 && !was {
+                    self.idx = 0;
+                    self.rx.clear();
+                } // target latched at 1st byte
             }
-            o => { self.regs.insert(o, val); }
+            o => {
+                self.regs.insert(o, val);
+            }
         }
     }
 }
@@ -582,10 +810,10 @@ pub struct Spi5 {
     idx: u32,
     op: u8,
     addr: u16,
-    dpos: u32,       // data bytes consumed this command (after the 3-byte header)
-    xfer_cnt: u32,   // bytes in the CURRENT spi-core transfer (for EOT); resets per SPE
-    dbg_n: u32,      // SP_EMU_SPIDBG trace counter (cap output)
-    cs: Spi5Cs,      // user-design CS assert-generation; reset the command when it changes
+    dpos: u32,     // data bytes consumed this command (after the 3-byte header)
+    xfer_cnt: u32, // bytes in the CURRENT spi-core transfer (for EOT); resets per SPE
+    dbg_n: u32,    // SP_EMU_SPIDBG trace counter (cap output)
+    cs: Spi5Cs,    // user-design CS assert-generation; reset the command when it changes
     last_gen: u32,
     fpga: std::collections::HashMap<u16, u8>, // FPGA user-design register file (byte-addressed)
 }
@@ -626,18 +854,36 @@ fn seed_ignition(fpga: &mut std::collections::HashMap<u16, u8>) {
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let (port_s, type_s) = match entry.split_once(':') {
             Some(x) => x,
-            None => { eprintln!("[sp-emu] SP_EMU_IGNITION: ignoring malformed entry {:?}", entry); continue; }
+            None => {
+                eprintln!(
+                    "[sp-emu] SP_EMU_IGNITION: ignoring malformed entry {:?}",
+                    entry
+                );
+                continue;
+            }
         };
         let port: u8 = match port_s.trim().parse() {
             Ok(p) if p < NUM_PORTS => p,
-            _ => { eprintln!("[sp-emu] SP_EMU_IGNITION: ignoring out-of-range port {:?}", port_s); continue; }
+            _ => {
+                eprintln!(
+                    "[sp-emu] SP_EMU_IGNITION: ignoring out-of-range port {:?}",
+                    port_s
+                );
+                continue;
+            }
         };
         let sys_type: u8 = match type_s.trim().to_ascii_lowercase().as_str() {
             "gimlet" => 0x11,
             "sidecar" => 0x12,
             "psc" => 0x13,
             "cosmo" => 0x04,
-            other => { eprintln!("[sp-emu] SP_EMU_IGNITION: unknown type {:?}, defaulting to gimlet", other); 0x11 }
+            other => {
+                eprintln!(
+                    "[sp-emu] SP_EMU_IGNITION: unknown type {:?}, defaulting to gimlet",
+                    other
+                );
+                0x11
+            }
         };
         present |= 1u64 << port;
         let bytes = [0x01u8, 0x03, sys_type, 0x05, 0x00, 0x00, 0x03, 0x03];
@@ -658,44 +904,73 @@ impl Spi5 {
         // checksum: the driver reads ident.checksum BE but compares to the LE
         // interpretation of SIDECAR_MAINBOARD_BITSTREAM_CHECKSUM[..4]=[5e,47,07,64]
         // = 0x6407475e, so CS0..3 must be 64 07 47 5e (BE -> 0x6407475e). version/sha=0.
-        for (a, v) in [(0u16, 0x01u8), (1, 0xde), (2, 0x5b), (3, 0xae),
-                       (4, 0x64), (5, 0x07), (6, 0x47), (7, 0x5e),
-                       // FRONT_IO_STATE (0x30): STATE field is bits[7:4]; set it to
-                       // PowerRailStatus::Enabled(4) -> 4<<4 = 0x40, so the sequencer's
-                       // front-IO hot-swap preinit loop completes (status == Enabled).
-                       (0x30, 0x40),
-                       // Tofino sequencer register block (drv-sidecar-mainboard-controller
-                       // tofino2.rs / generated reg map). Reports a coherent A2 resting
-                       // state with no abort. a4x2's Tofino dataplane is SoftNPU/P4 in
-                       // software, so the SP only reports the switch as present/powered,
-                       // not sequence real silicon. TofinoSeqStatus decodes 6 bytes at
-                       // 0x100..0x105: CTRL, STATE=A2(1), STEP=Init(0), ERROR=None(0),
-                       // ERROR_STATE=Init(0), ERROR_STEP=Init(0) -> abort=None.
-                       (0x100, 0x00),  // TOFINO_SEQ_CTRL (EN=0; at rest in A2)
-                       (0x101, 0x01),  // TOFINO_SEQ_STATE = A2
-                       (0x102, 0x00),  // TOFINO_SEQ_STEP = Init
-                       (0x103, 0x00),  // TOFINO_SEQ_ERROR = None
-                       (0x104, 0x00),  // TOFINO_SEQ_ERROR_STATE = Init
-                       (0x105, 0x00)]  // TOFINO_SEQ_ERROR_STEP = Init
-    {
+        for (a, v) in [
+            (0u16, 0x01u8),
+            (1, 0xde),
+            (2, 0x5b),
+            (3, 0xae),
+            (4, 0x64),
+            (5, 0x07),
+            (6, 0x47),
+            (7, 0x5e),
+            // FRONT_IO_STATE (0x30): STATE field is bits[7:4]; set it to
+            // PowerRailStatus::Enabled(4) -> 4<<4 = 0x40, so the sequencer's
+            // front-IO hot-swap preinit loop completes (status == Enabled).
+            (0x30, 0x40),
+            // Tofino sequencer register block (drv-sidecar-mainboard-controller
+            // tofino2.rs / generated reg map). Reports a coherent A2 resting
+            // state with no abort. a4x2's Tofino dataplane is SoftNPU/P4 in
+            // software, so the SP only reports the switch as present/powered,
+            // not sequence real silicon. TofinoSeqStatus decodes 6 bytes at
+            // 0x100..0x105: CTRL, STATE=A2(1), STEP=Init(0), ERROR=None(0),
+            // ERROR_STATE=Init(0), ERROR_STEP=Init(0) -> abort=None.
+            (0x100, 0x00), // TOFINO_SEQ_CTRL (EN=0; at rest in A2)
+            (0x101, 0x01), // TOFINO_SEQ_STATE = A2
+            (0x102, 0x00), // TOFINO_SEQ_STEP = Init
+            (0x103, 0x00), // TOFINO_SEQ_ERROR = None
+            (0x104, 0x00), // TOFINO_SEQ_ERROR_STATE = Init
+            (0x105, 0x00),
+        ]
+        // TOFINO_SEQ_ERROR_STEP = Init
+        {
             fpga.insert(a, v);
         }
         seed_ignition(&mut fpga);
-        Spi5 { regs: std::collections::HashMap::new(), rx: Vec::new(), idx: 0, op: 0, addr: 0, dpos: 0, xfer_cnt: 0, dbg_n: 0, cs, last_gen: 0, fpga }
+        Spi5 {
+            regs: std::collections::HashMap::new(),
+            rx: Vec::new(),
+            idx: 0,
+            op: 0,
+            addr: 0,
+            dpos: 0,
+            xfer_cnt: 0,
+            dbg_n: 0,
+            cs,
+            last_gen: 0,
+            fpga,
+        }
     }
     /// Reset per-command state on the CS deasserted->asserted edge — a command
     /// (header write + data read) spans two SPE cycles under one CS lock.
     fn check_cs(&mut self) {
         let gen = self.cs.get();
-        if gen != self.last_gen { // a new CS lock began -> new FPGA command
-            self.idx = 0; self.dpos = 0; self.rx.clear(); self.op = 0; self.addr = 0; self.xfer_cnt = 0;
+        if gen != self.last_gen {
+            // a new CS lock began -> new FPGA command
+            self.idx = 0;
+            self.dpos = 0;
+            self.rx.clear();
+            self.op = 0;
+            self.addr = 0;
+            self.xfer_cnt = 0;
             self.last_gen = gen;
         }
     }
     /// The next data byte for the current (read) command, with address auto-increment.
     fn next_data(&mut self) -> u8 {
         let incr = self.op != 5 && self.op != 6; // No-AddrIncr variants hold addr
-        let a = self.addr.wrapping_add(if incr { self.dpos } else { 0 } as u16);
+        let a = self
+            .addr
+            .wrapping_add(if incr { self.dpos } else { 0 } as u16);
         self.dpos += 1;
         *self.fpga.get(&a).unwrap_or(&0)
     }
@@ -704,14 +979,32 @@ impl Spi5 {
     fn xfer(&mut self, b: u8) -> u8 {
         self.xfer_cnt += 1; // bytes in this spi-core transfer (drives EOT)
         let out = match self.idx {
-            0 => { self.op = b; self.idx += 1; 0 }
-            1 => { self.addr = (b as u16) << 8; self.idx += 1; 0 }
-            2 => { self.addr |= b as u16; self.idx += 1; 0 }
+            0 => {
+                self.op = b;
+                self.idx += 1;
+                0
+            }
+            1 => {
+                self.addr = (b as u16) << 8;
+                self.idx += 1;
+                0
+            }
+            2 => {
+                self.addr |= b as u16;
+                self.idx += 1;
+                0
+            }
             _ => {
-                if self.op == 1 || self.op == 6 { self.next_data() } // Read / ReadNoAddrIncr
-                else { // Write(0) / BitSet(2) / BitClear(3) / WriteNoAddrIncr(5)
+                if self.op == 1 || self.op == 6 {
+                    self.next_data()
+                }
+                // Read / ReadNoAddrIncr
+                else {
+                    // Write(0) / BitSet(2) / BitClear(3) / WriteNoAddrIncr(5)
                     let incr = self.op != 5; // only WriteNoAddrIncr holds the address
-                    let a = self.addr.wrapping_add(if incr { self.dpos } else { 0 } as u16);
+                    let a = self
+                        .addr
+                        .wrapping_add(if incr { self.dpos } else { 0 } as u16);
                     self.dpos += 1;
                     let cur = *self.fpga.get(&a).unwrap_or(&0);
                     let nv = match self.op {
@@ -726,21 +1019,27 @@ impl Spi5 {
         };
         if crate::dbg::spi() && self.dbg_n < 120 {
             self.dbg_n += 1;
-            eprintln!("[spi5] idx={} op={} addr={:#x} dpos={} in={:#04x} out={:#04x}",
-                self.idx, self.op, self.addr, self.dpos, b, out);
+            eprintln!(
+                "[spi5] idx={} op={} addr={:#x} dpos={} in={:#04x} out={:#04x}",
+                self.idx, self.op, self.addr, self.dpos, b, out
+            );
         }
         out
     }
 }
 impl Mmio for Spi5 {
-    fn name(&self) -> &str { "SPI5" }
+    fn name(&self) -> &str {
+        "SPI5"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x14 => { // SR (EOT/TXC keyed on xfer_cnt, not idx — full-duplex byte count)
+            0x14 => {
+                // SR (EOT/TXC keyed on xfer_cnt, not idx — full-duplex byte count)
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
                 spi_sr(self.xfer_cnt, tsize, !self.rx.is_empty())
             }
-            0x30 => { // RXDR
+            0x30 => {
+                // RXDR
                 if let Some(b) = (!self.rx.is_empty()).then(|| self.rx.remove(0)) {
                     b as u32 // full-duplex: byte produced by a TXDR write
                 } else if self.idx >= 3 && (self.op == 1 || self.op == 6) {
@@ -748,7 +1047,9 @@ impl Mmio for Spi5 {
                     // full-duplex) so EOT still fires in SR.
                     self.xfer_cnt += 1;
                     self.next_data() as u32
-                } else { 0 }
+                } else {
+                    0
+                }
             }
             o => *self.regs.get(&o).unwrap_or(&0),
         }
@@ -756,11 +1057,21 @@ impl Mmio for Spi5 {
     fn write(&mut self, off: u32, val: u32) {
         self.check_cs(); // resets per-command state on the CS asserting edge
         match off & !3 {
-            0x20 => { let rx = self.xfer(val as u8); self.rx.push(rx); } // TXDR
-            0x04 => { self.xfer_cnt = 0; self.regs.insert(0x04, val); // CR2.TSIZE: new transfer -> reset EOT count
-                if crate::dbg::spi() && self.dbg_n < 120 { eprintln!("[spi5] CR2/TSIZE <- {:#x} (xfer_cnt reset)", val); } }
+            0x20 => {
+                let rx = self.xfer(val as u8);
+                self.rx.push(rx);
+            } // TXDR
+            0x04 => {
+                self.xfer_cnt = 0;
+                self.regs.insert(0x04, val); // CR2.TSIZE: new transfer -> reset EOT count
+                if crate::dbg::spi() && self.dbg_n < 120 {
+                    eprintln!("[spi5] CR2/TSIZE <- {:#x} (xfer_cnt reset)", val);
+                }
+            }
             o => {
-                if crate::dbg::spi() && self.dbg_n < 120 && (o == 0x00) { eprintln!("[spi5] CR1 <- {:#x}", val); }
+                if crate::dbg::spi() && self.dbg_n < 120 && (o == 0x00) {
+                    eprintln!("[spi5] CR1 <- {:#x}", val);
+                }
                 self.regs.insert(o, val);
             }
         }
@@ -773,12 +1084,26 @@ impl Mmio for Spi5 {
 ///  - GPIOG (port 6): PG[2:0] = board revision -> 0b010 for gimlet-c.
 ///
 /// Other ports' IDR mirrors their ODR (+0x14) so output read-back works.
-pub struct GpioBank { regs: std::collections::HashMap<u32, u32>, cs: Spi2Cs, spi5_cs: Spi5Cs, prev_pj6_low: Cell<bool>, sidecar: bool }
+pub struct GpioBank {
+    regs: std::collections::HashMap<u32, u32>,
+    cs: Spi2Cs,
+    spi5_cs: Spi5Cs,
+    prev_pj6_low: Cell<bool>,
+    sidecar: bool,
+}
 impl GpioBank {
     pub fn new(cs: Spi2Cs, spi5_cs: Spi5Cs) -> Self {
         // $SP_EMU_BOARD selects the board profile for synthesized input pins.
-        let sidecar = std::env::var("SP_EMU_BOARD").map(|b| b == "sidecar").unwrap_or(false);
-        GpioBank { regs: std::collections::HashMap::new(), cs, spi5_cs, prev_pj6_low: Cell::new(false), sidecar }
+        let sidecar = std::env::var("SP_EMU_BOARD")
+            .map(|b| b == "sidecar")
+            .unwrap_or(false);
+        GpioBank {
+            regs: std::collections::HashMap::new(),
+            cs,
+            spi5_cs,
+            prev_pj6_low: Cell::new(false),
+            sidecar,
+        }
     }
 }
 impl GpioBank {
@@ -788,21 +1113,32 @@ impl GpioBank {
     fn update_cs(&self) {
         let pb = *self.regs.get(&(0x400 + 0x14)).unwrap_or(&0); // GPIOB ODR
         let pi = *self.regs.get(&(8 * 0x400 + 0x14)).unwrap_or(&0); // GPIOI ODR
-        self.cs.set(if pb & (1 << 5) == 0 { 1 } else if pi & (1 << 0) == 0 { 2 } else { 0 });
+        self.cs.set(if pb & (1 << 5) == 0 {
+            1
+        } else if pi & (1 << 0) == 0 {
+            2
+        } else {
+            0
+        });
         // Sidecar SPI5 user-design CS = Port J (port 9) pin 6, active-low. Count
         // each deasserted->asserted edge so Spi5 can delimit FPGA commands even
         // when the deassert happens between (Spi5-invisible) GPIO writes.
         let pj = *self.regs.get(&(9 * 0x400 + 0x14)).unwrap_or(&0); // GPIOJ ODR
         let pj6_low = pj & (1 << 6) == 0;
-        if pj6_low && !self.prev_pj6_low.get() { self.spi5_cs.set(self.spi5_cs.get().wrapping_add(1)); }
+        if pj6_low && !self.prev_pj6_low.get() {
+            self.spi5_cs.set(self.spi5_cs.get().wrapping_add(1));
+        }
         self.prev_pj6_low.set(pj6_low);
     }
 }
 impl Mmio for GpioBank {
-    fn name(&self) -> &str { "GPIO" }
+    fn name(&self) -> &str {
+        "GPIO"
+    }
     fn read(&mut self, off: u32) -> u32 {
         let (port, reg) = (off / 0x400, off & 0x3FF & !3);
-        if reg == 0x10 { // IDR
+        if reg == 0x10 {
+            // IDR
             if port == 4 {
                 // GPIOE: PE3 is rot-irq (input from the RoT, active-low). Surface
                 // the sprot link's rot_irq on bit 3 so the SP's sprot-server sees it.
@@ -827,8 +1163,8 @@ impl Mmio for GpioBank {
                 };
             }
             return match port {
-                2 => 0b11 << 6,  // GPIOC: PG lines good
-                6 => 0b010,      // GPIOG: gimlet-c board rev
+                2 => 0b11 << 6,                                            // GPIOC: PG lines good
+                6 => 0b010, // GPIOG: gimlet-c board rev
                 _ => *self.regs.get(&(port * 0x400 + 0x14)).unwrap_or(&0), // mirror ODR
             };
         }
@@ -868,14 +1204,21 @@ impl Mmio for GpioBank {
                         l.ssd = true;
                     }
                     if crate::sprot::dbg() {
-                        eprintln!("[gpio] PE4 CS {} (mosi={} miso={})", if new_cs {"ASSERT"} else {"deassert"}, l.mosi.len(), l.miso.len());
+                        eprintln!(
+                            "[gpio] PE4 CS {} (mosi={} miso={})",
+                            if new_cs { "ASSERT" } else { "deassert" },
+                            l.mosi.len(),
+                            l.miso.len()
+                        );
                     }
                 }
                 l.cs = new_cs;
             }
         }
         // GPIOB/GPIOI affect SPI2 CS; GPIOJ (port 9) affects the sidecar SPI5 CS.
-        if port == 1 || port == 8 || port == 9 { self.update_cs(); }
+        if port == 1 || port == 8 || port == 9 {
+            self.update_cs();
+        }
     }
 }
 
@@ -897,23 +1240,32 @@ pub struct SensorEnv {
 pub type Sensors = Rc<RefCell<SensorEnv>>;
 impl SensorEnv {
     pub fn from_env() -> Sensors {
-        let default_temp_c = std::env::var("SP_EMU_AMBIENT_C").ok()
-            .and_then(|s| s.trim().parse().ok()).unwrap_or(30.0);
+        let default_temp_c = std::env::var("SP_EMU_AMBIENT_C")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(30.0);
         let mut temp_override = std::collections::HashMap::new();
         if let Ok(s) = std::env::var("SP_EMU_SENSORS") {
             for kv in s.split(',') {
                 if let Some((a, v)) = kv.split_once('=') {
                     let a = a.trim().trim_start_matches("0x");
-                    if let (Ok(addr), Ok(t)) = (u8::from_str_radix(a, 16), v.trim().parse::<f32>()) {
+                    if let (Ok(addr), Ok(t)) = (u8::from_str_radix(a, 16), v.trim().parse::<f32>())
+                    {
                         temp_override.insert(addr, t);
                     }
                 }
             }
         }
-        Rc::new(RefCell::new(SensorEnv { default_temp_c, temp_override }))
+        Rc::new(RefCell::new(SensorEnv {
+            default_temp_c,
+            temp_override,
+        }))
     }
     fn temp_c(&self, addr: u8) -> f32 {
-        *self.temp_override.get(&addr).unwrap_or(&self.default_temp_c)
+        *self
+            .temp_override
+            .get(&addr)
+            .unwrap_or(&self.default_temp_c)
     }
 }
 
@@ -924,7 +1276,11 @@ fn crc32c(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -934,7 +1290,9 @@ fn crc32c(data: &[u8]) -> u32 {
 /// `!(le_u32(tag).wrapping_mul(HEADER_MAGIC).wrapping_add(len))`.
 fn tlvc_header_checksum(tag: [u8; 4], len: u32) -> u32 {
     const HEADER_MAGIC: u32 = 0x6b32_9f69;
-    !u32::from_le_bytes(tag).wrapping_mul(HEADER_MAGIC).wrapping_add(len)
+    !u32::from_le_bytes(tag)
+        .wrapping_mul(HEADER_MAGIC)
+        .wrapping_add(len)
 }
 
 /// Serialize one TLV-C chunk: header { tag, len(LE), header_checksum(LE) },
@@ -946,7 +1304,9 @@ fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
     v.extend_from_slice(&len.to_le_bytes());
     v.extend_from_slice(&tlvc_header_checksum(*tag, len).to_le_bytes());
     v.extend_from_slice(body);
-    while v.len() % 4 != 0 { v.push(0); } // header is 12B, so this pads the body
+    while v.len() % 4 != 0 {
+        v.push(0);
+    } // header is 12B, so this pads the body
     v.extend_from_slice(&crc32c(body).to_le_bytes());
     v
 }
@@ -968,10 +1328,17 @@ struct Hash {
     dcis: bool,
 }
 impl Hash {
-    pub fn new() -> Self { Hash { irq_pending: false, dcis: false } }
+    pub fn new() -> Self {
+        Hash {
+            irq_pending: false,
+            dcis: false,
+        }
+    }
 }
 impl Mmio for Hash {
-    fn name(&self) -> &str { "HASH" }
+    fn name(&self) -> &str {
+        "HASH"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x24 => (1 << 0) | if self.dcis { 1 << 1 } else { 0 }, // SR: DINIS + DCIS, BUSY=0
@@ -982,36 +1349,61 @@ impl Mmio for Hash {
     }
     fn write(&mut self, off: u32, val: u32) {
         match off & !3 {
-            0x00 => { if val & (1 << 2) != 0 { self.dcis = false; } }                 // CR.INIT
-            0x08 => { if val & (1 << 8) != 0 { self.dcis = true; self.irq_pending = true; } } // STR.DCAL
+            0x00 => {
+                if val & (1 << 2) != 0 {
+                    self.dcis = false;
+                }
+            } // CR.INIT
+            0x08 => {
+                if val & (1 << 8) != 0 {
+                    self.dcis = true;
+                    self.irq_pending = true;
+                }
+            } // STR.DCAL
             _ => {}
         }
     }
     fn take_irq(&mut self) -> Option<u16> {
-        if self.irq_pending { self.irq_pending = false; Some(80) } else { None }
+        if self.irq_pending {
+            self.irq_pending = false;
+            Some(80)
+        } else {
+            None
+        }
     }
 }
 
 fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     let mut img = vec![0xFFu8; 1024];
-    let sidecar = std::env::var("SP_EMU_BOARD").map(|b| b == "sidecar").unwrap_or(false);
+    let sidecar = std::env::var("SP_EMU_BOARD")
+        .map(|b| b == "sidecar")
+        .unwrap_or(false);
     // Per-instance index from the bridge port (33300->0, 33310->1, ...) so the
     // emulated gimlet SPs get distinct serials and MACs. Inventory keys SPs on
     // serial, and a shared MAC (the old blank-VPD gimlet default) caused L2
     // collisions => intermittent "no answer" on the management net.
-    let idx: u8 = std::env::var("SP_EMU_BRIDGE").ok()
+    let idx: u8 = std::env::var("SP_EMU_BRIDGE")
+        .ok()
         .and_then(|b| b.rsplit(':').next().map(str::to_string))
         .and_then(|p| p.parse::<u32>().ok())
         .map(|p| ((p.wrapping_sub(33300)) / 10) as u8)
         .unwrap_or(0);
     // MAC0: 128-MAC block. sidecar base ...45:30; gimlets ...45:21/22/23.
-    let mac_last = if sidecar { 0x30 } else { 0x20u8.wrapping_add(idx) };
+    let mac_last = if sidecar {
+        0x30
+    } else {
+        0x20u8.wrapping_add(idx)
+    };
     let mut mac0 = Vec::new();
     mac0.extend_from_slice(&[0x0e, 0x1d, 0xb7, 0xfe, 0x45, mac_last]); // base_mac
-    mac0.extend_from_slice(&128u16.to_le_bytes());                    // count
-    mac0.push(1);                                                     // stride
-    // BARC: 0XV2 barcode "version:part(<=11):rev:serial(<=11)".
-    let serial = if sidecar { "BRM42220001".to_string() } else { format!("BRM4422000{}", idx) };
+    mac0.extend_from_slice(&128u16.to_le_bytes()); // count
+    mac0.push(1); // stride
+                  // BARC: 0XV2 barcode "version:part(<=11):rev:serial(<=11)".
+    let serial = if sidecar {
+        "BRM42220001".to_string()
+    } else {
+        format!("BRM4422000{}", idx)
+    };
     let barc = format!("0XV2:913-0000019:002:{}", serial);
     let mut fru0 = tlvc_chunk(b"MAC0", &mac0);
     fru0.extend_from_slice(&tlvc_chunk(b"BARC", barc.as_bytes()));
@@ -1026,14 +1418,14 @@ pub struct I2c {
     active: bool,
     env: Sensors,
     // --- transaction state for modeling real device registers ---
-    addr: u8,        // current 7-bit target (from CR2.SADD)
-    reg_ptr: u8,     // device register pointer (from the write phase)
-    read_idx: u16,   // byte index within the current read phase
-    writing: bool,   // current phase is a master write (register-pointer set)
-    wrote_ptr: bool, // captured the register-pointer byte this write phase
-    eeprom: Rc<Vec<u8>>, // AT24CSW080 VPD/FRUID backing store (1024 bytes)
+    addr: u8,                             // current 7-bit target (from CR2.SADD)
+    reg_ptr: u8,                          // device register pointer (from the write phase)
+    read_idx: u16,                        // byte index within the current read phase
+    writing: bool,                        // current phase is a master write (register-pointer set)
+    wrote_ptr: bool,                      // captured the register-pointer byte this write phase
+    eeprom: Rc<Vec<u8>>,                  // AT24CSW080 VPD/FRUID backing store (1024 bytes)
     bridge: crate::i2c_bridge::I2cBridge, // SP_EMU_I2C_BRIDGE sniff / _DEVICE delegate (no-op when off)
-    bus: u8,         // 1-based bus number (i2c1..i2c4) for the trace
+    bus: u8,                              // 1-based bus number (i2c1..i2c4) for the trace
 }
 impl I2c {
     pub fn new(
@@ -1043,8 +1435,20 @@ impl I2c {
         bridge: crate::i2c_bridge::I2cBridge,
         bus: u8,
     ) -> Self {
-        I2c { regs: std::collections::HashMap::new(), ev_irq, active: false, env,
-            addr: 0, reg_ptr: 0, read_idx: 0, writing: false, wrote_ptr: false, eeprom, bridge, bus }
+        I2c {
+            regs: std::collections::HashMap::new(),
+            ev_irq,
+            active: false,
+            env,
+            addr: 0,
+            reg_ptr: 0,
+            read_idx: 0,
+            writing: false,
+            wrote_ptr: false,
+            eeprom,
+            bridge,
+            bus,
+        }
     }
     /// Accurate device-register model, keyed by I2C address. Returns the 16-bit
     /// value of `reg` (drivers read big-endian: high byte first; single-byte reads
@@ -1057,15 +1461,15 @@ impl I2c {
             // TMP117 temperature sensors (front/rear, 0x48-0x4a): 7.8125 m°C/LSB,
             // DeviceID must read 0x0117.
             0x48..=0x4a => Some(match reg {
-                0x0f => 0x0117,                                          // DeviceID
-                0x00 => (env.temp_c(addr) / 0.0078125) as i16 as u16,    // TempResult
-                0x01 => 0x0220,                                          // Configuration
+                0x0f => 0x0117,                                       // DeviceID
+                0x00 => (env.temp_c(addr) / 0.0078125) as i16 as u16, // TempResult
+                0x01 => 0x0220,                                       // Configuration
                 _ => 0,
             }),
             // TSE2004av DIMM temp sensors (bus "mid", 0x18-0x1f): DeviceIdRevision
             // upper byte must be 0x22; AmbientTemp is a 13-bit value (raw = °C*16).
             0x18..=0x1f => Some(match reg {
-                0x07 => 0x2200,                                          // DeviceIdRevision
+                0x07 => 0x2200, // DeviceIdRevision
                 0x05 => (((env.temp_c(addr) / 0.0078125) as i16 >> 3) as u16) & 0x1fff, // AmbientTemp
                 _ => 0,
             }),
@@ -1077,8 +1481,8 @@ impl I2c {
             // SINGLE-byte -> the value goes in the high byte (read_idx 0). ManufacturerId
             // (0xFE) must be 0x55 (TI); Local/Remote temp hi byte = integer °C.
             0x4c => Some(match reg {
-                0xFE => 0x5500,                                          // ManufacturerId = 0x55
-                0x00 | 0x01 => ((env.temp_c(addr) as i16) << 8) as u16,  // Local/Remote temp hi byte
+                0xFE => 0x5500,                                         // ManufacturerId = 0x55
+                0x00 | 0x01 => ((env.temp_c(addr) as i16) << 8) as u16, // Local/Remote temp hi byte
                 _ => 0,
             }),
             _ => None,
@@ -1086,17 +1490,26 @@ impl I2c {
     }
 }
 impl Mmio for I2c {
-    fn name(&self) -> &str { "I2C" }
+    fn name(&self) -> &str {
+        "I2C"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x18 => (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6), // ISR: TXE|TXIS|RXNE|TC
-            0x24 => { // RXDR: serve the modeled device register / EEPROM byte
+            0x24 => {
+                // RXDR: serve the modeled device register / EEPROM byte
                 if crate::dbg::vpd() {
-                    eprintln!("[i2c{:#x}] RD RXDR addr={:#04x} ptr={} ridx={}", self.ev_irq, self.addr, self.reg_ptr, self.read_idx);
+                    eprintln!(
+                        "[i2c{:#x}] RD RXDR addr={:#04x} ptr={} ridx={}",
+                        self.ev_irq, self.addr, self.reg_ptr, self.read_idx
+                    );
                 }
                 // DELEGATE (SP_EMU_I2C_DEVICE): a local device server may answer
                 // this read; `None` falls through to the built-in model below.
-                if let Some(b) = self.bridge.on_read(self.bus, self.addr, self.reg_ptr, self.read_idx) {
+                if let Some(b) =
+                    self.bridge
+                        .on_read(self.bus, self.addr, self.reg_ptr, self.read_idx)
+                {
                     self.read_idx = self.read_idx.wrapping_add(1);
                     return b as u32;
                 }
@@ -1110,16 +1523,34 @@ impl Mmio for I2c {
                     let idx = (off.wrapping_add(self.read_idx) & 0x3FF) as usize;
                     let byte = self.eeprom[idx];
                     if crate::dbg::vpd() {
-                        eprintln!("[vpd] rd addr={:#04x} ptr={} ridx={} off={} -> {:#04x}",
-                            self.addr, self.reg_ptr, self.read_idx, idx, byte);
+                        eprintln!(
+                            "[vpd] rd addr={:#04x} ptr={} ridx={} off={} -> {:#04x}",
+                            self.addr, self.reg_ptr, self.read_idx, idx, byte
+                        );
                     }
-                    self.bridge.on_read_served(self.bus, self.addr, self.reg_ptr, self.read_idx, byte);
+                    self.bridge.on_read_served(
+                        self.bus,
+                        self.addr,
+                        self.reg_ptr,
+                        self.read_idx,
+                        byte,
+                    );
                     self.read_idx = self.read_idx.wrapping_add(1);
                     return byte as u32;
                 }
                 let v = self.device_reg(self.addr, self.reg_ptr).unwrap_or(0);
-                let byte = if self.read_idx == 0 { (v >> 8) & 0xFF } else { v & 0xFF };
-                self.bridge.on_read_served(self.bus, self.addr, self.reg_ptr, self.read_idx, byte as u8);
+                let byte = if self.read_idx == 0 {
+                    (v >> 8) & 0xFF
+                } else {
+                    v & 0xFF
+                };
+                self.bridge.on_read_served(
+                    self.bus,
+                    self.addr,
+                    self.reg_ptr,
+                    self.read_idx,
+                    byte as u8,
+                );
                 self.read_idx = self.read_idx.wrapping_add(1);
                 byte as u32
             }
@@ -1130,32 +1561,52 @@ impl Mmio for I2c {
         if crate::dbg::vpd() && self.ev_irq == 95 {
             eprintln!("[i2c4] WR off={:#05x} val={:#010x}", off & !3, val);
         }
-        if off & !3 == 0x28 { // TXDR: first byte of a write phase is the register pointer
+        if off & !3 == 0x28 {
+            // TXDR: first byte of a write phase is the register pointer
             let byte = (val & 0xFF) as u8;
-            if self.writing && !self.wrote_ptr { self.reg_ptr = byte; self.wrote_ptr = true; }
+            if self.writing && !self.wrote_ptr {
+                self.reg_ptr = byte;
+                self.wrote_ptr = true;
+            }
             self.bridge.on_write(self.bus, self.addr, byte);
             return;
         }
-        if off & !3 == 0x04 { // CR2: START begins a master transfer, STOP ends it.
-            if val & (1 << 13) != 0 { // START
+        if off & !3 == 0x04 {
+            // CR2: START begins a master transfer, STOP ends it.
+            if val & (1 << 13) != 0 {
+                // START
                 self.active = true;
                 self.addr = ((val >> 1) & 0x7F) as u8; // SADD[7:1] = 7-bit address
-                if val & (1 << 10) != 0 { // RD_WRN set -> read phase
+                if val & (1 << 10) != 0 {
+                    // RD_WRN set -> read phase
                     self.read_idx = 0;
                     self.writing = false;
-                } else { // write phase (sets the register pointer)
+                } else {
+                    // write phase (sets the register pointer)
                     self.writing = true;
                     self.wrote_ptr = false;
                 }
                 if crate::dbg::vpd() {
-                    eprintln!("[i2c{:#x}] START addr={:#04x} rd={} nbytes={}", self.ev_irq, self.addr,
-                        (val >> 10) & 1, (val >> 16) & 0xFF);
+                    eprintln!(
+                        "[i2c{:#x}] START addr={:#04x} rd={} nbytes={}",
+                        self.ev_irq,
+                        self.addr,
+                        (val >> 10) & 1,
+                        (val >> 16) & 0xFF
+                    );
                 }
-                self.bridge.on_start(self.bus, self.addr, val & (1 << 10) != 0, (val >> 16) & 0xFF);
+                self.bridge.on_start(
+                    self.bus,
+                    self.addr,
+                    val & (1 << 10) != 0,
+                    (val >> 16) & 0xFF,
+                );
             }
-            if val & (1 << 14) != 0 { self.active = false; } // STOP
-            // START/STOP are command bits that auto-clear in hardware; store them
-            // cleared so a later read-modify-write doesn't carry a stale START.
+            if val & (1 << 14) != 0 {
+                self.active = false;
+            } // STOP
+              // START/STOP are command bits that auto-clear in hardware; store them
+              // cleared so a later read-modify-write doesn't carry a stale START.
             self.regs.insert(0x04, val & !((1 << 13) | (1 << 14)));
             return;
         }
@@ -1165,7 +1616,13 @@ impl Mmio for I2c {
     // Raise it only while a master transfer is active (CR2.START..STOP) so I2C
     // slave mode (gimlet-spd's operate_as_target, never addressed in the
     // emulator) stays blocked instead of busy-looping on stray IRQs.
-    fn take_irq(&mut self) -> Option<u16> { if self.active { Some(self.ev_irq) } else { None } }
+    fn take_irq(&mut self) -> Option<u16> {
+        if self.active {
+            Some(self.ev_irq)
+        } else {
+            None
+        }
+    }
 }
 
 /// STM32H7 QUADSPI — minimal model so the host-flash driver's transfers finish.
@@ -1189,55 +1646,88 @@ impl Mmio for I2c {
 /// is drained, so the driver never waits on the qspi-irq — avoiding the
 /// busy-loop/irq-storm a plain stub caused.
 pub struct Qspi {
-    dlr: u32,           // transfer length register (holds len-1)
-    resp: Vec<u8>,      // pending read response
-    resp_pos: usize,    // bytes drained from `resp`
-    mode_read: bool,    // current transfer is an indirect read
-    tcf: bool,          // transfer-complete latch
-    cr: u32,            // control register (stored, for EN bit etc.)
-    dcr: u32,           // device config (stored)
+    dlr: u32,        // transfer length register (holds len-1)
+    resp: Vec<u8>,   // pending read response
+    resp_pos: usize, // bytes drained from `resp`
+    mode_read: bool, // current transfer is an indirect read
+    tcf: bool,       // transfer-complete latch
+    cr: u32,         // control register (stored, for EN bit etc.)
+    dcr: u32,        // device config (stored)
 }
 impl Qspi {
     pub fn new() -> Self {
-        Qspi { dlr: 0, resp: Vec::new(), resp_pos: 0, mode_read: false, tcf: false, cr: 0, dcr: 0 }
+        Qspi {
+            dlr: 0,
+            resp: Vec::new(),
+            resp_pos: 0,
+            mode_read: false,
+            tcf: false,
+            cr: 0,
+            dcr: 0,
+        }
     }
     fn build_response(&self, instruction: u8, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
         match instruction {
-            0x9F => { // ReadId (RDID): Micron MT25Q, 32 MiB (log2 capacity = 0x19)
+            0x9F => {
+                // ReadId (RDID): Micron MT25Q, 32 MiB (log2 capacity = 0x19)
                 let id = [0x20u8, 0xBA, 0x19];
-                for (i, b) in id.iter().enumerate() { if i < len { v[i] = *b; } }
+                for (i, b) in id.iter().enumerate() {
+                    if i < len {
+                        v[i] = *b;
+                    }
+                }
             }
             0x05 => { /* ReadStatusReg: 0x00 (not busy) — zeros already */ }
             // Read / QuadRead / DdrRead / page-data etc.: erased NOR flash.
-            _ => { for b in v.iter_mut() { *b = 0xFF; } }
+            _ => {
+                for b in v.iter_mut() {
+                    *b = 0xFF;
+                }
+            }
         }
         v
     }
 }
 impl Mmio for Qspi {
-    fn name(&self) -> &str { "QUADSPI" }
+    fn name(&self) -> &str {
+        "QUADSPI"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x00 => self.cr,
             0x04 => self.dcr,
-            0x08 => { // SR
+            0x08 => {
+                // SR
                 let remaining = self.resp.len().saturating_sub(self.resp_pos);
-                if self.mode_read && remaining == 0 { self.tcf = true; }
-                let flevel = if self.mode_read { remaining.min(32) as u32 } else { 0 };
+                if self.mode_read && remaining == 0 {
+                    self.tcf = true;
+                }
+                let flevel = if self.mode_read {
+                    remaining.min(32) as u32
+                } else {
+                    0
+                };
                 let mut sr = 0u32;
-                if self.tcf { sr |= 1 << 1; }              // TCF
-                if !self.mode_read || remaining > 0 { sr |= 1 << 2; } // FTF
-                sr |= flevel << 8;                          // FLEVEL[5:0]
+                if self.tcf {
+                    sr |= 1 << 1;
+                } // TCF
+                if !self.mode_read || remaining > 0 {
+                    sr |= 1 << 2;
+                } // FTF
+                sr |= flevel << 8; // FLEVEL[5:0]
                 sr
             }
             0x10 => self.dlr,
-            0x20 => { // DR: pop one byte (driver reads the low byte via byte access)
+            0x20 => {
+                // DR: pop one byte (driver reads the low byte via byte access)
                 if self.resp_pos < self.resp.len() {
                     let b = self.resp[self.resp_pos] as u32;
                     self.resp_pos += 1;
                     b
-                } else { 0xFF }
+                } else {
+                    0xFF
+                }
             }
             _ => 0,
         }
@@ -1246,23 +1736,33 @@ impl Mmio for Qspi {
         match off & !3 {
             0x00 => self.cr = val,
             0x04 => self.dcr = val,
-            0x0C => { if val & (1 << 1) != 0 { self.tcf = false; } } // FCR.CTCF
-            0x10 => self.dlr = val,                                  // DLR (len-1)
-            0x14 => { // CCR: instruction in bits[7:0], FMODE in bits[27:26]
+            0x0C => {
+                if val & (1 << 1) != 0 {
+                    self.tcf = false;
+                }
+            } // FCR.CTCF
+            0x10 => self.dlr = val, // DLR (len-1)
+            0x14 => {
+                // CCR: instruction in bits[7:0], FMODE in bits[27:26]
                 let instruction = (val & 0xFF) as u8;
                 let fmode = (val >> 26) & 0b11;
-                if fmode == 0b01 { // indirect read
+                if fmode == 0b01 {
+                    // indirect read
                     let len = (self.dlr as usize).wrapping_add(1);
                     self.resp = self.build_response(instruction, len);
                     self.resp_pos = 0;
                     self.mode_read = true;
                     self.tcf = false;
-                } else { // indirect write (write-enable / program / erase): instant
+                } else {
+                    // indirect write (write-enable / program / erase): instant
                     self.mode_read = false;
                     self.tcf = true;
                 }
                 if crate::dbg::eth() {
-                    eprintln!("[qspi] CCR instr={:#04x} fmode={:#b} dlr={}", instruction, fmode, self.dlr);
+                    eprintln!(
+                        "[qspi] CCR instr={:#04x} fmode={:#b} dlr={}",
+                        instruction, fmode, self.dlr
+                    );
                 }
             }
             _ => {} // AR, DR-writes, interrupt-enable bits in CR: accept/ignore
@@ -1270,42 +1770,78 @@ impl Mmio for Qspi {
     }
     // No irq needed: the driver completes by polling FLEVEL/TCF, satisfied
     // immediately. Raising no irq keeps hf from busy-looping.
-    fn take_irq(&mut self) -> Option<u16> { None }
+    fn take_irq(&mut self) -> Option<u16> {
+        None
+    }
 }
 
 /// SYSCFG — store/return except PKGR (+0x124), whose pkg[3:0] field reads back
 /// 0b1000 (TFBGA240) so gimlet's package-guard accepts the firmware.
-pub struct Syscfg { regs: std::collections::HashMap<u32, u32> }
-impl Syscfg { pub fn new() -> Self { Syscfg { regs: std::collections::HashMap::new() } } }
+pub struct Syscfg {
+    regs: std::collections::HashMap<u32, u32>,
+}
+impl Syscfg {
+    pub fn new() -> Self {
+        Syscfg {
+            regs: std::collections::HashMap::new(),
+        }
+    }
+}
 impl Mmio for Syscfg {
-    fn name(&self) -> &str { "SYSCFG" }
+    fn name(&self) -> &str {
+        "SYSCFG"
+    }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x124 => (*self.regs.get(&0x124).unwrap_or(&0) & !0xF) | 0b1000, // PKGR.pkg
             o => *self.regs.get(&o).unwrap_or(&0),
         }
     }
-    fn write(&mut self, off: u32, val: u32) { self.regs.insert(off & !3, val); }
+    fn write(&mut self, off: u32, val: u32) {
+        self.regs.insert(off & !3, val);
+    }
 }
 
 /// STM32H7 unique device ID (96 bits / 3 words) — a stable fake identity.
 pub struct Uid;
 impl Mmio for Uid {
-    fn name(&self) -> &str { "UID" }
+    fn name(&self) -> &str {
+        "UID"
+    }
     fn read(&mut self, off: u32) -> u32 {
-        match off & !3 { 0x0 => 0x5350_4D45, 0x4 => 0x2D45_4D55, _ => 0x0000_0001 }
+        match off & !3 {
+            0x0 => 0x5350_4D45,
+            0x4 => 0x2D45_4D55,
+            _ => 0x0000_0001,
+        }
     }
     fn write(&mut self, _: u32, _: u32) {}
 }
 
 /// Generic peripheral that stores writes and returns them (sparse) — models
 /// config registers whose only requirement is readback consistency.
-pub struct RegFile { name: &'static str, regs: std::collections::HashMap<u32, u32> }
-impl RegFile { pub fn new(name: &'static str) -> Self { RegFile { name, regs: std::collections::HashMap::new() } } }
+pub struct RegFile {
+    name: &'static str,
+    regs: std::collections::HashMap<u32, u32>,
+}
+impl RegFile {
+    pub fn new(name: &'static str) -> Self {
+        RegFile {
+            name,
+            regs: std::collections::HashMap::new(),
+        }
+    }
+}
 impl Mmio for RegFile {
-    fn name(&self) -> &str { self.name }
-    fn read(&mut self, off: u32) -> u32 { *self.regs.get(&(off & !3)).unwrap_or(&0) }
-    fn write(&mut self, off: u32, val: u32) { self.regs.insert(off & !3, val); }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn read(&mut self, off: u32) -> u32 {
+        *self.regs.get(&(off & !3)).unwrap_or(&0)
+    }
+    fn write(&mut self, off: u32, val: u32) {
+        self.regs.insert(off & !3, val);
+    }
 }
 
 // ---- RCC: clock tree. Ready bits mirror their enable bits. -----------------
@@ -1315,11 +1851,15 @@ pub struct Rcc {
 }
 
 impl Rcc {
-    pub fn new() -> Self { Rcc { regs: [0; 0x100] } }
+    pub fn new() -> Self {
+        Rcc { regs: [0; 0x100] }
+    }
 }
 
 impl Mmio for Rcc {
-    fn name(&self) -> &str { "RCC" }
+    fn name(&self) -> &str {
+        "RCC"
+    }
     fn read(&mut self, off: u32) -> u32 {
         let i = (off / 4) as usize & 0xff;
         let mut v = self.regs[i];
@@ -1328,10 +1868,18 @@ impl Mmio for Rcc {
                 // CR: synthesize *RDY immediately from each *ON request.
                 v |= 1 << 1; // HSIRDY  (HSI always running out of reset)
                 v |= 1 << 2; // HSIDIVF / CSIRDY stand-in
-                if v & (1 << 16) != 0 { v |= 1 << 17; } // HSEON  -> HSERDY
-                if v & (1 << 24) != 0 { v |= 1 << 25; } // PLL1ON -> PLL1RDY
-                if v & (1 << 26) != 0 { v |= 1 << 27; } // PLL2ON -> PLL2RDY
-                if v & (1 << 28) != 0 { v |= 1 << 29; } // PLL3ON -> PLL3RDY
+                if v & (1 << 16) != 0 {
+                    v |= 1 << 17;
+                } // HSEON  -> HSERDY
+                if v & (1 << 24) != 0 {
+                    v |= 1 << 25;
+                } // PLL1ON -> PLL1RDY
+                if v & (1 << 26) != 0 {
+                    v |= 1 << 27;
+                } // PLL2ON -> PLL2RDY
+                if v & (1 << 28) != 0 {
+                    v |= 1 << 29;
+                } // PLL3ON -> PLL3RDY
             }
             0x10 => {
                 // CFGR: SWS (bits 5:3) tracks the requested SW (bits 2:0),
@@ -1356,17 +1904,21 @@ pub struct Pwr {
 }
 
 impl Pwr {
-    pub fn new() -> Self { Pwr { regs: [0; 0x40] } }
+    pub fn new() -> Self {
+        Pwr { regs: [0; 0x40] }
+    }
 }
 
 impl Mmio for Pwr {
-    fn name(&self) -> &str { "PWR" }
+    fn name(&self) -> &str {
+        "PWR"
+    }
     fn read(&mut self, off: u32) -> u32 {
         let i = (off / 4) as usize & 0x3f;
         let v = self.regs[i];
         match off {
-            0x04 => v | (1 << 13),       // CSR1.ACTVOSRDY  (startup spins on this)
-            0x18 => v | (1 << 13),       // D3CR.VOSRDY     (offset 0x18 on STM32H7)
+            0x04 => v | (1 << 13), // CSR1.ACTVOSRDY  (startup spins on this)
+            0x18 => v | (1 << 13), // D3CR.VOSRDY     (offset 0x18 on STM32H7)
             _ => v,
         }
     }
@@ -1387,11 +1939,15 @@ pub struct Scs {
 }
 
 impl Scs {
-    pub fn new() -> Self { Scs { regs: [0; 0x400] } }
+    pub fn new() -> Self {
+        Scs { regs: [0; 0x400] }
+    }
 }
 
 impl Mmio for Scs {
-    fn name(&self) -> &str { "SCS" }
+    fn name(&self) -> &str {
+        "SCS"
+    }
     fn read(&mut self, off: u32) -> u32 {
         let i = (off / 4) as usize & 0x3ff;
         match off {
@@ -1410,4 +1966,3 @@ impl Mmio for Scs {
         }
     }
 }
-
