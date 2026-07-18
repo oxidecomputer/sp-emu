@@ -510,6 +510,8 @@ pub fn serve(
                     // loop resumes the SP after a humility command detaches.
                     let r = crate::glasgow::serve(stream, &mut cpu, &mut bus, host);
                     cpu.halted = false;
+                    cpu.debug_en = false;
+                    cpu.bkpt_hit = false;
                     if let Err(e) = r {
                         eprintln!("[gdb] SWD connection ended: {e}");
                     }

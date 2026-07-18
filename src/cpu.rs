@@ -79,6 +79,8 @@ pub struct Cpu {
     pub idle_skip: u32,     // instrs skipped to the next tick on an idle WFI (loop sleeps instead)
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
     pub halted: bool,       // external debug halt (DHCSR C_HALT via the SWD debug port)
+    pub debug_en: bool,     // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
+    pub bkpt_hit: bool,     // last halt was a BKPT instruction (reported as DFSR.BKPT)
     pub trace_svc: bool,    // log Hubris syscalls (Sysnum in r11) at each SVC — RoT IPC tracing
     pub last_disasm: String,
     decoder: InstDecoder,
@@ -148,6 +150,8 @@ impl Cpu {
             idle_skip: 0,
             record_disasm: false,
             halted: false,
+            debug_en: false,
+            bkpt_hit: false,
             trace_svc: false,
             last_disasm: String::new(),
             decoder: InstDecoder::default_thumb(),
@@ -981,6 +985,22 @@ impl Cpu {
                 Ok(())
             }
             Opcode::UDF => Err(()), // permanently undefined: surface as a stop
+
+            Opcode::BKPT => {
+                if self.debug_en {
+                    // Debug enabled: halt into debug state AT the breakpoint (do
+                    // not advance past it), the way a real core enters debug on
+                    // BKPT when DHCSR.C_DEBUGEN is set. endoscope ends with a BKPT
+                    // to signal completion to the RoT, which then reads the result.
+                    self.pc = pc;
+                    self.halted = true;
+                    self.bkpt_hit = true;
+                    Ok(())
+                } else {
+                    // No debugger attached: an unexpected BKPT is a fault.
+                    Err(())
+                }
+            }
 
             _ => Err(()),
         }
@@ -2343,5 +2363,51 @@ fn regwback(op: &Operand) -> Result<(u8, bool), ()> {
     match op {
         Operand::RegWBack(r, wb) => Ok((r.number(), *wb)),
         _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::StdoutHost;
+
+    // Thumb `BKPT #0` = 0xBE00.
+    const BKPT: u16 = 0xBE00;
+    const RAM: u32 = 0x2000_0000;
+
+    fn ram_bus() -> Bus {
+        let mut bus = Bus::new();
+        bus.log_unmapped = false;
+        bus.add_ram(RAM, 0x1000);
+        bus
+    }
+
+    #[test]
+    fn bkpt_halts_when_debug_enabled() {
+        let mut bus = ram_bus();
+        bus.write16(RAM, BKPT);
+        let mut cpu = Cpu::new();
+        cpu.debug_en = true;
+        cpu.pc = RAM;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert!(cpu.halted, "BKPT with C_DEBUGEN halts into debug state");
+        assert!(cpu.bkpt_hit, "the halt is attributed to a breakpoint");
+        assert_eq!(cpu.pc, RAM, "PC stays at the BKPT, not past it");
+    }
+
+    #[test]
+    fn bkpt_faults_when_debug_disabled() {
+        let mut bus = ram_bus();
+        bus.write16(RAM, BKPT);
+        let mut cpu = Cpu::new();
+        cpu.debug_en = false;
+        cpu.pc = RAM;
+        let mut host = StdoutHost;
+        assert!(
+            cpu.step(&mut bus, &mut host).is_err(),
+            "no debugger: BKPT is a fault, not a halt"
+        );
+        assert!(!cpu.halted);
     }
 }

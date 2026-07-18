@@ -152,6 +152,11 @@ pub fn serve(
                 if cpu.step(bus, host).is_err() {
                     break;
                 }
+                // A BKPT instruction (endoscope's completion signal) halts the
+                // core mid-run; stop so the debugger sees S_HALT immediately.
+                if cpu.halted {
+                    break;
+                }
                 cpu.maybe_tick(bus);
                 cpu.maybe_interrupt(bus);
                 if cpu.idle_skip > 0 {
