@@ -258,6 +258,29 @@ impl Cpu {
         self.mode = Mode::Thread;
     }
 
+    /// Full architectural reset to the boot vector, as a SYSRESETREQ (system
+    /// reset) produces: SP/PC from the vector table plus all core execution
+    /// state back to its reset values. RAM and peripherals are left as-is (a
+    /// soft reset does not clear them; the firmware's startup re-inits them).
+    /// Used by the debug port's AIRCR reset path.
+    pub fn reset_for_reboot(&mut self, sp: u32, pc: u32) {
+        self.reset(sp, pc);
+        self.control = 0;
+        self.primask = false;
+        self.basepri = 0;
+        self.faultmask = false;
+        self.ipsr = 0;
+        self.itstate = 0;
+        self.psp = 0;
+        self.n = false;
+        self.z = false;
+        self.c = false;
+        self.v = false;
+        self.q = false;
+        self.systick = 0;
+        self.halted = false;
+    }
+
     #[inline]
     fn read_reg(&self, i: u8) -> u32 {
         if i == 15 {

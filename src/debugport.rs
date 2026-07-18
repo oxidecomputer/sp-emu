@@ -45,6 +45,21 @@ const C_STEP: u32 = 1 << 2;
 const C_MASKINTS: u32 = 1 << 3;
 const S_REGRDY: u32 = 1 << 16;
 const S_HALT: u32 = 1 << 17;
+// DHCSR.S_RESET_ST (bit25): set when the core has reset since the last DHCSR
+// read, and read-cleared. probe-rs's reset sequence polls this to know the
+// reset completed.
+const S_RESET_ST: u32 = 1 << 25;
+
+// AIRCR (0xE000ED0C): a SYSRESETREQ with the correct write key triggers a
+// system reset. This is the reset humility drives over the debug port.
+const AIRCR: u32 = 0xE000_ED0C;
+const AIRCR_VECTKEY: u32 = 0x05FA_0000;
+const AIRCR_SYSRESETREQ: u32 = 1 << 2;
+// DEMCR.VC_CORERESET (bit0): vector catch — halt at the reset vector instead of
+// running. probe-rs sets it via reset_catch_set for reset-and-halt / endoscope.
+const VC_CORERESET: u32 = 1 << 0;
+// Slot-A boot vector table (XIP flash): [0]=initial SP, [1]=reset PC.
+const VECTOR_TABLE: u32 = 0x0800_0000;
 
 /// One SWD transfer's result, mapped by the server to the applet's response byte.
 pub enum Ack {
@@ -62,8 +77,9 @@ pub struct SwDp {
     csw: u32,        // MEM-AP CSW (size + address-increment)
     tar: u32,        // MEM-AP TAR (transfer address)
     dcrdr: u32,      // DCRDR shadow for DCRSR register-file access
-    demcr: u32,      // DEMCR (VC_CORERESET honored in phase 2)
+    demcr: u32,      // DEMCR (VC_CORERESET drives halt-after-reset)
     dhcsr_ctrl: u32, // C_DEBUGEN|C_HALT|C_MASKINTS echoed back on DHCSR read
+    reset_sticky: bool, // a reset happened; reported once as DHCSR.S_RESET_ST then cleared
     /// Set by a DHCSR resume-with-C_STEP; the server steps one instruction then
     /// re-halts. Free-run (no step) is driven by `cpu.halted` directly.
     pub step_request: bool,
@@ -86,6 +102,7 @@ impl SwDp {
             dcrdr: 0,
             demcr: 0,
             dhcsr_ctrl: 0,
+            reset_sticky: false,
             step_request: false,
         }
     }
@@ -202,12 +219,18 @@ impl SwDp {
 
     // ---- word-wide memory access with the CoreDebug intercept ----------------
 
-    fn mem_read_word(&self, cpu: &Cpu, bus: &mut Bus, addr: u32) -> u32 {
+    fn mem_read_word(&mut self, cpu: &Cpu, bus: &mut Bus, addr: u32) -> u32 {
         match addr {
             DHCSR => {
                 let mut v = self.dhcsr_ctrl | S_REGRDY;
                 if cpu.halted {
                     v |= S_HALT;
+                }
+                // S_RESET_ST is sticky-until-read: report a reset once, so
+                // probe-rs's post-reset poll sees it set then cleared.
+                if self.reset_sticky {
+                    v |= S_RESET_ST;
+                    self.reset_sticky = false;
                 }
                 v
             }
@@ -235,8 +258,27 @@ impl SwDp {
             DCRDR => self.dcrdr = val,
             DEMCR => self.demcr = val,
             DFSR => {} // write-1-to-clear; the read reflects live halt state
+            AIRCR => {
+                if (val & 0xFFFF_0000) == AIRCR_VECTKEY && val & AIRCR_SYSRESETREQ != 0 {
+                    self.do_reset(cpu, bus);
+                }
+            }
             _ => bus.write32(addr, val),
         }
+    }
+
+    /// System reset via AIRCR.SYSRESETREQ: re-boot the core from the vector
+    /// table. RAM/peripherals persist (a soft reset), matching real silicon; the
+    /// firmware's startup re-inits them. If DEMCR.VC_CORERESET is armed, halt at
+    /// the reset vector (reset-and-halt / endoscope) instead of running.
+    fn do_reset(&mut self, cpu: &mut Cpu, bus: &mut Bus) {
+        let sp = bus.read32(VECTOR_TABLE);
+        let pc = bus.read32(VECTOR_TABLE + 4) & !1;
+        cpu.reset_for_reboot(sp, pc);
+        if self.demcr & VC_CORERESET != 0 {
+            cpu.halted = true;
+        }
+        self.reset_sticky = true;
     }
 
     fn write_dhcsr(&mut self, cpu: &mut Cpu, val: u32) {
