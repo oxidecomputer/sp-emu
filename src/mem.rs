@@ -610,6 +610,10 @@ impl Bus {
     pub fn irq_prio(&self, irq: u16) -> u8 {
         self.nvic_prio[irq as usize]
     }
+    /// Whether the given NVIC IRQ is enabled (firmware called sys_irq_control).
+    pub fn irq_enabled(&self, irq: u16) -> bool {
+        self.nvic_en[(irq / 32) as usize] & (1 << (irq % 32)) != 0
+    }
     pub fn clear_pending(&mut self, irq: u16) {
         self.nvic_pend[(irq / 32) as usize] &= !(1 << (irq % 32));
     }

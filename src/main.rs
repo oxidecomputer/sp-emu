@@ -433,11 +433,15 @@ fn setup(image: &[u8], boot_base: u32) -> Result<(Cpu, Bus)> {
     cpu.reset(initial_sp, reset_pc);
 
     // Measurement-handoff token (RFD 568): production gimlet firmware spins
-    // resetting itself until the RoT deposits a "measured" token at DTCM base,
-    // or a debugger deposits the SKIP token. No RoT yet, so acts as the
-    // debugger and deposits SKIP (0x9f38bd71) at 0x2000_0000 to boot directly.
-    // TODO: once the LPC55 RoT core exists, have it write VALID (0x0c887a12).
-    bus.write32(0x2000_0000, 0x9f38_bd71);
+    // resetting itself until the RoT deposits a VALID token at DTCM base, or a
+    // debugger deposits the SKIP token. By default we act as the debugger and
+    // deposit SKIP (0x9f38bd71) at 0x2000_0000 so the SP boots directly. In
+    // SP_EMU_ROT_MEASURE mode we skip that: the SP finds no token, self-resets,
+    // wakes the in-process RoT, which measures the SP over SWD and writes VALID
+    // (0x0c887a12) — the real RFD 568 dance.
+    if std::env::var("SP_EMU_ROT_MEASURE").is_err() {
+        bus.write32(0x2000_0000, 0x9f38_bd71);
+    }
     Ok((cpu, bus))
 }
 
