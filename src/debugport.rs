@@ -36,6 +36,9 @@ const DEMCR: u32 = 0xE000_EDFC;
 // halt as HaltReason::Request; a stale non-zero DFSR reads as a breakpoint and
 // sends probe-rs into an FPB retry loop.
 const DFSR_HALTED: u32 = 1 << 0;
+// DFSR bit1 = BKPT: the halt was a BKPT instruction (or BPU match). probe-rs maps
+// this to HaltReason::Breakpoint. endoscope's terminal BKPT reports this.
+const DFSR_BKPT: u32 = 1 << 1;
 
 // DHCSR fields.
 const DBGKEY: u32 = 0xA05F;
@@ -241,7 +244,9 @@ impl SwDp {
             // sticky/W1C; modeling it as plain storage let probe-rs's own
             // "clear DFSR" write (0x1F) read back as a breakpoint.
             DFSR => {
-                if cpu.halted {
+                if cpu.bkpt_hit {
+                    DFSR_BKPT
+                } else if cpu.halted {
                     DFSR_HALTED
                 } else {
                     0
@@ -287,7 +292,9 @@ impl SwDp {
             return;
         }
         self.dhcsr_ctrl = val & (C_DEBUGEN | C_HALT | C_MASKINTS);
-        if val & C_DEBUGEN == 0 {
+        // C_DEBUGEN gates whether a BKPT instruction halts into debug state.
+        cpu.debug_en = val & C_DEBUGEN != 0;
+        if !cpu.debug_en {
             return;
         }
         if val & C_HALT != 0 {
@@ -295,7 +302,9 @@ impl SwDp {
             self.step_request = false;
         } else {
             // Resume: free-run, or single-step one instruction then re-halt.
+            // Clear the breakpoint-hit flag; the debugger is moving past it.
             cpu.halted = false;
+            cpu.bkpt_hit = false;
             self.step_request = val & C_STEP != 0;
         }
     }
