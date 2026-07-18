@@ -544,6 +544,11 @@ pub fn serve(
             if cpu.step(&mut bus, host).is_err() {
                 break;
             }
+            // Firmware wrote AIRCR.SYSRESETREQ during that step: stop the burst so
+            // the self-reset is applied below, outside the loop.
+            if bus.reset_pending {
+                break;
+            }
             if pcprof {
                 pcprof_samp = pcprof_samp.wrapping_add(1);
                 if pcprof_samp & 0xFF == 0 {
@@ -569,6 +574,15 @@ pub fn serve(
             if txbreak && bus.eth_has_tx() {
                 break;
             }
+        }
+        // Apply a firmware system reset (AIRCR.SYSRESETREQ): re-boot the SP from its
+        // slot-A vector table. This is the reset the SP does when the RFD 568
+        // measurement token is absent; the RoT-trigger side-band hooks in here (M4b).
+        if bus.reset_pending {
+            let sp = bus.read32(0x0800_0000);
+            let pc = bus.read32(0x0800_0004) & !1;
+            cpu.reset_for_reboot(sp, pc);
+            bus.reset_pending = false;
         }
         bus.pump_eth(host);
         // host-sp-comms (UART7 / IPCC + host console): drain the SP's TX to the
