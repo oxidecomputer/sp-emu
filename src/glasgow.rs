@@ -57,12 +57,18 @@ pub fn serve(
     host: &mut dyn HostIo,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
-    // Fully non-blocking: a read of a large region has probe-rs writing all N
-    // transfer commands while we write back N responses, so a blocking write_all
-    // can deadlock (both peers write, neither reads); and a blocking read wedges
-    // sp-emu's single-client accept loop if the client vanishes uncleanly. We
+    // A read of a large region has probe-rs writing all N transfer commands
+    // while we write back N responses, so a blocking write_all can deadlock
+    // (both peers write, neither reads). We therefore never block on a write:
     // always read before writing and buffer any unsent output in `pending_out`.
-    stream.set_nonblocking(true).ok();
+    // We DO block on the read, but only when idle (core halted, nothing buffered
+    // to send) — that gives a round-trip near-zero latency (a 150us poll-sleep
+    // otherwise dominated latency-bound commands like `tasks -sl`), while the
+    // read timeout below keeps the idle-timeout check live so a vanished client
+    // can't wedge the single-client accept loop.
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+        .ok();
     let mut swdp = SwDp::new();
     let mut raw: Vec<u8> = Vec::new(); // 0-delimited COBS frames, undecoded
     let mut root_in: Vec<u8> = Vec::new(); // demuxed Root endpoint byte stream
@@ -78,6 +84,12 @@ pub fn serve(
     let mut last_activity = std::time::Instant::now();
     loop {
         let mut worked = false;
+        // Block on the read only when there is nothing else to do: the core is
+        // halted (so we are not stepping it) and no response is queued (so we are
+        // not mid-transfer and cannot deadlock a peer that is still writing).
+        // Otherwise poll, so we interleave stepping the core / flushing output.
+        let block = cpu.halted && !swdp.step_request && pending_out.is_empty();
+        stream.set_nonblocking(!block).ok();
         match stream.read(&mut rbuf) {
             Ok(0) => return Ok(()), // client closed
             Ok(n) => {
@@ -85,7 +97,12 @@ pub fn serve(
                 worked = true;
                 last_activity = std::time::Instant::now();
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Non-blocking: no data yet. Blocking: the read timeout expired.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(e) => return Err(e.into()),
         }
         if last_activity.elapsed() > idle_timeout {
@@ -167,11 +184,11 @@ pub fn serve(
             worked = true;
         }
 
-        // Nothing happened this iteration (halted, waiting for the next command):
-        // yield briefly so we don't peg a host core. Kept short so a round-trip
-        // adds <=this much latency; a 1ms sleep here made bulk reads crawl. While
-        // data or output is flowing, `worked` stays true and we never sleep.
-        if !worked {
+        // If we polled (didn't block) and got nothing done — e.g. output is
+        // backpressured (write returned WouldBlock) while the core is halted —
+        // yield briefly so we don't spin a host core. When `block` was set we
+        // already waited in the blocking read, so no extra sleep is needed.
+        if !worked && !block {
             std::thread::sleep(std::time::Duration::from_micros(150));
         }
     }
