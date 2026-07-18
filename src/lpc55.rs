@@ -48,6 +48,13 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
             Box::new(crate::sprot::LpcGpio::new(lk)),
         );
     }
+    // FLEXCOMM5 SPI (0x4009_A000): the block the RoT clocks SWD through to drive
+    // the SP's debug port. Added before the catch-alls, like the sprot devices.
+    bus.add_device(
+        0x4009_A000,
+        0x1000,
+        Box::new(crate::rotswd::RotSwdSpi::new()),
+    );
     // Permissive catch-all for the rest of the peripheral block (SYSCON, IOCON,
     // GPIO, FLEXCOMM, HASHCRYPT...), split around the flash controller window.
     bus.add_device(

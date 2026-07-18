@@ -28,6 +28,7 @@ mod i2c_bridge;
 mod lpc55;
 mod mem;
 mod rot_service;
+mod rotswd;
 mod soc;
 mod sprot;
 
