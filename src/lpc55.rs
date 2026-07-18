@@ -67,6 +67,16 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
         0x000C_B000,
         Box::new(RegFile::new("lpc55-periph-hi")),
     );
+    // SYSCON non-secure alias (0x50000000). lpc55-rot-startup reads SYSCON_DIEID at
+    // 0x50000FFC and panics unless (val & 1) == ROM_VER (1). Without this the whole
+    // region is unmapped, the read returns 0, and the RoT wedges in a panic spin
+    // very early in boot (before any task runs). Model it and seed the DIEID.
+    bus.add_device(
+        0x5000_0000,
+        0x1000,
+        Box::new(RegFile::new("lpc55-syscon-ns")),
+    );
+    bus.write32(0x5000_0FFC, 0x0000_0001); // SYSCON_DIEID: bit0 = ROM version 1
     // get_clock_speed() asserts the FRO-96MHz config the ROM/stage0 leaves:
     // SYSCON MAINCLKSELA(0x280)=3, MAINCLKSELB(0x284)=0, AHBCLKDIV(0x380)=0.
     bus.write32(0x4000_0280, 3);
