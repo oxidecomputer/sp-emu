@@ -39,6 +39,11 @@ const DFSR_HALTED: u32 = 1 << 0;
 // DFSR bit1 = BKPT: the halt was a BKPT instruction (or BPU match). probe-rs maps
 // this to HaltReason::Breakpoint. endoscope's terminal BKPT reports this.
 const DFSR_BKPT: u32 = 1 << 1;
+// DFSR bit3 = VCATCH: the halt was a vector catch (DEMCR.VC_CORERESET at the reset
+// vector). The RoT's reset_into_debug_halt reads DFSR and confirms `is_vcatch()`
+// before trusting the halt, so a plain HALTED report is rejected as "reset not
+// caught".
+const DFSR_VCATCH: u32 = 1 << 3;
 
 // DHCSR fields.
 const DBGKEY: u32 = 0xA05F;
@@ -74,15 +79,16 @@ pub enum Ack {
 
 /// A SW-DP with a single MEM-AP, plus the CoreDebug semantics behind it.
 pub struct SwDp {
-    select: u32,     // DP SELECT: APSEL[31:24] / APBANKSEL[7:4] / DPBANKSEL[3:0]
-    ctrl_stat: u32,  // last CTRL/STAT write (its power-req bits drive the ack echo)
-    posted: u32,     // pipelined AP-read result (returned by the next AP read / RDBUFF)
-    csw: u32,        // MEM-AP CSW (size + address-increment)
-    tar: u32,        // MEM-AP TAR (transfer address)
-    dcrdr: u32,      // DCRDR shadow for DCRSR register-file access
-    demcr: u32,      // DEMCR (VC_CORERESET drives halt-after-reset)
-    dhcsr_ctrl: u32, // C_DEBUGEN|C_HALT|C_MASKINTS echoed back on DHCSR read
+    select: u32,        // DP SELECT: APSEL[31:24] / APBANKSEL[7:4] / DPBANKSEL[3:0]
+    ctrl_stat: u32,     // last CTRL/STAT write (its power-req bits drive the ack echo)
+    posted: u32,        // pipelined AP-read result (returned by the next AP read / RDBUFF)
+    csw: u32,           // MEM-AP CSW (size + address-increment)
+    tar: u32,           // MEM-AP TAR (transfer address)
+    dcrdr: u32,         // DCRDR shadow for DCRSR register-file access
+    demcr: u32,         // DEMCR (VC_CORERESET drives halt-after-reset)
+    dhcsr_ctrl: u32,    // C_DEBUGEN|C_HALT|C_MASKINTS echoed back on DHCSR read
     reset_sticky: bool, // a reset happened; reported once as DHCSR.S_RESET_ST then cleared
+    vcatch_halt: bool,  // the current halt came from a reset vector catch (reported as DFSR.VCATCH)
     /// Set by a DHCSR resume-with-C_STEP; the server steps one instruction then
     /// re-halts. Free-run (no step) is driven by `cpu.halted` directly.
     pub step_request: bool,
@@ -106,6 +112,7 @@ impl SwDp {
             demcr: 0,
             dhcsr_ctrl: 0,
             reset_sticky: false,
+            vcatch_halt: false,
             step_request: false,
         }
     }
@@ -246,6 +253,8 @@ impl SwDp {
             DFSR => {
                 if cpu.bkpt_hit {
                     DFSR_BKPT
+                } else if self.vcatch_halt && cpu.halted {
+                    DFSR_VCATCH
                 } else if cpu.halted {
                     DFSR_HALTED
                 } else {
@@ -272,6 +281,21 @@ impl SwDp {
         }
     }
 
+    /// Reset the SP via its external reset pin (the RoT's ROT_TO_SP_RESET_L pulse).
+    /// Same effect as a debug-port SYSRESETREQ: re-boot from the vector table, and
+    /// if DEMCR.VC_CORERESET is armed, halt at the reset vector. This is how the
+    /// emulated RoT lands the SP in reset-into-debug-halt for its endoscope
+    /// measurement (it never writes AIRCR over SWD; it pulses the pin instead).
+    pub fn pin_reset(&mut self, cpu: &mut Cpu, bus: &mut Bus) {
+        self.do_reset(cpu, bus);
+        if std::env::var("SP_EMU_SWD_TRACE").is_ok() {
+            eprintln!(
+                "[swd] pin_reset: demcr={:#x} halted={} vcatch={}",
+                self.demcr, cpu.halted, self.vcatch_halt
+            );
+        }
+    }
+
     /// System reset via AIRCR.SYSRESETREQ: re-boot the core from the vector
     /// table. RAM/peripherals persist (a soft reset), matching real silicon; the
     /// firmware's startup re-inits them. If DEMCR.VC_CORERESET is armed, halt at
@@ -282,6 +306,7 @@ impl SwDp {
         cpu.reset_for_reboot(sp, pc);
         if self.demcr & VC_CORERESET != 0 {
             cpu.halted = true;
+            self.vcatch_halt = true;
         }
         self.reset_sticky = true;
     }
@@ -295,6 +320,13 @@ impl SwDp {
         // C_DEBUGEN gates whether a BKPT instruction halts into debug state.
         cpu.debug_en = val & C_DEBUGEN != 0;
         if !cpu.debug_en {
+            // Leaving halting-debug (C_DEBUGEN cleared, e.g. the RoT's `end_debug()`
+            // after depositing the measurement token): the core exits debug state
+            // and runs on from where it was halted.
+            cpu.halted = false;
+            cpu.bkpt_hit = false;
+            self.vcatch_halt = false;
+            self.step_request = false;
             return;
         }
         if val & C_HALT != 0 {
@@ -305,6 +337,7 @@ impl SwDp {
             // Clear the breakpoint-hit flag; the debugger is moving past it.
             cpu.halted = false;
             cpu.bkpt_hit = false;
+            self.vcatch_halt = false;
             self.step_request = val & C_STEP != 0;
         }
     }

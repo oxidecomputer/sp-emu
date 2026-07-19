@@ -58,6 +58,12 @@ pub struct SprotLink {
     // (which an over-broad "RoT ran a full quantum" heuristic did, decaying the
     // instance's scheduling priority and making `voxel sp state` slow/variable).
     pub request_in_flight: bool,
+    // Rising-edge latch: the RoT released ROT_TO_SP_RESET_L (PIO0_13 low->high) in
+    // `sp_reset_leave`, i.e. it pulsed the SP's reset pin. The serve loop consumes
+    // this to reset the SP through its debug port, so that with DEMCR.VC_CORERESET
+    // armed the SP halts at its reset vector -- the reset-into-debug-halt the RoT's
+    // endoscope measurement depends on. Set by `LpcGpio`, taken by the serve loop.
+    pub sp_reset_release: bool,
 }
 pub type Link = Rc<RefCell<SprotLink>>;
 
@@ -356,16 +362,25 @@ impl Mmio for RotSpiSlave {
 pub struct LpcGpio {
     link: Link,
     p0: u32,
+    // Last observed level of ROT_TO_SP_RESET_L (PIO0_13), so `refresh` can spot the
+    // low->high edge (`sp_reset_leave`) that releases the SP from reset.
+    sp_reset_asserted: bool,
 }
 impl LpcGpio {
     pub fn new(link: Link) -> Self {
         LpcGpio {
             link,
             p0: 0xFFFF_FFFF,
+            sp_reset_asserted: false,
         }
     }
     fn refresh(&mut self) {
         let asserted = (self.p0 >> 18) & 1 == 0;
+        // ROT_TO_SP_RESET_L = PIO0_13, active-low: 0 asserts reset, 1 releases it.
+        // The RoT drives it low in `sp_reset_enter`, then high in `sp_reset_leave`.
+        let reset_asserted = (self.p0 >> 13) & 1 == 0;
+        let reset_released = self.sp_reset_asserted && !reset_asserted;
+        self.sp_reset_asserted = reset_asserted;
         let mut lk = self.link.borrow_mut();
         if asserted != lk.rot_irq && dbg() {
             eprintln!(
@@ -373,6 +388,12 @@ impl LpcGpio {
                 if asserted { "ASSERT" } else { "deassert" },
                 (self.p0 >> 18) & 1
             );
+        }
+        if reset_released {
+            if dbg() {
+                eprintln!("[sprot] SP_RESET released (PIO0_13 high)");
+            }
+            lk.sp_reset_release = true;
         }
         // Reply is ready: the request is no longer "in flight" (the SP will now be
         // woken via EXTI to clock the response).
