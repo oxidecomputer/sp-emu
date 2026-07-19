@@ -87,10 +87,11 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
             Box::new(crate::sprot::LpcGpio::new(lk)),
         );
     }
-    // FLEXCOMM5 SPI (0x4009_A000): the block the RoT clocks SWD through to drive
-    // the SP's debug port. Added before the catch-alls, like the sprot devices.
+    // FLEXCOMM5 SPI: the block the RoT clocks SWD through to drive the SP's debug
+    // port. The granted address for this build (per `humility map`) is 0x40096000,
+    // NOT the datasheet's 0x4009A000. Added before the catch-alls, like sprot.
     bus.add_device(
-        0x4009_A000,
+        0x4009_6000,
         0x1000,
         Box::new(crate::rotswd::RotSwdSpi::new()),
     );

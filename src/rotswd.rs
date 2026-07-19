@@ -1,7 +1,8 @@
 //! RoT-side SWD: the emulated LPC55 RoT drives the SP's debug port (`SwDp`) over
 //! an internal SWD link that it clocks through its FLEXCOMM5 SPI block.
 //!
-//! The real `drv-lpc55-swd` implements raw SWD on top of SPI5 (0x4009_A000):
+//! The real `drv-lpc55-swd` implements raw SWD on top of FLEXCOMM5 (granted at
+//! 0x4009_6000 for this build, per `humility map`):
 //! MOSI/MISO tied together as SWDIO, MSB-first, variable frame length set per word
 //! via FIFOWR.LEN. This device intercepts that FLEXCOMM5 SPI block. For now it is a
 //! frame logger used to confirm the RoT actually clocks SWD; the raw-SWD decoder
