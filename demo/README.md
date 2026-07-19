@@ -64,7 +64,7 @@ the fake-halt `-p ocd`/`-p ocdgdb` transports. The SWD port follows the bridge
 ## Watch the RoT measure the SP (attestation)
 
 ```
-./run-sp-measure.sh <hubris>/.../oxide-rot-1-selfsigned/dist/a/final.bin
+./run-sp-measure.sh <hubris>/.../oxide-rot-1-selfsigned/dist/a/build-oxide-rot-1-selfsigned-image-a.zip
 ```
 
 Boots the SP with an **in-process** LPC55 RoT that drives the SP's debug port over

@@ -11,7 +11,7 @@
 #   SP_BASE=33320 ./run-sp-rot.sh <image>   # boot as gimlet1
 #
 # The RoT image is an oxide-rot-1 build (raw final.bin or a build archive), e.g.
-#   <hubris>/target/oxide-rot-1/dist/a/final.bin
+#   <hubris>/target/oxide-rot-1/dist/a/build-oxide-rot-1-image-a.zip
 
 set -euo pipefail
 
@@ -44,7 +44,7 @@ if [ ! -s "$SP_EMU_FLASH" ]; then
 fi
 if [ -z "$ROT_IMAGE" ] || [ ! -s "$ROT_IMAGE" ]; then
   echo "[!] RoT image missing. Pass an oxide-rot-1 image (raw final.bin or build archive):"
-  echo "    ./run-sp-rot.sh <hubris>/target/oxide-rot-1/dist/a/final.bin"
+  echo "    ./run-sp-rot.sh <hubris>/target/oxide-rot-1/dist/a/build-oxide-rot-1-image-a.zip"
   echo "    (or set ROT_IMAGE=...)"
   exit 1
 fi
@@ -54,7 +54,7 @@ MAGIC2="$(od -An -tx1 -N2 "$ROT_IMAGE" | tr -d ' ')"
 SP_HI="$(od -An -tx1 -j3 -N1 "$ROT_IMAGE" | tr -d ' ')"
 if [ "$MAGIC2" != "504b" ] && [ "$SP_HI" != "20" ] && [ "$SP_HI" != "30" ]; then
   echo "[!] $ROT_IMAGE does not look like an oxide-rot-1 image (no build-archive or"
-  echo "    Cortex-M vector table). Pass the firmware, e.g. target/oxide-rot-1/dist/a/final.bin"
+  echo "    Cortex-M vector table). Pass the firmware, e.g. target/oxide-rot-1/dist/a/build-oxide-rot-1-image-a.zip"
   echo "    — not a board/app .toml. None is built? Build the oxide-rot-1 app in hubris first."
   exit 1
 fi

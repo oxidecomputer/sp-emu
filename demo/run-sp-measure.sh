@@ -16,7 +16,7 @@
 #
 # The RoT image must be an oxide-rot-1 build whose drv-lpc55-swd does the SWD
 # measurement (e.g. a self-signed sp-reset-testing build):
-#   <hubris>/.../oxide-rot-1-selfsigned/dist/a/final.bin
+#   <hubris>/.../oxide-rot-1-selfsigned/dist/a/build-oxide-rot-1-selfsigned-image-a.zip
 
 set -euo pipefail
 
@@ -38,7 +38,7 @@ if [ ! -s "$SP_EMU_FLASH" ]; then
 fi
 if [ -z "$ROT_IMAGE" ] || [ ! -s "$ROT_IMAGE" ]; then
   echo "[!] RoT image missing. Pass a measurement-capable oxide-rot-1 image:"
-  echo "    ./run-sp-measure.sh <hubris>/.../oxide-rot-1-selfsigned/dist/a/final.bin"
+  echo "    ./run-sp-measure.sh <hubris>/.../oxide-rot-1-selfsigned/dist/a/build-oxide-rot-1-selfsigned-image-a.zip"
   echo "    (or set ROT_IMAGE=...)"
   exit 1
 fi
@@ -47,7 +47,7 @@ MAGIC2="$(od -An -tx1 -N2 "$ROT_IMAGE" | tr -d ' ')"
 SP_HI="$(od -An -tx1 -j3 -N1 "$ROT_IMAGE" | tr -d ' ')"
 if [ "$MAGIC2" != "504b" ] && [ "$SP_HI" != "20" ] && [ "$SP_HI" != "30" ]; then
   echo "[!] $ROT_IMAGE does not look like an oxide-rot-1 image. Pass the firmware,"
-  echo "    e.g. target/oxide-rot-1-selfsigned/dist/a/final.bin — not a board/app .toml."
+  echo "    e.g. target/oxide-rot-1-selfsigned/dist/a/build-oxide-rot-1-selfsigned-image-a.zip — not a board/app .toml."
   exit 1
 fi
 
