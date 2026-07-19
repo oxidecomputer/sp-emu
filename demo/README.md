@@ -47,7 +47,33 @@ Use the demos to run some actual commands:
 ./tasks             # live Hubris task table: jefe, net, gimlet_seq, hf,
                     # control_plane_agent, thermal, power, sprot, ... all live
 ./tasks -sl net     # source-line stack backtrace of a running task
+./hiffy             # call a Hubris IPC (default Jefe.get_state) over the SWD port
+./hiffy -l          # list the interfaces hiffy can call
+./tasks --swd       # same task table, but over the SWD debug port instead of ocd
 ```
+
+`./tasks` uses the OpenOCD transport (`-p ocd`), which humility expects on
+localhost:6666, so boot sp-emu with its MGS bridge on `[::1]:33300` for that
+(`SP_BASE=33300 ./run-sp.sh`). `./hiffy` and `./tasks --swd` use the new **SWD
+debug port**: a real halt/run/step debug core exposed as a Glasgow probe, so
+`hiffy` -- which injects and runs a program -- actually works, where it hangs on
+the fake-halt `-p ocd`/`-p ocdgdb` transports. The SWD port follows the bridge
+(`4444 + (SP_BASE - 33300)`); `sp-emu gdb` prints the exact ports on startup.
+
+## Watch the RoT measure the SP (attestation)
+
+```
+./run-sp-measure.sh <hubris>/.../oxide-rot-1-selfsigned/dist/a/final.bin
+```
+
+Boots the SP with an **in-process** LPC55 RoT that drives the SP's debug port over
+an internal SWD link and performs the RFD 568 attestation measurement, exactly as
+real hardware does at boot: it resets the SP into debug halt, injects the
+`endoscope` program, runs it to hash the SP flash, reads the digest back, and
+deposits the VALID measurement token so the SP boots normally. The script waits for
+`SP measurement recorded` and then leaves the SP running for `./tasks --swd` and
+`./mgs`. (This is different from `run-sp-rot.sh`, which attaches an out-of-process
+RoT over the sprot SPI link only for boot-info.)
 
 ## Notes and caveats
 

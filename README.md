@@ -15,8 +15,11 @@ answer the management gateway (MGS) over UDP.
   hardware does: `discover`, `state`, `inventory`, `read-sensor-value`,
   `power-state`, `rot-boot-info`, caboose reads, dumps, and the rest of the
   faux-mgs surface.
-- Lets `humility` attach to the running firmware over a GDB-RSP or OpenOCD
-  listener: live task table, per-task stack backtraces, `readmem`, ringbufs.
+- Lets `humility` attach to the running firmware three ways: a read-only GDB-RSP
+  listener and a read/write OpenOCD listener (live task table, per-task stack
+  backtraces, `readmem`, ringbufs, `writemem`), plus a real SWD debug port exposed
+  as a Glasgow Interface Explorer probe that models actual halt/run/step -- so
+  halt-and-run commands like `hiffy` work, not just memory reads.
 - Runs the SP and RoT together over an emulated sprot SPI link, so
   `drv-stm32h7-sprot-server` on the emulated SP talks to `drv-lpc55-sprot-server`
   on the emulated RoT. The RoT publishes boot-state measurements (sha3-256 of the
@@ -90,6 +93,23 @@ Or attach humility to read the live Hubris task table. The GDB-RSP port is
 HUMILITY_OCD_PORT=3343 humility -a <gimlet-archive.zip> -p ocdgdb tasks
 ```
 
+That GDB-RSP path (and the OpenOCD one, `-p ocd`) fakes the debug core, so it
+serves reads and writes but cannot really halt and run the SP -- `hiffy` hangs on
+it. For commands that halt, inject a program, and run it (`hiffy`, and the RoT's
+endoscope measurement), attach over the **SWD debug port** instead. sp-emu exposes
+it as a Glasgow Interface Explorer probe, so stock `humility`/`probe-rs` drive it
+with no changes. The SWD port is `4444 + (bridge_port - 33300)`, so for
+`[::1]:33310` it is 4454:
+
+```
+humility -a <gimlet-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:4454 tasks
+humility -a <gimlet-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:4454 hiffy -c Jefe.get_state
+```
+
+`sp-emu gdb` prints the exact `gdb`, `ocd`, and `swd` ports and the attach lines on
+startup (the `ready (gdb :... ocd :... swd :...)` line), so you do not have to do
+the port arithmetic by hand.
+
 The `demo/` directory wraps all of this in scripts:
 
 - `demo/run-sp.sh` boots a gimlet SP and waits until it is reachable; `demo/mgs`
@@ -110,7 +130,7 @@ sp-emu flash <a|b> <image.bin | build-archive.zip>   program a flash slot
 sp-emu erase <a|b>                                   erase a slot
 sp-emu info                                          show each slot's reset vector
 sp-emu run [a|b] [max_insns]                         boot from a slot and run
-sp-emu gdb [a|b] [preboot]                           boot a slot, then serve GDB/OpenOCD for humility
+sp-emu gdb [a|b] [preboot]                           boot a slot, then serve GDB/OpenOCD/SWD for humility
 sp-emu rot <oxide-rot-1 image> [max]                 boot the LPC55 RoT firmware standalone
 sp-emu rot-serve <listen-addr> <rot-image>           run a shared RoT for SPs to connect to
 sp-emu i2c-sniff [listen-addr]                        observe I2C traffic from a running emulator
@@ -129,6 +149,12 @@ The ones you reach for most:
 - `SP_EMU_ROT_SERVICE`: address of a `rot-serve` RoT to attach over the sprot link
   (the shared, out-of-process RoT).
 - `SP_EMU_ROT_FLASH`: instead of a service, run an in-process RoT core from this image.
+  Unlike `SP_EMU_ROT_SERVICE`, this RoT drives the SP's debug port over an internal SWD
+  link, so it can run the endoscope attestation measurement (see `demo/run-sp-measure.sh`).
+- `SP_EMU_SWD_TRIGGER`: fire one synthetic SP-reset measurement request after boot, so the
+  in-process RoT measures the SP even when the SP image does not gate its boot on the token.
+- `SP_EMU_ROT_MEASURE`: let the SP self-reset until measured (drop the pre-seeded SKIP token)
+  rather than short-circuiting the RFD 568 handoff.
 - `SP_EMU_HOST_UART`: socket for the host-to-SP comms UART (IPCC).
 - `SP_EMU_NO_DEBUG`: suppress the humility debug listeners.
 - `SP_EMU_I2C_BRIDGE` / `SP_EMU_I2C_DEVICE`: socket for the I2C sniff and delegate bridges.
