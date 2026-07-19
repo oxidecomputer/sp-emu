@@ -123,7 +123,19 @@ pub fn install_peripherals(bus: &mut Bus) {
     // hash_driver never replies => hf (host-flash) waits forever => CPA deadlocks
     // on `send to hf`, stalling the gimlet SP when MGS does its inventory phase1
     // host-flash hash. Modeled below so the digest completes.
-    bus.add_device(0x4802_1400, 0x1000, Box::new(Hash::new()));
+    // Size 0x400: the HASH block is 0x4802_1400..0x4802_1800; the RNG below it
+    // starts at 0x4802_1800. (An earlier 0x1000 span overlapped and shadowed the
+    // RNG, so its status register read back 0 from HASH's fallthrough.)
+    bus.add_device(0x4802_1400, 0x400, Box::new(Hash::new()));
+
+    // STM32H7 RNG (0x4802_1800): the true random number generator. gimlet's
+    // rng_driver enables it, polls SR.DRDY, and reads DR to seed packrat's
+    // ereport restart id (drv-stm32h7-rng, `packrat`/`ereport` feature).
+    // Unmodeled, SR reads 0 from the catch-all below so DRDY never sets: the rng
+    // task spins forever, packrat never gets a restart id, and the snitch drops
+    // every ereport request (EreportReadError::RestartIdNotSet) -- so MGS ereport
+    // polls get no reply and time out. Modeled below so entropy is always ready.
+    bus.add_device(0x4802_1800, 0x400, Box::new(Rng::new()));
 
     // QUADSPI (0x5200_5000): command-aware host-flash model for the `hf` task.
     // Answers RDID with a recognized Micron 32 MiB chip + blank flash, so hf's
@@ -1369,6 +1381,57 @@ impl Mmio for Hash {
             Some(80)
         } else {
             None
+        }
+    }
+}
+
+/// STM32H7 RNG (0x4802_1800). Minimal model: report data always ready (SR.DRDY)
+/// with no error bits, and return a non-zero pseudo-random word from DR. The
+/// PRNG is deterministic (fixed seed) so a given boot yields a stable ereport
+/// restart id -- reproducibility the workshop wants; the driver only requires
+/// DRDY set, CEIS/SEIS clear, and DR != 0 (drv-stm32h7-rng `read`).
+struct Rng {
+    state: u64,
+    cr: u32,
+}
+impl Rng {
+    pub fn new() -> Self {
+        // Fixed non-zero seed -> stable restart id per boot.
+        Rng {
+            state: 0x9E37_79B9_7F4A_7C15,
+            cr: 0,
+        }
+    }
+    fn next_word(&mut self) -> u32 {
+        // xorshift64*: a non-zero state stays non-zero, so DR is never 0.
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        let v = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32;
+        if v == 0 {
+            1
+        } else {
+            v
+        }
+    }
+}
+impl Mmio for Rng {
+    fn name(&self) -> &str {
+        "RNG"
+    }
+    fn read(&mut self, off: u32) -> u32 {
+        match off & !3 {
+            0x00 => self.cr,      // CR: read back the last write
+            0x04 => 1,            // SR: DRDY set (bit 0), CEIS/SEIS clear
+            0x08 => self.next_word(), // DR: non-zero random word
+            _ => 0,
+        }
+    }
+    fn write(&mut self, off: u32, val: u32) {
+        if off & !3 == 0x00 {
+            self.cr = val; // CR (RNGEN/IE); SR error-clear writes are no-ops
         }
     }
 }
