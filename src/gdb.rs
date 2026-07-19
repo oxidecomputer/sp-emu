@@ -557,7 +557,18 @@ pub fn serve(
                 l.rot_irq && l.cs
             })
             .unwrap_or(false);
-        let sp_burst = if replying { 48 } else { quantum };
+        // While the SP is halted through its debug port (the RoT drove DHCSR.C_HALT,
+        // or a vector catch stopped it at the reset vector), do not step it: the
+        // core is stopped and only the RoT, over SWD, may move it. Skipping the
+        // burst (not just `cpu.step`) also avoids ticking systick / taking
+        // interrupts on a halted core.
+        let sp_burst = if cpu.halted {
+            0
+        } else if replying {
+            48
+        } else {
+            quantum
+        };
         for _ in 0..sp_burst {
             if cpu.step(&mut bus, host).is_err() {
                 break;
@@ -758,6 +769,18 @@ pub fn serve(
                         swd.borrow_mut().resp = Some(d);
                     }
                 }
+            }
+            // The RoT released ROT_TO_SP_RESET_L (PIO0_13 low->high) in
+            // `sp_reset_leave`: pulse the SP's reset through its debug port. Done
+            // after draining the SWD link so the DHCSR/DEMCR writes that arm the
+            // vector catch are already applied to `sp_swdp` -- the SP then halts at
+            // its reset vector (DFSR.VCATCH), which is what reset_into_debug_halt
+            // waits for before injecting endoscope.
+            let sp_reset_released = crate::sprot::link()
+                .map(|l| std::mem::take(&mut l.borrow_mut().sp_reset_release))
+                .unwrap_or(false);
+            if sp_reset_released {
+                sp_swdp.pin_reset(&mut cpu, &mut bus);
             }
             // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions,
             // only while a sprot exchange is in flight (CS has been touched) to
