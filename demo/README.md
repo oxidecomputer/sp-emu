@@ -27,7 +27,8 @@ cd demo
 ./run-sp.sh
 ```
 
-Wait ~60-90s for `[+] SP ONLINE` (it is really booting a kernel plus 30+ tasks).
+Wait tens of seconds for the SP to come online (it is really booting a kernel
+plus 30+ tasks); `run-sp.sh` prints `online:` with the ports when it is ready.
 
 Terminal 2, talk to it with MGS:
 
@@ -82,10 +83,12 @@ RoT over the sprot SPI link only for boot-info.)
   board.
 - MGS reaches it on both switch uplinks (ports 33310 / 33311), the same
   dual-path wiring a real gimlet has to the two sidecars.
-- `state` returns `rot: Err(...)` because there is no emulated root-of-trust in this demo.
-  However, emulated RoT is available in voxel a4x2 environments.
-- The emulator runs ~4M instr/s, so MGS uses a generous per-attempt timeout
-  (baked into `./mgs`). Commands take a few seconds.
+- `state` returns `rot: Err(...)` because this standalone SP has no RoT. Attach
+  one with `./run-sp-rot.sh` (an out-of-process RoT over sprot, for boot-info) or
+  `./run-sp-measure.sh` (an in-process RoT that measures the SP over SWD).
+- The emulator runs tens of millions of instructions per second; MGS still uses a
+  generous per-attempt timeout (baked into `./mgs`), and commands take a few
+  seconds of round-trips.
 - The `mgs` helper needs `$FAUX_MGS` set to a `faux-mgs` from the
   management-gateway-service repo, built from the same `gateway-messages` revision
   as the gimlet image. The wire protocol must match the firmware, so the demo does
