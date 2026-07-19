@@ -68,11 +68,36 @@ fn make_host() -> Box<dyn HostIo> {
     }
 }
 
-/// SP UDP sockets to bridge in well-known-port mode, keyed by board (the union
-/// declared across hubris `app/*/*.toml`; see the proposal's socket table). A
-/// bound port the firmware does not serve is just an idle listener, so keep the
-/// set to what each board actually declares.
-fn sp_socket_ports(sidecar: bool) -> Vec<u16> {
+/// SP UDP sockets the firmware declares, parsed from a Hubris archive's
+/// `app.toml` (`[config.net.sockets.*].port`). This is the honest source: the
+/// bridge binds exactly what the flashed image serves. Returns None if the
+/// archive/app.toml/sockets table can't be read.
+fn archive_socket_ports(archive: &str) -> Option<Vec<u16>> {
+    let app = flash::archive_app_toml(archive)?;
+    let value: toml::Value = app.parse().ok()?;
+    let sockets = value
+        .get("config")?
+        .get("net")?
+        .get("sockets")?
+        .as_table()?;
+    let mut ports: Vec<u16> = sockets
+        .values()
+        .filter_map(|s| s.get("port")?.as_integer())
+        .filter(|p| (0..=u16::MAX as i64).contains(p))
+        .map(|p| p as u16)
+        .collect();
+    ports.sort_unstable();
+    if ports.is_empty() {
+        None
+    } else {
+        Some(ports)
+    }
+}
+
+/// Fallback SP UDP socket set when no archive is available to parse, keyed by
+/// board (the union declared across hubris `app/*/*.toml`; see the proposal's
+/// socket table).
+fn default_socket_ports(sidecar: bool) -> Vec<u16> {
     // echo(7), broadcast(997), rpc/udprpc(998), control_plane_agent(11111),
     // dump_agent(11113), ereport(57005).
     let mut ports = vec![7u16, 997, 998, 11111, 11113, 57005];
@@ -110,7 +135,25 @@ fn make_well_known_host() -> Box<dyn HostIo> {
         views.push((SocketAddr::new(addr1, 0), env_vid("SP_EMU_VID1", def1)));
     }
 
-    let ports = sp_socket_ports(sidecar);
+    // Prefer the socket set the flashed image actually declares (its app.toml in
+    // $SP_EMU_ARCHIVE); fall back to the board-keyed union when no archive path
+    // is given.
+    let ports = std::env::var("SP_EMU_ARCHIVE")
+        .ok()
+        .and_then(|a| {
+            let p = archive_socket_ports(&a);
+            match &p {
+                Some(ports) => eprintln!(
+                    "[bridge] well-known ports from archive app.toml: {:?}",
+                    ports
+                ),
+                None => eprintln!(
+                    "[bridge] could not read sockets from $SP_EMU_ARCHIVE={a}; using board defaults"
+                ),
+            }
+            p
+        })
+        .unwrap_or_else(|| default_socket_ports(sidecar));
     match bridge::Bridge::new_well_known(&views, &ports) {
         Ok(b) => Box::new(b),
         Err(e) => {
