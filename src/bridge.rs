@@ -163,7 +163,59 @@ impl Bridge {
             "[bridge] point MGS/faux-mgs at {} (switch0) or its +1 port (switch1)",
             base
         );
-        Ok(Bridge {
+        Ok(Self::from_socks(socks))
+    }
+
+    /// Well-known-port mode (additive; opt-in). Each `(addr, vid)` view binds the
+    /// SP's real socket `ports` on `addr` -- host port == SP socket port, no
+    /// offset arithmetic -- so faux-mgs/humility/sp-test reach the emulated SP at
+    /// exactly the addresses and ports they would use against real hardware
+    /// (`<addr>:11111` for MGS, `:57005` for ereport, ...). Instances never
+    /// collide because they live on different addresses, not different ports. The
+    /// default `Bridge::new` (port-offset, loopback-multiplexed) is untouched.
+    pub fn new_well_known(views: &[(SocketAddr, u16)], ports: &[u16]) -> std::io::Result<Self> {
+        let mut socks = Vec::new();
+        for &(addr, vid) in views {
+            for &port in ports {
+                let mut a = addr;
+                a.set_port(port);
+                // Bind best-effort: a low well-known port (echo 7, broadcast 997,
+                // rpc 998) needs CAP_NET_BIND_SERVICE, which the workshop
+                // container has but a bare dev shell may not. Skip-and-warn so a
+                // privileged-port failure never takes down mgmt/ereport; the
+                // warning keeps the capability signal honest.
+                match UdpSocket::bind(a) {
+                    Ok(sock) => {
+                        let _ = sock.set_nonblocking(true);
+                        eprintln!(
+                            "[bridge] listening on {} (vid {:#x}, SP port {})",
+                            a, vid, port
+                        );
+                        socks.push(BoundSock {
+                            sock,
+                            vid,
+                            sp_port: port,
+                        });
+                    }
+                    Err(e) => eprintln!(
+                        "[bridge] skip SP port {} on {} (vid {:#x}): {} (socket not bridged)",
+                        port, a, vid, e
+                    ),
+                }
+            }
+        }
+        eprintln!(
+            "[bridge] well-known-port mode: {} socket(s) across {} view(s)",
+            socks.len(),
+            views.len()
+        );
+        Ok(Self::from_socks(socks))
+    }
+
+    /// Shared tail: build the Bridge around an already-bound socket set. Identity
+    /// on the emulated link and the host-UART connect are the same in both modes.
+    fn from_socks(socks: Vec<BoundSock>) -> Self {
+        Bridge {
             serial: StdoutHost,
             socks,
             my_mac: [0x0e, 0x00, 0x00, 0x00, 0x00, 0x01],
@@ -191,7 +243,7 @@ impl Bridge {
                     }
                 },
             ),
-        })
+        }
     }
 
     fn dbg(&self) -> bool {
@@ -307,8 +359,11 @@ impl Bridge {
             return;
         }
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
-        // Only relay the SP's management socket; ignore broadcast/echo chatter.
-        if src_port != SP_PORT && src_port != EREPORT_PORT {
+        // Relay only the SP sockets this bridge actually bound on this VLAN; drop
+        // broadcast/echo chatter from unbridged sockets. In the default mode that
+        // is exactly {mgmt 11111, ereport 57005}; in well-known-port mode it is
+        // whatever socket set the instance binds.
+        if !self.socks.iter().any(|s| s.vid == vid && s.sp_port == src_port) {
             return;
         }
         // Route the reply to the specific MGS client that sent the request: the
