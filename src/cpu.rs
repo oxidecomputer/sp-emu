@@ -89,7 +89,7 @@ pub struct Cpu {
     /// removes the per-instruction fetch (two RAM reads) + yaxpeax decode, the
     /// dominant hot-loop cost. Only flash-window PCs are cached: the running
     /// image is never self-modified, and the flash-update path writes the other slot.
-    dcache: std::collections::HashMap<u32, Rc<Decoded>>,
+    dcache: std::collections::HashMap<u32, Rc<Decoded>, PcBuildHasher>,
     syst_csr: u32, // cached SYST_CSR (refreshed periodically in maybe_tick)
     syst_rvr: u32, // cached SYST_RVR reload value (>=1)
 }
@@ -107,6 +107,31 @@ const LR: usize = 14;
 /// Flash window (2 MB). PCs here are XIP and immutable -> safe to cache decodes.
 const FLASH_LO: u32 = 0x0800_0000;
 const FLASH_HI: u32 = 0x0a00_0000;
+
+/// Fast hasher for the decode cache's `u32` flash-PC keys. `HashMap`'s default
+/// SipHash is DoS-resistant but far slower than needed, and the decode-cache
+/// lookup is the interpreter's dominant per-instruction cost. PCs are dense and
+/// 2-byte aligned, so a single Fibonacci multiply (2^64 / golden ratio) scatters
+/// them across buckets without clustering; the keys are our own PCs, so SipHash's
+/// DoS resistance buys nothing here. Behavior is identical -- only the bucket
+/// mapping changes.
+#[derive(Default)]
+struct PcHasher(u64);
+impl std::hash::Hasher for PcHasher {
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("decode-cache keys are hashed via write_u32");
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+type PcBuildHasher = std::hash::BuildHasherDefault<PcHasher>;
 
 impl Default for Cpu {
     fn default() -> Self {
@@ -155,7 +180,7 @@ impl Cpu {
             trace_svc: false,
             last_disasm: String::new(),
             decoder: InstDecoder::default_thumb(),
-            dcache: std::collections::HashMap::new(),
+            dcache: std::collections::HashMap::default(),
             syst_csr: 0,
             syst_rvr: 1,
         }
