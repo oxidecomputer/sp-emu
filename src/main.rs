@@ -39,7 +39,16 @@ use mem::Bus;
 
 /// Build the host I/O backend: a network bridge when `$SP_EMU_BRIDGE` is set
 /// (its value is the bind address, default `[::1]:11111`), else plain stdout.
+///
+/// `$SP_EMU_WELL_KNOWN_PORTS` selects the additive well-known-port mode: each
+/// switch view binds the SP's real socket ports (11111 MGS, 57005 ereport, ...)
+/// on its own host address (`$SP_EMU_ADDR0` / `$SP_EMU_ADDR1`, default `::1`),
+/// so tools reach the emulated SP exactly as they would real hardware. The
+/// default `$SP_EMU_BRIDGE` port-offset mode is unchanged.
 fn make_host() -> Box<dyn HostIo> {
+    if std::env::var("SP_EMU_WELL_KNOWN_PORTS").is_ok() {
+        return make_well_known_host();
+    }
     match std::env::var("SP_EMU_BRIDGE") {
         Ok(v) => {
             let bind = if v.is_empty() || v == "1" {
@@ -56,6 +65,58 @@ fn make_host() -> Box<dyn HostIo> {
             }
         }
         Err(_) => Box::new(StdoutHost),
+    }
+}
+
+/// SP UDP sockets to bridge in well-known-port mode, keyed by board (the union
+/// declared across hubris `app/*/*.toml`; see the proposal's socket table). A
+/// bound port the firmware does not serve is just an idle listener, so keep the
+/// set to what each board actually declares.
+fn sp_socket_ports(sidecar: bool) -> Vec<u16> {
+    // echo(7), broadcast(997), rpc/udprpc(998), control_plane_agent(11111),
+    // dump_agent(11113), ereport(57005).
+    let mut ports = vec![7u16, 997, 998, 11111, 11113, 57005];
+    if sidecar {
+        ports.push(11112); // transceivers (sidecar/medusa)
+    } else {
+        ports.push(23547); // gimlet inspector
+    }
+    ports
+}
+
+/// Build the well-known-port host bridge from `$SP_EMU_ADDR0/1` + vids.
+fn make_well_known_host() -> Box<dyn HostIo> {
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    let sidecar = std::env::var("SP_EMU_BOARD")
+        .map(|b| b == "sidecar")
+        .unwrap_or(false);
+    let env_vid = |k: &str, d: u16| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(d)
+    };
+    let parse_ip = |k: &str| -> Option<IpAddr> {
+        std::env::var(k).ok().and_then(|s| s.parse().ok())
+    };
+
+    // switch0 view: $SP_EMU_ADDR0 (default ::1). switch1 view: $SP_EMU_ADDR1 if
+    // set (a distinct address, since both views bind the same real ports).
+    let addr0 = parse_ip("SP_EMU_ADDR0").unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    let (def0, def1) = if sidecar { (0x130, 0x302) } else { (0x301, 0x302) };
+    let mut views = vec![(SocketAddr::new(addr0, 0), env_vid("SP_EMU_VID0", def0))];
+    if let Some(addr1) = parse_ip("SP_EMU_ADDR1") {
+        views.push((SocketAddr::new(addr1, 0), env_vid("SP_EMU_VID1", def1)));
+    }
+
+    let ports = sp_socket_ports(sidecar);
+    match bridge::Bridge::new_well_known(&views, &ports) {
+        Ok(b) => Box::new(b),
+        Err(e) => {
+            eprintln!("[bridge] well-known-port bind failed: {e}; falling back to stdout");
+            Box::new(StdoutHost)
+        }
     }
 }
 
