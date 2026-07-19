@@ -483,7 +483,6 @@ pub fn serve(
     // full SP self-reset (whose measurement gate depends on the SP image).
     let swd_trigger = std::env::var("SP_EMU_SWD_TRIGGER").is_ok();
     let mut swd_triggered = false;
-    let mut loop_count: u64 = 0;
 
     loop {
         if let Some((gdb_l, ocd_l, swd_l)) = &listeners {
@@ -610,20 +609,16 @@ pub fn serve(
         // Step the in-process RoT core a quantum (it mostly idles, waking to
         // answer the SP over the sprot link).
         if let Some((rc, rb)) = rot.as_mut() {
-            // The SP just reset (RFD 568 dance): wake the RoT's sp_reset-irq
-            // (pint.irq0 = NVIC IRQ 4) so its lpc55-swd task measures the SP over
-            // SWD, exactly as real hardware reacts to an SP reset.
-            if sp_reset_edge {
-                rb.pend_irq(4);
-            }
-            // Synthetic trigger: fire the same IRQ once, a bit after boot.
-            loop_count += 1;
-            if swd_trigger && !swd_triggered && loop_count > 200 {
-                eprintln!(
-                    "[swd] synthetic trigger: pending RoT sp_reset-irq (NVIC 4); irq4_enabled={} rot_pc={:#010x}",
-                    rb.irq_enabled(4),
-                    rc.pc
-                );
+            // Wake the RoT to measure the SP, exactly as real hardware reacts to an
+            // SP reset: pend its sp_reset-irq (pint.irq0 = NVIC IRQ 4) and record a
+            // falling edge on the SP_RESET PINT slot 0 (PINT.FALL @ 0x4000_4020), so
+            // do_handle_sp_reset passes its pint_detect check and drives SWD instead
+            // of returning "SpResetNotAsserted". Fired on a real SP self-reset, or
+            // once via SP_EMU_SWD_TRIGGER to exercise the path when the SP image has
+            // no measurement gate to self-reset it.
+            let synthetic = swd_trigger && !swd_triggered && rb.irq_enabled(4);
+            if sp_reset_edge || synthetic {
+                rb.write32(0x4000_4020, 0x1); // PINT.FALL slot 0 = SP_RESET falling edge
                 rb.pend_irq(4);
                 swd_triggered = true;
             }
