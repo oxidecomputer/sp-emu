@@ -76,6 +76,17 @@ pub fn archive_flash_ron(path: &str) -> Option<String> {
     String::from_utf8(archive_entry(&raw, "img/flash.ron").ok()?).ok()
 }
 
+/// The image's `app.toml` from a Hubris build archive (root entry). Carries the
+/// firmware's `[config.net.sockets.*]` table, which the well-known-port bridge
+/// uses to bind exactly the SP UDP sockets this image declares.
+pub fn archive_app_toml(path: &str) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    if !raw.starts_with(b"PK") {
+        return None;
+    }
+    String::from_utf8(archive_entry(&raw, "app.toml").ok()?).ok()
+}
+
 /// Program an image into a slot: erase the bank, then write the image at its base.
 pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
     let off = slot_offset(slot)?;
