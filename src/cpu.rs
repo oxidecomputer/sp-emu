@@ -554,6 +554,7 @@ impl Cpu {
             Opcode::RSB => self.alu(ops, Alu::Rsb),
             Opcode::AND => self.alu(ops, Alu::And),
             Opcode::ORR => self.alu(ops, Alu::Orr),
+            Opcode::ORN => self.alu(ops, Alu::Orn),
             Opcode::EOR => self.alu(ops, Alu::Eor),
             Opcode::BIC => self.alu(ops, Alu::Bic),
 
@@ -1031,6 +1032,7 @@ impl Cpu {
             Alu::Sbc => a.wrapping_sub(b).wrapping_sub(1 - cin),
             Alu::And => a & b,
             Alu::Orr => a | b,
+            Alu::Orn => a | !b,
             Alu::Eor => a ^ b,
             Alu::Bic => a & !b,
         };
@@ -2160,6 +2162,7 @@ enum Alu {
     Rsb,
     And,
     Orr,
+    Orn,
     Eor,
     Bic,
 }
