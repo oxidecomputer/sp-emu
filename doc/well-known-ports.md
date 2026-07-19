@@ -29,10 +29,13 @@ SP_EMU_ADDR0=::1 \
 - `SP_EMU_VID0` / `SP_EMU_VID1` and `SP_EMU_BOARD` set the VLAN ids / board as in
   the default mode.
 
-The sockets bound (per address) are the union the board declares: `echo` (7),
-`broadcast` (997), `rpc`/udprpc (998), `control_plane_agent` (11111),
-`dump_agent` (11113), `ereport` (57005), plus `inspector` (23547) on gimlet or
-`transceivers` (11112) on sidecar.
+The sockets bound (per address) come from the flashed image itself: set
+`SP_EMU_ARCHIVE=<path-to-build-archive.zip>` and sp-emu parses the archive's
+`app.toml` `[config.net.sockets.*]` table and binds exactly those ports -- so the
+bridged set is whatever the firmware actually serves. Without an archive path it
+falls back to the board-keyed union: `echo` (7), `broadcast` (997), `rpc`/udprpc
+(998), `control_plane_agent` (11111), `dump_agent` (11113), `ereport` (57005),
+plus `inspector` (23547) on gimlet or `transceivers` (11112) on sidecar.
 
 Point tools at the address directly:
 
