@@ -282,6 +282,9 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
     cpu.wfi_throttle = true;
+    // The RoT executes in place from its LPC55 image (immutable XIP flash) at
+    // 0x0001_0000, outside the SP's default cache window, so cache decodes there.
+    cpu.set_flash_cache(base..(base + image.len() as u32));
     bus.write32(0xE000_ED08, base);
     Ok((cpu, bus))
 }

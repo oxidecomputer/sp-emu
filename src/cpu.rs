@@ -90,6 +90,16 @@ pub struct Cpu {
     /// dominant hot-loop cost. Only flash-window PCs are cached: the running
     /// image is never self-modified, and the flash-update path writes the other slot.
     dcache: std::collections::HashMap<u32, Rc<Decoded>, PcBuildHasher>,
+    /// PC window whose decodes are cacheable: the immutable XIP flash of *this*
+    /// core instance. sp-emu instantiates this one interpreter twice -- a separate
+    /// `Cpu`+`Bus` for the STM32H7 SP and for the LPC55 RoT (independent registers,
+    /// memory map, and decode cache); they only differ by where their image is
+    /// mapped. So the cacheable window is per-instance: it defaults to the SP's
+    /// flash window (`FLASH_LO..FLASH_HI`, 0x0800_0000) and the RoT instance sets
+    /// its own (its image span at 0x0001_0000) via `set_flash_cache`. PCs outside
+    /// the window (RAM, the ITCM-injected endoscope) are decoded fresh every time,
+    /// so self-modified or injected code is never served a stale decode.
+    flash_cache: std::ops::Range<u32>,
     syst_csr: u32, // cached SYST_CSR (refreshed periodically in maybe_tick)
     syst_rvr: u32, // cached SYST_RVR reload value (>=1)
 }
@@ -181,6 +191,7 @@ impl Cpu {
             last_disasm: String::new(),
             decoder: InstDecoder::default_thumb(),
             dcache: std::collections::HashMap::default(),
+            flash_cache: FLASH_LO..FLASH_HI,
             syst_csr: 0,
             syst_rvr: 1,
         }
@@ -279,6 +290,17 @@ impl Cpu {
         }
     }
 
+    /// Set the PC window whose decodes are cached -- this instance's own immutable
+    /// XIP flash. The SP and RoT are separate `Cpu` instances (see `flash_cache`)
+    /// whose images sit at different flash bases (SP 0x0800_0000, RoT/LPC55
+    /// 0x0001_0000), so each configures its own window; this is a memory-map
+    /// setting, not a change of core architecture. The range must cover only
+    /// immutable code -- RAM or injected/self-modified regions must stay outside
+    /// it, or their stale decodes would be reused.
+    pub fn set_flash_cache(&mut self, range: std::ops::Range<u32>) {
+        self.flash_cache = range;
+    }
+
     pub fn reset(&mut self, sp: u32, pc: u32) {
         self.msp = sp;
         self.r[SP] = sp;
@@ -338,7 +360,7 @@ impl Cpu {
         self.last_vfp = false;
         self.last_sys = false;
         // Fetch + decode, via the PC-keyed cache for flash code (the common case).
-        let dec: Rc<Decoded> = if (FLASH_LO..FLASH_HI).contains(&pc) {
+        let dec: Rc<Decoded> = if self.flash_cache.contains(&pc) {
             match self.dcache.get(&pc) {
                 Some(d) => d.clone(), // Rc bump; decouples from the &mut self execute below
                 None => {
