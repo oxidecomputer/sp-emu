@@ -362,6 +362,16 @@ pub fn serve(
     let rotpc_every = parse_env("SP_EMU_ROTPC");
     let mut rotpc_next = 0u64;
     let mut last_rottrap = u32::MAX;
+    // SP_EMU_ROT_TRACE_FROM/TO="0xADDR": log the RoT's pc + disasm + r0..r3,r6 for
+    // every instruction whose pc is in [FROM,TO] — an instruction-level window to
+    // debug a specific RoT function's execution.
+    let parse_hex = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    };
+    let rot_trace_from = parse_hex("SP_EMU_ROT_TRACE_FROM");
+    let rot_trace_to = parse_hex("SP_EMU_ROT_TRACE_TO");
     // SP_EMU_ROTDUMP="0xADDR:LEN" dumps that RoT RAM range every ~8s for task-table introspection.
     let rotdump: Option<(u32, u32)> = std::env::var("SP_EMU_ROTDUMP").ok().and_then(|s| {
         let (a, l) = s.split_once(':')?;
@@ -625,6 +635,9 @@ pub fn serve(
                 rb.pend_irq(4);
                 swd_triggered = true;
             }
+            if rot_trace_from.is_some() {
+                rc.record_disasm = true; // populate last_disasm for the window trace
+            }
             // Wake the RoT's FLEXCOMM8 slave (irq 59) whenever it owes a receive —
             // i.e. an un-processed slave-select assert is latched (`ssa`) or a
             // transfer is active (`cs`). Keying off the latched `ssa`, not just
@@ -669,6 +682,7 @@ pub fn serve(
             'rot_burst: for _ in 0..rot_budget {
                 let mut rot_idled = false;
                 for _ in 0..quantum {
+                    let rpc = rc.pc; // pc of the instruction about to execute (for the window trace)
                     if let Err(t) = rc.step(rb, host) {
                         // A RoT task hitting an unimplemented/undecodable instruction
                         // would re-fault every quantum, silently wedged (the kernel
@@ -698,6 +712,14 @@ pub fn serve(
                             }
                         }
                         break 'rot_burst;
+                    }
+                    if let (Some(f), Some(t)) = (rot_trace_from, rot_trace_to) {
+                        if (f..=t).contains(&rpc) {
+                            eprintln!(
+                                "[rottrace] {:#010x}: {:<26} r0={:08x} r1={:08x} r2={:08x} r3={:08x} r6={:08x}",
+                                rpc, rc.last_disasm, rc.r[0], rc.r[1], rc.r[2], rc.r[3], rc.r[6]
+                            );
+                        }
                     }
                     if crate::sprot::rot_trace_tick() {
                         eprintln!("[rottr] {:#010x}", rc.pc);
