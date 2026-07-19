@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Call a Hubris IPC on the emulated SP with humility hiffy, over the emulator's
+# SWD (Glasgow) debug port.
+#
+#   ./hiffy                       # default: -c Jefe.get_state
+#   ./hiffy -l                    # list the callable interfaces
+#   ./hiffy -c Sensor.get -a id=0 # call with arguments
+#
+# hiffy writes a small program into the SP, runs it, and reads the result back,
+# so it needs a debug port that can really halt and run the core. The GDB-RSP
+# (`-p ocdgdb`) and OpenOCD (`-p ocd`) transports fake that -- hiffy hangs on them.
+# sp-emu's SWD port models real halt/run/step and is exposed as a Glasgow Interface
+# Explorer probe, so stock humility drives it with the selector below.
+#
+# Set $ARCHIVE to the gimlet-c build archive that matches the flashed image.
+# The SWD port follows the emulator's MGS bridge: 4444 + (SP_BASE - 33300), so a
+# default `./run-sp.sh` (SP_BASE=33310) serves it on 4454. Override SP_BASE (or
+# SWD_PORT directly) to match how you booted sp-emu.
+set -euo pipefail
+
+ARCHIVE="${ARCHIVE:-}"
+[ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ] || {
+  echo "[!] Set \$ARCHIVE to your hubris gimlet-c build archive (.zip)" >&2
+  exit 1
+}
+
+SP_BASE="${SP_BASE:-33310}"
+SWD_PORT="${SWD_PORT:-$((4444 + SP_BASE - 33300))}"
+
+# Default to a harmless, always-present call so `./hiffy` with no args does
+# something useful; otherwise pass the caller's hiffy arguments through.
+if [ "$#" -eq 0 ]; then
+  set -- -c Jefe.get_state
+fi
+
+set -x
+exec humility -a "$ARCHIVE" -p "20b7:9db1:tcp:127.0.0.1:${SWD_PORT}" hiffy "$@"

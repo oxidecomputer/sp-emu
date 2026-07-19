@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Show the Hubris task table on the emulated SP, via humility over the
-# emulator's OpenOCD transport.
+# Show the Hubris task table on the emulated SP, via humility.
 #
-#   ./tasks              # the task table
+#   ./tasks              # the task table, over the OpenOCD transport (-p ocd)
 #   ./tasks -sl net      # stack-backtrace a task
+#   ./tasks --swd        # attach over the SWD (Glasgow) debug port instead
+#   ./tasks --swd -sl net
 #
-# (Run this when the SP is idle — i.e. not mid-MGS-command — since humility
+# By default this uses the OpenOCD transport (`-p ocd`), which humility expects on
+# localhost:6666 -- so boot sp-emu with its MGS bridge on `[::1]:33300` for that
+# port. `--swd` attaches over the real SWD debug port instead (the same one
+# `./hiffy` uses); its port follows the bridge (4444 + (SP_BASE - 33300)), so it
+# works at any SP_BASE. tasks is read-only, so both transports serve it -- --swd is
+# handy as a cross-check that the SWD path agrees with OpenOCD.
+#
+# (Run this when the SP is idle -- i.e. not mid-MGS-command -- since humility
 # halts the CPU to read memory.)
 
 set -euo pipefail
@@ -16,4 +24,13 @@ ARCHIVE="${ARCHIVE:-}"
   echo "[!] Set \$ARCHIVE to your hubris gimlet-c build archive (.zip)" >&2
   exit 1
 }
-exec humility -a "$ARCHIVE" -p ocd tasks "$@"
+
+PROBE="ocd"
+if [ "${1:-}" = "--swd" ]; then
+  shift
+  SP_BASE="${SP_BASE:-33310}"
+  SWD_PORT="${SWD_PORT:-$((4444 + SP_BASE - 33300))}"
+  PROBE="20b7:9db1:tcp:127.0.0.1:${SWD_PORT}"
+fi
+
+exec humility -a "$ARCHIVE" -p "$PROBE" tasks "$@"
