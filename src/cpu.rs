@@ -118,6 +118,12 @@ const LR: usize = 14;
 const FLASH_LO: u32 = 0x0800_0000;
 const FLASH_HI: u32 = 0x0a00_0000;
 
+/// Upper bound of the SP's ITCM (0x0000_0000..0x0001_0000). Injected code (the
+/// RoT's endoscope measurement program) runs here. It is cacheable only while the
+/// core is under debug control, and its entries are invalidated on debug-port
+/// writes -- see `flash_cache` / `invalidate_decode` and `step`.
+const ITCM_HI: u32 = 0x0001_0000;
+
 /// Fast hasher for the decode cache's `u32` flash-PC keys. `HashMap`'s default
 /// SipHash is DoS-resistant but far slower than needed, and the decode-cache
 /// lookup is the interpreter's dominant per-instruction cost. PCs are dense and
@@ -301,6 +307,21 @@ impl Cpu {
         self.flash_cache = range;
     }
 
+    /// Drop cached decodes overlapping a write at `addr` (the write's word plus a
+    /// possible 4-byte instruction straddling into it from `addr-2`). The debug
+    /// port calls this when it writes to a region whose decodes may be cached
+    /// (the ITCM the RoT injects endoscope into), so a re-injection is never
+    /// served a stale decode. No-op for the common case where nothing there is
+    /// cached.
+    pub fn invalidate_decode(&mut self, addr: u32) {
+        if self.dcache.is_empty() {
+            return;
+        }
+        for a in [addr.wrapping_sub(2), addr, addr.wrapping_add(2)] {
+            self.dcache.remove(&a);
+        }
+    }
+
     pub fn reset(&mut self, sp: u32, pc: u32) {
         self.msp = sp;
         self.r[SP] = sp;
@@ -360,7 +381,14 @@ impl Cpu {
         self.last_vfp = false;
         self.last_sys = false;
         // Fetch + decode, via the PC-keyed cache for flash code (the common case).
-        let dec: Rc<Decoded> = if self.flash_cache.contains(&pc) {
+        // Cacheable: this core's immutable flash, or -- only while the core is
+        // under debug control -- its ITCM. The debug case lets the injected
+        // endoscope program (which loops over the flash hash for ~140M
+        // instructions) be decoded once instead of every instruction; the debug
+        // port invalidates those entries on injection (`invalidate_decode`), and
+        // gating on `debug_en` keeps normal execution's mutable ITCM uncached.
+        let cacheable = self.flash_cache.contains(&pc) || (self.debug_en && pc < ITCM_HI);
+        let dec: Rc<Decoded> = if cacheable {
             match self.dcache.get(&pc) {
                 Some(d) => d.clone(), // Rc bump; decouples from the &mut self execute below
                 None => {

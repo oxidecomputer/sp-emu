@@ -224,6 +224,12 @@ impl SwDp {
             2 => bus.write16(tar, (wdata >> ((tar & 2) * 8)) as u16),
             _ => self.mem_write_word(cpu, bus, tar, wdata),
         }
+        // Injecting code (endoscope) into the SP's ITCM, which the core caches
+        // while under debug: drop any cached decode this write invalidates so the
+        // injected program is never run from a stale decode.
+        if tar < 0x0001_0000 {
+            cpu.invalidate_decode(tar);
+        }
         self.auto_inc();
     }
 
