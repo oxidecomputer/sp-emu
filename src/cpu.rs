@@ -283,6 +283,9 @@ impl Cpu {
         self.q = false;
         self.systick = 0;
         self.halted = false;
+        // A reset clears any "last halt was a BKPT" state, so a subsequent
+        // vector-catch halt reports DFSR.VCATCH rather than a stale DFSR.BKPT.
+        self.bkpt_hit = false;
     }
 
     #[inline]

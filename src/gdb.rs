@@ -562,14 +562,28 @@ pub fn serve(
         // core is stopped and only the RoT, over SWD, may move it. Skipping the
         // burst (not just `cpu.step`) also avoids ticking systick / taking
         // interrupts on a halted core.
+        //
+        // When the RoT is running an injected program under debug (C_DEBUGEN set,
+        // not halted -- i.e. endoscope after the RoT resumed it), let the SP sprint
+        // in a large burst so it reaches its terminal BKPT within the RoT's 500ms
+        // halt-poll timeout. The RoT's timer only advances while the RoT itself
+        // runs, so the SP finishing the flash measurement here costs little
+        // RoT-time; without it the RoT times out (DidNotHalt) before the SP halts.
         let sp_burst = if cpu.halted {
             0
+        } else if cpu.debug_en {
+            20_000_000
         } else if replying {
             48
         } else {
             quantum
         };
         for _ in 0..sp_burst {
+            // Stop the burst the instant the SP halts (e.g. endoscope's terminal
+            // BKPT), so the debug-run burst above doesn't spin on the BKPT.
+            if cpu.halted {
+                break;
+            }
             if cpu.step(&mut bus, host).is_err() {
                 break;
             }

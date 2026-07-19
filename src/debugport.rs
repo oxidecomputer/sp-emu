@@ -288,12 +288,6 @@ impl SwDp {
     /// measurement (it never writes AIRCR over SWD; it pulses the pin instead).
     pub fn pin_reset(&mut self, cpu: &mut Cpu, bus: &mut Bus) {
         self.do_reset(cpu, bus);
-        if std::env::var("SP_EMU_SWD_TRACE").is_ok() {
-            eprintln!(
-                "[swd] pin_reset: demcr={:#x} halted={} vcatch={}",
-                self.demcr, cpu.halted, self.vcatch_halt
-            );
-        }
     }
 
     /// System reset via AIRCR.SYSRESETREQ: re-boot the core from the vector
