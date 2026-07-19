@@ -25,6 +25,7 @@ mod gdb;
 mod glasgow;
 mod host;
 mod i2c_bridge;
+mod i2c_topology;
 mod lpc55;
 mod mem;
 mod rot_service;

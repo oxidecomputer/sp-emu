@@ -12,6 +12,7 @@ object = { version = "0.36", default-features = false, features = ["read", "elf"
 anyhow = "1"
 zip = { version = "2", default-features = false, features = ["bzip2", "deflate"] }
 sha3 = "0.10"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [profile.release]
 debug = true
