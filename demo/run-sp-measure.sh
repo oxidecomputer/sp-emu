@@ -82,5 +82,5 @@ echo "The RoT reset the SP into debug halt, ran endoscope over internal SWD, and
 echo "deposited the VALID token so the SP boots normally. The SP keeps running:"
 echo
 echo "    ./tasks --swd          # read the live task table over the SWD debug port"
-echo "    ./mgs state            # (after ~60-90s, once the network stack is up)"
+echo "    ./mgs state            # (after tens of seconds, once the network stack is up)"
 echo "    kill ${PID}"

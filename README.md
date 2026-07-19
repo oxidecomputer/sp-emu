@@ -47,9 +47,11 @@ virtual rack, and it also runs standalone for firmware bring-up and debugging.
 - A small bridge presents the SP's MGS UDP surface on a loopback address, as two
   ports (one per switch view), which is all MGS needs to reach it.
 
-Because it is an interpreter, it runs at a few million instructions per second, so
-a full SP boot takes roughly 60 to 90 seconds. MGS and humility are given generous
-timeouts to match.
+Because it is an interpreter, timing is not real: an access to a peripheral takes
+"one instruction", not the cycles it would on silicon. It runs tens of millions
+of instructions per second (a PC-keyed decode cache does most of that), so a full
+SP boot to `[sp-emu] online` takes tens of seconds. MGS and humility are given
+generous timeouts anyway.
 
 ## Building
 
@@ -86,20 +88,12 @@ faux-mgs --sp-sim-addr '[::1]:33310' inventory
 faux-mgs --sp-sim-addr '[::1]:33310' read-sensor-value 0
 ```
 
-Or attach humility to read the live Hubris task table. The GDB-RSP port is
-`3333 + (bridge_port - 33300)`, so for `[::1]:33310` it is 3343:
-
-```
-HUMILITY_OCD_PORT=3343 humility -a <gimlet-archive.zip> -p ocdgdb tasks
-```
-
-That GDB-RSP path (and the OpenOCD one, `-p ocd`) fakes the debug core, so it
-serves reads and writes but cannot really halt and run the SP -- `hiffy` hangs on
-it. For commands that halt, inject a program, and run it (`hiffy`, and the RoT's
-endoscope measurement), attach over the **SWD debug port** instead. sp-emu exposes
-it as a Glasgow Interface Explorer probe, so stock `humility`/`probe-rs` drive it
-with no changes. The SWD port is `4444 + (bridge_port - 33300)`, so for
-`[::1]:33310` it is 4454:
+Or attach humility to read and drive the live firmware, over the **SWD debug
+port**: a real halt/run/step debug core exposed as a Glasgow Interface Explorer
+probe, which a stock humility drives via probe-rs. Because it really halts and
+runs the core, halt-and-run commands like `hiffy` work over it, not just memory
+reads. The SWD port is `4444 + (bridge_port - 33300)`, so for `[::1]:33310` it is
+4454:
 
 ```
 humility -a <gimlet-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:4454 tasks
@@ -109,6 +103,12 @@ humility -a <gimlet-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:4454 hiffy -c Jefe.g
 `sp-emu gdb` prints the exact `gdb`, `ocd`, and `swd` ports and the attach lines on
 startup (the `ready (gdb :... ocd :... swd :...)` line), so you do not have to do
 the port arithmetic by hand.
+
+sp-emu also serves the older read-only GDB-RSP (`-p ocdgdb`, port `3333 + off`) and
+read/write OpenOCD-Tcl (`-p ocd`, port `6666 + off`) transports, but recent
+humility removed those probe cores (`unrecognized probe: ocdgdb`), so they need a
+pre-removal humility build, and they fake the debug core -- `hiffy` hangs on them.
+Prefer the SWD port.
 
 The `demo/` directory wraps all of this in scripts:
 

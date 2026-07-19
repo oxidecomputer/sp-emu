@@ -79,7 +79,7 @@ SP_EMU_BRIDGEDBG=1 SP_EMU_BRIDGE="[::1]:${SP_BASE}" SP_EMU_ROT_SERVICE="$ROT_ADD
   "$SPEMU" gdb a 340000000 > "$SP_LOG" 2>&1 &
 PID=$!
 echo "pid ${PID}, log ${SP_LOG}"
-printf "waiting for the SP (~60-90s) "
+printf "waiting for the SP (tens of seconds) "
 until grep -qE '\[sp-emu\] online|learned SP vid 0x301' "$SP_LOG" 2>/dev/null; do
   if ! kill -0 "$PID" 2>/dev/null; then
     echo; echo "[!] SP exited early — see ${SP_LOG}"; kill "$ROT_PID" 2>/dev/null || true; exit 1

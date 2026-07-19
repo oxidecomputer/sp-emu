@@ -443,9 +443,9 @@ pub fn serve(
         ocd_l.set_nonblocking(true)?;
         swd_l.set_nonblocking(true)?;
         eprintln!("[gdb] ready (gdb :{gdb_port}, ocd :{ocd_port}, swd :{swd_port}). attach with:");
-        eprintln!("[gdb]   humility -a <archive.zip> -p ocdgdb <cmd>   (reads: tasks, readmem, ringbuf, ...)");
-        eprintln!("[gdb]   humility -a <archive.zip> -p ocd    <cmd>   (reads + writes: writemem, hiffy, ...)");
-        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (real SWD debug port: halt/run/hiffy)");
+        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (SWD debug port: halt/run/hiffy; works with a stock humility)");
+        eprintln!("[gdb]   humility -a <archive.zip> -p ocdgdb <cmd>   (reads: tasks, readmem, ringbuf; needs a pre-removal humility)");
+        eprintln!("[gdb]   humility -a <archive.zip> -p ocd    <cmd>   (reads + writes; needs a pre-removal humility)");
         Some((gdb_l, ocd_l, swd_l))
     };
 
