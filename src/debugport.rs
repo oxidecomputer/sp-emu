@@ -69,6 +69,13 @@ const VC_CORERESET: u32 = 1 << 0;
 // Slot-A boot vector table (XIP flash): [0]=initial SP, [1]=reset PC.
 const VECTOR_TABLE: u32 = 0x0800_0000;
 
+// RFD 568 SP measurement handoff word (SP RAM). After the RoT measures the SP over
+// SWD it writes VALID here; the absent/other value makes the SP self-reset until it
+// is measured. Logged so a measurement is observable without full SWD tracing.
+const SP_MEASUREMENT_ADDR: u32 = 0x2000_0000;
+const SP_MEASUREMENT_VALID: u32 = 0x0c88_7a12;
+const SP_MEASUREMENT_SKIP: u32 = 0x9f38_bd71;
+
 /// One SWD transfer's result, mapped by the server to the applet's response byte.
 pub enum Ack {
     /// Read data (`Some`) or a write acknowledgement (`None`).
@@ -282,6 +289,14 @@ impl SwDp {
                 if (val & 0xFFFF_0000) == AIRCR_VECTKEY && val & AIRCR_SYSRESETREQ != 0 {
                     self.do_reset(cpu, bus);
                 }
+            }
+            SP_MEASUREMENT_ADDR if val == SP_MEASUREMENT_VALID => {
+                eprintln!("[rot] SP measurement recorded: VALID token deposited at {SP_MEASUREMENT_ADDR:#010x}");
+                bus.write32(addr, val);
+            }
+            SP_MEASUREMENT_ADDR if val == SP_MEASUREMENT_SKIP => {
+                eprintln!("[rot] SP measurement skipped: SKIP token deposited at {SP_MEASUREMENT_ADDR:#010x}");
+                bus.write32(addr, val);
             }
             _ => bus.write32(addr, val),
         }
