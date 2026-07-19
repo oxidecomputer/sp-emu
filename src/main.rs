@@ -240,6 +240,10 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     if rot_service.is_some() || std::env::var("SP_EMU_ROT_FLASH").is_ok() {
         sprot::enable();
     }
+    // The in-process RoT drives the SP's debug port over an internal SWD link.
+    if std::env::var("SP_EMU_ROT_FLASH").is_ok() {
+        rotswd::enable();
+    }
     let (cpu, bus) = setup(&nvm, flash::slot_base(slot)?)?;
     let rot = match (&rot_service, std::env::var("SP_EMU_ROT_FLASH")) {
         (None, Ok(p)) => {

@@ -483,6 +483,9 @@ pub fn serve(
     // full SP self-reset (whose measurement gate depends on the SP image).
     let swd_trigger = std::env::var("SP_EMU_SWD_TRIGGER").is_ok();
     let mut swd_triggered = false;
+    // The SP's debug port, driven by the in-process RoT over the internal SWD link.
+    // Loop-lifetime so its DP/AP/CoreDebug state persists across transactions.
+    let mut sp_swdp = crate::debugport::SwDp::new();
 
     loop {
         if let Some((gdb_l, ocd_l, swd_l)) = &listeners {
@@ -717,6 +720,21 @@ pub fn serve(
                     .unwrap_or(false)
                 {
                     break;
+                }
+            }
+            // Drain the internal SWD link: run each ADIv5 transaction the RoT
+            // clocked out against the SP's debug port, and hand back a read
+            // result. This is what lets the emulated RoT actually read/write the
+            // SP over SWD (the RoT stalls on FIFOSTAT until a read result lands).
+            if let Some(swd) = crate::rotswd::link() {
+                loop {
+                    let req = swd.borrow_mut().req.pop_front();
+                    let Some(r) = req else { break };
+                    if let crate::debugport::Ack::Ok(Some(d)) =
+                        sp_swdp.transfer(&mut cpu, &mut bus, r.ap, r.rnw, r.a, r.wdata)
+                    {
+                        swd.borrow_mut().resp = Some(d);
+                    }
                 }
             }
             // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions,

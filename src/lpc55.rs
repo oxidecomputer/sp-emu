@@ -51,11 +51,13 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
     // FLEXCOMM5 SPI: the block the RoT clocks SWD through to drive the SP's debug
     // port. The granted address for this build (per `humility map`) is 0x40096000,
     // NOT the datasheet's 0x4009A000. Added before the catch-alls, like sprot.
-    bus.add_device(
-        0x4009_6000,
-        0x1000,
-        Box::new(crate::rotswd::RotSwdSpi::new()),
-    );
+    if let Some(swd) = crate::rotswd::link() {
+        bus.add_device(
+            0x4009_6000,
+            0x1000,
+            Box::new(crate::rotswd::RotSwdSpi::new(swd)),
+        );
+    }
     // Permissive catch-all for the rest of the peripheral block (SYSCON, IOCON,
     // GPIO, FLEXCOMM, HASHCRYPT...), split around the flash controller window.
     bus.add_device(
