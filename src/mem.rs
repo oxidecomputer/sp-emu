@@ -555,6 +555,9 @@ impl Bus {
                 None => break,
             }
         }
+        // Deliver queued TX to the host, retrying anything the socket could not
+        // accept yet (an IPCC reply is bursty; dropping on WouldBlock truncates it).
+        host.host_uart_flush();
         while let Some(byte) = host.host_uart_rx() {
             self.uart_rx.borrow_mut().push_back(byte);
         }
