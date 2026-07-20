@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Show the Hubris task table on the emulated SP, via humility over the
+# emulator's OpenOCD transport.
+#
+#   ./tasks              # the task table
+#   ./tasks -sl net      # stack-backtrace a task
+#
+# (Run this when the SP is idle — i.e. not mid-MGS-command — since humility
+# halts the CPU to read memory.)
+
+set -euo pipefail
+
+# The build archive comes from the separate hubris repo; set $ARCHIVE to your build.
+ARCHIVE="${ARCHIVE:-}"
+[ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ] || {
+  echo "[!] Set \$ARCHIVE to your hubris gimlet-c build archive (.zip)" >&2
+  exit 1
+}
+exec humility -a "$ARCHIVE" -p ocd tasks "$@"

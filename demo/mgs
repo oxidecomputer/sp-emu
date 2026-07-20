@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Talk to the emulated gimlet SP via faux-mgs (the same MGS client used in tests).
+#
+#   ./mgs discover
+#   ./mgs state
+#   ./mgs inventory
+#   SP_PORT=33311 ./mgs state      # talk via the switch1 view instead of switch0
+#
+# NOTE: this faux-mgs is built from the gateway-messages revision the gimlet-c
+# image was compiled against (97c0fa04). The protocol enums must match the
+# firmware, so don't swap in an arbitrary faux-mgs.
+#
+# The emulator runs ~4M instr/s, so we give MGS a generous per-attempt timeout.
+set -euo pipefail
+PORT="${SP_PORT:-33310}"
+
+# faux-mgs lives in the separate management-gateway-service repo and must match the
+# firmware's gateway-messages revision (see the note above), so point $FAUX_MGS at
+# your build of it rather than relying on a guessed path.
+if [ -z "${FAUX_MGS:-}" ] || [ ! -x "${FAUX_MGS}" ]; then
+  echo "[!] Set \$FAUX_MGS to your faux-mgs build from the management-gateway-service repo:" >&2
+  echo "    FAUX_MGS=/path/to/faux-mgs ./mgs $*" >&2
+  exit 1
+fi
+
+exec "$FAUX_MGS" \
+  --sp-sim-addr "[::1]:${PORT}" \
+  --max-attempts 5 \
+  --per-attempt-timeout-millis 15000 \
+  "$@"
