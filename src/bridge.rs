@@ -56,8 +56,10 @@ fn open_host_pty() -> Option<Box<dyn HostUartIo>> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            // openpty's termp/winp are *const on Linux but *mut on macOS/BSD;
+            // null_mut() matches macOS and coerces to *const on Linux.
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         ) != 0
         {
             eprintln!("[bridge] host-uart openpty failed");
