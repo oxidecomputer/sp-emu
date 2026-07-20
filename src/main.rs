@@ -374,6 +374,7 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     lpc55::install_peripherals(&mut bus, image);
     bus.load(base, image)?;
     publish_rot_bootstate(&mut bus, image);
+    publish_dice_handoff(&mut bus);
     let initial_sp = bus.read32(base);
     let reset_pc = bus.read32(base + 4) & !1;
     eprintln!(
@@ -448,6 +449,49 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
             .map(|b| format!("{:02x}", b))
             .collect::<String>()
     );
+}
+
+/// Deposit the DICE cert handoff that stage0 writes on real hardware, so the RoT
+/// `attest` task serves get-certs instead of `AttestNoCerts`. On hardware stage0
+/// derives a DICE identity (UDS + FWID) and writes `CertData` (persistid/deviceid
+/// chain) at `CERTS_RANGE` and `AliasData` (alias/tqdhe leaves + seeds) at
+/// `ALIAS_RANGE` within `DICE_RANGE` (0x4010_0000, LPC55 USB SRAM). sp-emu skips
+/// stage0, so it deposits pre-generated blobs (header + hubpack, byte-identical to
+/// the task's expected load) produced by the hubris `dice-handoff-gen` tool.
+/// Gated on `SP_EMU_ROT_DICE=<dir with dice-certs.bin, dice-alias.bin>`.
+///
+/// Prototype (Approach A): a deterministic self-signed chain with a stand-in FWID
+/// -- enough for get-certs to return a parseable chain. Approach B (run the real
+/// stage0/bootleby so the identity binds to the actual FWID) is future work; see
+/// doc/dice-handoff.md.
+fn publish_dice_handoff(bus: &mut Bus) {
+    let Ok(dir) = std::env::var("SP_EMU_ROT_DICE") else {
+        return;
+    };
+    // DICE_RANGE = 0x4010_0000..0x4010_2000: CertData at start (CERTS_RANGE),
+    // AliasData at +0xa00 (ALIAS_RANGE). Must match lib/dice handoff.rs.
+    const CERTS_BASE: u32 = 0x4010_0000;
+    const ALIAS_BASE: u32 = 0x4010_0a00;
+    for (name, base) in
+        [("dice-certs.bin", CERTS_BASE), ("dice-alias.bin", ALIAS_BASE)]
+    {
+        let path = std::path::Path::new(&dir).join(name);
+        match std::fs::read(&path) {
+            Ok(blob) => {
+                for (i, b) in blob.iter().enumerate() {
+                    bus.write8(base + i as u32, *b);
+                }
+                eprintln!(
+                    "[rot] published DICE {name} @ {base:#010x} ({} bytes)",
+                    blob.len()
+                );
+            }
+            Err(e) => eprintln!(
+                "[rot] SP_EMU_ROT_DICE set but cannot read {}: {e}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// rot-serve <listen-addr> <oxide-rot-1 image|archive> — run one shared RoT that
