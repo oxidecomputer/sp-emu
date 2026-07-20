@@ -45,12 +45,19 @@ LD_PRELOAD=./nomodem.so faux-ipcc --port /dev/pts/N --read-timeout-ms 5000 statu
 
 ## What the emulated SP can service
 
+Measured on gimlet-c with the in-process RoT attached
+(`SP_EMU_ROT_FLASH=<oxide-rot-1 image-a>`):
+
 - **Local calls** (`status`, and the firmware's GetIdentity / GetMacAddresses /
-  GetBootStorageUnit): serviced in the ~400 ms per-request range, comparable to an
-  MGS `state` query -- the interpreter's inherent per-request cost, not an IPCC
-  problem.
-- **RoT-backed calls** (`get-certs`, `get-log`): these round-trip to the RoT over
-  sprot. The standalone emulated SP has no RoT, so they fail; attach the in-process
-  RoT with `SP_EMU_ROT_FLASH=<oxide-rot-1 archive.zip>` to service them, at
-  seconds-scale latency.
+  GetBootStorageUnit -- packrat-local, no RoT): serviced fast. The first call after
+  attaching the pty pays a one-time ~2 s channel-sync cost (COBS resync on the freshly
+  opened pipe); every call after that is ~8 ms. faux-ipcc only exposes `status` of
+  this group.
+- **RoT-backed calls** (`get-certs`, `get-log`): **not serviceable yet.** They round-
+  trip to the RoT attest task over sprot, and the SP's own sprot layer times out on
+  the RoT -- faux-ipcc reports `SprotError(ProtocolTimeout)` in ~0.14 s. This is an
+  SP-side deadline, so raising faux-ipcc's `--read-timeout-ms` does not help. The
+  emulated RoT core boots, but attestation over the emulated sprot/SWD link
+  (RFD 568 measurement + attest replies) is not wired up end to end. Tracked with the
+  phase-2 RoT-over-SWD work in `doc/` -- see the sp-swd debug-port plan.
 </content>
