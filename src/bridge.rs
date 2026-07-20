@@ -81,6 +81,11 @@ pub struct Bridge {
     /// propolis IPCC COM port (a unix socket); set `$SP_EMU_HOST_UART` to its
     /// path.
     host_uart: Option<UnixStream>,
+    /// Bytes the SP has written toward the host UART but the (non-blocking)
+    /// socket has not yet accepted. The channel is low-rate but bursty (an IPCC
+    /// response is tens of bytes at once); dropping on WouldBlock truncates the
+    /// reply, so buffer and retry on each flush instead.
+    host_uart_txq: VecDeque<u8>,
 }
 
 impl Bridge {
@@ -243,6 +248,7 @@ impl Bridge {
                     }
                 },
             ),
+            host_uart_txq: VecDeque::new(),
         }
     }
 
@@ -623,8 +629,34 @@ impl HostIo for Bridge {
     }
 
     fn host_uart_tx(&mut self, byte: u8) {
-        if let Some(s) = self.host_uart.as_mut() {
-            let _ = s.write_all(&[byte]);
+        // Queue the byte; delivery happens in host_uart_flush so a WouldBlock on
+        // the non-blocking socket never truncates a reply.
+        self.host_uart_txq.push_back(byte);
+    }
+
+    fn host_uart_flush(&mut self) {
+        let s = match self.host_uart.as_mut() {
+            Some(s) => s,
+            None => {
+                self.host_uart_txq.clear();
+                return;
+            }
+        };
+        // Write as much as the socket accepts; stop at the first WouldBlock and
+        // keep the rest queued for the next flush (pumped every serve iteration).
+        while let Some(&byte) = self.host_uart_txq.front() {
+            match s.write(&[byte]) {
+                Ok(1) => {
+                    self.host_uart_txq.pop_front();
+                }
+                Ok(_) => break, // 0 bytes written: try again next flush
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    // Broken pipe / disconnect: drop the backlog, nothing to do.
+                    self.host_uart_txq.clear();
+                    break;
+                }
+            }
         }
     }
 
