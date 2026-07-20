@@ -38,6 +38,76 @@ const VLAN_TPID: u16 = 0x8100;
 const VID_SWITCH0: u16 = 0x301;
 const VID_SWITCH1: u16 = 0x302;
 
+/// A bidirectional byte channel to the host CPU over the host-facing UART. A
+/// unix socket (voxel/propolis) and a pty master (faux-ipcc and other serial
+/// tools) both satisfy it.
+trait HostUartIo: Read + Write {}
+impl<T: Read + Write> HostUartIo for T {}
+
+/// Open a pty for the host UART, print its slave device path, and return the
+/// non-blocking master as the byte channel. Lets serial-port tools (faux-ipcc)
+/// attach directly with `--port <path>`, no external socat bridge.
+fn open_host_pty() -> Option<Box<dyn HostUartIo>> {
+    use std::os::unix::io::FromRawFd;
+    unsafe {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        if libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        ) != 0
+        {
+            eprintln!("[bridge] host-uart openpty failed");
+            return None;
+        }
+        // Raw the slave so no line discipline munges the IPCC byte stream.
+        let mut tio: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave, &mut tio) == 0 {
+            libc::cfmakeraw(&mut tio);
+            libc::tcsetattr(slave, libc::TCSANOW, &tio);
+        }
+        let name_ptr = libc::ttyname(slave);
+        let path = if name_ptr.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        libc::close(slave); // the tool opens the slave by path
+        // Non-blocking master: host_uart_rx polls it.
+        let fl = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        eprintln!(
+            "[bridge] host-uart (UART7/IPCC) pty ready: {path}  (attach: faux-ipcc --port {path} ...)"
+        );
+        Some(Box::new(std::fs::File::from_raw_fd(master)))
+    }
+}
+
+/// Connect the host UART to `$SP_EMU_HOST_PTY` (a pty sp-emu creates) or
+/// `$SP_EMU_HOST_UART` (a unix socket to connect to), whichever is set.
+fn open_host_uart() -> Option<Box<dyn HostUartIo>> {
+    if std::env::var("SP_EMU_HOST_PTY").is_ok() {
+        return open_host_pty();
+    }
+    let p = std::env::var("SP_EMU_HOST_UART").ok()?;
+    match UnixStream::connect(&p) {
+        Ok(s) => {
+            let _ = s.set_nonblocking(true);
+            eprintln!("[bridge] host-uart (UART7/IPCC) connected: {p}");
+            Some(Box::new(s))
+        }
+        Err(e) => {
+            eprintln!("[bridge] host-uart connect {p} failed: {e}");
+            None
+        }
+    }
+}
+
 /// One bound UDP socket and the SP VLAN ("switch view") it represents.
 struct BoundSock {
     sock: UdpSocket,
@@ -78,9 +148,11 @@ pub struct Bridge {
     rtt_sum_us: u128,
     rtt_max_us: u128,
     /// host-sp-comms (UART7) bytes to/from the host CPU. In voxel this is the
-    /// propolis IPCC COM port (a unix socket); set `$SP_EMU_HOST_UART` to its
-    /// path.
-    host_uart: Option<UnixStream>,
+    /// propolis IPCC COM port, a unix socket (`$SP_EMU_HOST_UART`). Serial-port
+    /// tools like faux-ipcc want a tty instead: `$SP_EMU_HOST_PTY=1` makes
+    /// sp-emu open a pty and print its slave path. Both back-ends are just a
+    /// bidirectional byte channel.
+    host_uart: Option<Box<dyn HostUartIo>>,
     /// Bytes the SP has written toward the host UART but the (non-blocking)
     /// socket has not yet accepted. The channel is low-rate but bursty (an IPCC
     /// response is tens of bytes at once); dropping on WouldBlock truncates the
@@ -235,19 +307,7 @@ impl Bridge {
             rtt_n: 0,
             rtt_sum_us: 0,
             rtt_max_us: 0,
-            host_uart: std::env::var("SP_EMU_HOST_UART").ok().and_then(
-                |p| match UnixStream::connect(&p) {
-                    Ok(s) => {
-                        let _ = s.set_nonblocking(true);
-                        eprintln!("[bridge] host-uart (UART7/IPCC) connected: {p}");
-                        Some(s)
-                    }
-                    Err(e) => {
-                        eprintln!("[bridge] host-uart connect {p} failed: {e}");
-                        None
-                    }
-                },
-            ),
+            host_uart: open_host_uart(),
             host_uart_txq: VecDeque::new(),
         }
     }
@@ -635,6 +695,7 @@ impl HostIo for Bridge {
     }
 
     fn host_uart_flush(&mut self) {
+        let dbg = std::env::var("SP_EMU_UARTDBG").is_ok();
         let s = match self.host_uart.as_mut() {
             Some(s) => s,
             None => {
@@ -644,10 +705,12 @@ impl HostIo for Bridge {
         };
         // Write as much as the socket accepts; stop at the first WouldBlock and
         // keep the rest queued for the next flush (pumped every serve iteration).
+        let mut wrote = 0usize;
         while let Some(&byte) = self.host_uart_txq.front() {
             match s.write(&[byte]) {
                 Ok(1) => {
                     self.host_uart_txq.pop_front();
+                    wrote += 1;
                 }
                 Ok(_) => break, // 0 bytes written: try again next flush
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -658,13 +721,25 @@ impl HostIo for Bridge {
                 }
             }
         }
+        if dbg && wrote > 0 {
+            eprintln!(
+                "[host-uart] socket TX {} bytes ({} still queued)",
+                wrote,
+                self.host_uart_txq.len()
+            );
+        }
     }
 
     fn host_uart_rx(&mut self) -> Option<u8> {
         let s = self.host_uart.as_mut()?;
         let mut b = [0u8; 1];
         match s.read(&mut b) {
-            Ok(1) => Some(b[0]),
+            Ok(1) => {
+                if std::env::var("SP_EMU_UARTDBG").is_ok() {
+                    eprintln!("[host-uart] socket RX {:#04x}", b[0]);
+                }
+                Some(b[0])
+            }
             _ => None, // 0 (EOF) or WouldBlock
         }
     }
