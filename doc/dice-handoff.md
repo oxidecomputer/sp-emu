@@ -52,29 +52,35 @@ Properties:
 
 Use as a fallback or when PUF modeling is not available.
 
-## Approach B -- model the PUF so the image generates its own handoff (preferred)
+## Approach B -- model the PUF so the image generates its own handoff (IMPLEMENTED)
 
-Let the RoT image do what it does on hardware. `gen_mfg_artifacts_self` needs only
-a stable seed from the PUF; sp-emu already owns the PUF address space.
+The unmodified `-selfsigned` RoT image now derives its own DICE identity in sp-emu
+and `faux-ipcc get-certs` returns the full chain (alias -> device-id -> persistid).
+Four pieces were needed:
 
-- Extend the PUF model at `0x4003_B000` so `generate_keycode` returns a keycode
-  and `get_key(keycode)` returns a stable seed (we control both ends -- the "PUF
-  secret" can be any fixed value, optionally derived from a per-instance id).
-- Model the surrounding PUF handshake the driver checks: `CTRL`/`STAT` busy and
-  success/error flags, `KEYINDEX`/`KEYSIZE`, the `CODEOUTPUT` FIFO for
-  `generate_keycode`, the `KEYINPUT`/`KEYOUTPUT` FIFOs for `get_key`, and the
-  index block/lock bits (`block_index`, `lock_indices_low`).
+1. **DICE CDI** (`src/lpc55.rs`): seed a stable non-zero 256-bit CDI in the SYSCON
+   registers at offset 0x900. `lib_dice::Cdi::from_reg` returns None -- skipping ALL
+   DICE generation -- when these are zero, which the boot ROM normally fills.
+2. **PUF model** (`src/puf.rs`) at `0x4003_B000`: the `lpc55-puf` command engine --
+   `CTRL`/`STAT` busy/avail handshake, `KEYINDEX`/`KEYSIZE`, the CODEOUTPUT/CODEINPUT/
+   KEYOUTPUT FIFOs -- returning a stable seed from GETKEY. `gen_mfg_artifacts_self`
+   drives GENERATEKEY -> GETKEY, then blocks+locks index 1 itself (IDXBLK_L starts
+   unblocked; the old stub pre-blocked it and made GETKEY fail). Note GETKEY is
+   CTRL bit6.
+3. **UMAAL** (`src/cpu.rs`): the Ed25519 field-mul instruction, previously UNIMPL,
+   needed for the DICE key derivation.
+4. **T3 MOV-immediate-shift decode** (`src/cpu.rs`): yaxpeax mis-decodes
+   `MOV.w Rd, Rm, ror #imm` as ASR; fixed in `t2_reg_shift_style`. This one broke
+   PlatformId validation (the `_` arm's index dispatch), panicking at mfg.rs:77.
 
-Properties:
+Also: `SP_EMU_ROT_PREBOOT` (default 400M) gives the crypto-heavy startup room.
 
-- No hubris change, no fixtures, no generator: the unmodified `-selfsigned` image
-  derives the identity itself.
-- The identity binds to the real FWID (the measured image), exactly as
-  `-selfsigned` hardware behaves.
-- Self-contained in sp-emu; the only work is a bounded peripheral model.
+Properties: no hubris change, no fixtures; identity binds to the real FWID; the
+measurement log populates with `SP_EMU_ROT_MEASURE=1`. Diagnostics used to find the
+bugs: `SP_EMU_PUFDBG`, the spin-detector and preboot trace (`SP_EMU_SPROTDBG`,
+`SP_EMU_ROT_TRACE_FROM/TO`).
 
-Reference: `lpc55-puf` (the `Puf` driver) for the exact register semantics, and
-`lib/lpc55-rot-startup/src/dice.rs` for the call sequence.
+Reference: `lpc55-puf` (the `Puf` driver) and `lib/lpc55-rot-startup/src/dice.rs`.
 
 ## Notes
 
