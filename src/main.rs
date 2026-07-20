@@ -276,11 +276,14 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     }
     let wk = resolve_wellknown(&sel, slot)?;
     let path = nvm_path();
-    let nvm = flash::load_nvm(&path)?;
+    let mut nvm = flash::load_nvm(&path)?;
     if !flash::slot_programmed(&nvm, slot)? {
         bail!("slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
             slot.to_ascii_uppercase(), slot);
     }
+    // Present a caboose in the inactive bank too, so wicketd's inventory poll
+    // caches it instead of re-reading NoCaboose forever (see mirror docs).
+    flash::mirror_unprogrammed_slot(&mut nvm);
     eprintln!("[sp] booting from slot {} ({}) for GDB", slot.to_ascii_uppercase(), path);
     // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
     // in-process RoT core), or an in-process RoT core (SP_EMU_ROT_FLASH, the

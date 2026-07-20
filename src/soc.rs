@@ -939,7 +939,8 @@ fn tlvc_header_checksum(tag: [u8; 4], len: u32) -> u32 {
 
 /// Serialize one TLV-C chunk: header { tag, len(LE), header_checksum(LE) },
 /// then the body, zero-padded to a 4-byte boundary, then the body CRC (LE).
-fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
+/// Shared with lpc55.rs, which synthesizes a stage0 caboose in the same format.
+pub(crate) fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let len = body.len() as u32;
     let mut v = Vec::new();
     v.extend_from_slice(tag);

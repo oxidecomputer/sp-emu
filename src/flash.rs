@@ -140,6 +140,26 @@ pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// If exactly one slot is programmed, mirror it into the other bank in-memory.
+///
+/// sp-emu programs a single slot, but the control-plane inventory (wicketd)
+/// reads the caboose of BOTH banks every poll cycle (~10s per SP). An empty bank
+/// returns NoCaboose, which wicketd never caches and re-fetches forever - and
+/// each fetch is a ~38ms emulated MGS round-trip, so a real dual-banked SP's
+/// harmless polling becomes a continuous CPU drain here. Presenting the same
+/// image in both banks (as a real SP has) makes the inactive-slot caboose read
+/// succeed and get cached, ending the retries. Only the caboose is read from the
+/// inactive bank, so a byte copy suffices - that image is never executed there.
+pub fn mirror_unprogrammed_slot(nvm: &mut [u8]) {
+    let a = slot_programmed(nvm, 'a').unwrap_or(false);
+    let b = slot_programmed(nvm, 'b').unwrap_or(false);
+    match (a, b) {
+        (true, false) => nvm.copy_within(0..BANK_SIZE, BANK_SIZE),
+        (false, true) => nvm.copy_within(BANK_SIZE..TOTAL, 0),
+        _ => {}
+    }
+}
+
 pub fn erase_slot(path: &str, slot: char) -> Result<()> {
     let off = slot_offset(slot)?;
     let mut nvm = load_nvm(path)?;
