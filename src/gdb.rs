@@ -344,9 +344,32 @@ pub fn serve(
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(400_000_000);
         for _ in 0..rot_preboot {
+            let pc_before = rc.pc;
             if let Err(t) = rc.step(rb, host) {
                 if dbgtrap {
                     eprintln!("[rottrap-preboot] {:?}", t);
+                }
+                break;
+            }
+            // Spin detector: a `b .` self-branch (pc unchanged) is Hubris's panic/
+            // fault loop. Dump registers + on-stack return addresses to locate the
+            // panicking call site. Gated on SP_EMU_SPROTDBG.
+            if dbgtrap && rc.pc == pc_before {
+                eprintln!(
+                    "[rot-spin] stuck at pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
+                    rc.pc, rc.r[14], rc.r[13], rc.cycles
+                );
+                eprintln!("[rot-spin] r0..r7 = {:08x?}", &rc.r[0..8]);
+                let sp = rc.r[13];
+                for i in 0..64u32 {
+                    let v = rb.read32(sp.wrapping_add(i * 4));
+                    if (0x0001_0000..0x0002_0000).contains(&v) {
+                        eprintln!(
+                            "[rot-spin] stack[{:#010x}] = {:#010x}",
+                            sp.wrapping_add(i * 4),
+                            v
+                        );
+                    }
                 }
                 break;
             }
