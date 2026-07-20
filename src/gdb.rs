@@ -343,6 +343,15 @@ pub fn serve(
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(400_000_000);
+        // Optional windowed instruction trace during preboot (where DICE runs),
+        // SP_EMU_ROT_TRACE_FROM/TO as hex pc bounds.
+        let pbf = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        };
+        let (pb_from, pb_to) = (pbf("SP_EMU_ROT_TRACE_FROM"), pbf("SP_EMU_ROT_TRACE_TO"));
+        rc.record_disasm |= pb_from.is_some();
         for _ in 0..rot_preboot {
             let pc_before = rc.pc;
             if let Err(t) = rc.step(rb, host) {
@@ -350,6 +359,14 @@ pub fn serve(
                     eprintln!("[rottrap-preboot] {:?}", t);
                 }
                 break;
+            }
+            if let (Some(f), Some(t)) = (pb_from, pb_to) {
+                if (f..=t).contains(&pc_before) {
+                    eprintln!(
+                        "[rotpb] {:#010x}: {:<24} r0={:08x} r1={:08x} r2={:08x} r4={:08x} r5={:08x} r6={:08x}",
+                        pc_before, rc.last_disasm, rc.r[0], rc.r[1], rc.r[2], rc.r[4], rc.r[5], rc.r[6]
+                    );
+                }
             }
             // Spin detector: a `b .` self-branch (pc unchanged) is Hubris's panic/
             // fault loop. Dump registers + on-stack return addresses to locate the

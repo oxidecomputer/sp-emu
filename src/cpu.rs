@@ -2416,15 +2416,28 @@ fn t2_reg_shift_style(raw: u32, len: u32) -> Option<ShiftStyle> {
         return None;
     }
     let (hw1, hw2) = ((raw & 0xFFFF) as u16, (raw >> 16) as u16);
-    if (hw1 >> 7) != 0x1F4 || (hw2 & 0xF0F0) != 0xF000 {
-        return None;
+    // T2 register-form shift (`LSL/LSR/ASR/ROR.w Rd, Rn, Rm`): type in hw1[6:5].
+    if (hw1 >> 7) == 0x1F4 && (hw2 & 0xF0F0) == 0xF000 {
+        return Some(match (hw1 >> 5) & 0x3 {
+            0 => ShiftStyle::LSL,
+            1 => ShiftStyle::LSR,
+            2 => ShiftStyle::ASR,
+            _ => ShiftStyle::ROR,
+        });
     }
-    Some(match (hw1 >> 5) & 0x3 {
-        0 => ShiftStyle::LSL,
-        1 => ShiftStyle::LSR,
-        2 => ShiftStyle::ASR,
-        _ => ShiftStyle::ROR,
-    })
+    // T3 MOV-immediate-shift (`MOV.w Rd, Rm, <type> #imm`, Rn=1111, S in bit4):
+    // yaxpeax 0.4 also mis-decodes the type here; it lives in hw2[5:4]. Without
+    // this, e.g. `mov.w rd, rm, ror #n` runs as ASR and silently corrupts values
+    // (breaks the RoT's PlatformId validation, among others).
+    if (hw1 & 0xFFEF) == 0xEA4F {
+        return Some(match (hw2 >> 4) & 0x3 {
+            0 => ShiftStyle::LSL,
+            1 => ShiftStyle::LSR,
+            2 => ShiftStyle::ASR,
+            _ => ShiftStyle::ROR,
+        });
+    }
+    None
 }
 
 /// Decode the (lsb, msb) bitfield bounds of a 32-bit T1 BFI/BFC from raw.
