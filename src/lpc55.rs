@@ -97,6 +97,11 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
             Box::new(crate::rotswd::RotSwdSpi::new(swd)),
         );
     }
+    // PUF key store (0x4003_B000): the dice-self startup drives GENERATEKEY/GETKEY
+    // to derive the RoT's DICE seed, then blocks+locks index 1. Model it so the
+    // image generates its own cert handoff (get-certs works). Added before the
+    // catch-alls so it owns 0x4003_Bxxx.
+    bus.add_device(0x4003_B000, 0x1000, Box::new(crate::puf::Puf::new()));
     // Permissive catch-all for the rest of the peripheral block (SYSCON, IOCON,
     // GPIO, FLEXCOMM, HASHCRYPT...), split around the flash controller window.
     bus.add_device(
@@ -124,12 +129,20 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
     bus.write32(0x4000_0280, 3);
     bus.write32(0x4000_0284, 0);
     bus.write32(0x4000_0380, 0);
-    // PUF (base 0x4003_B000): lpc55-rot-startup::puf_check panics unless KEY_INDEX
-    // (1) is blocked and the register is locked in IDXBLK_L (offset 0x20C). The
-    // boot ROM normally configures this; emulate the result. Value bits: bit2 =
-    // index-1 disabled/blocked, bits[31:30]=0b01 = Locked (lpc55-puf is_index_blocked
-    // checks bit index*2; is_locked checks idxblk >> 30 == 1).
-    bus.write32(0x4003_B20C, 0x4000_0004);
+    // DICE CDI: the boot ROM deposits the 256-bit Compound Device Identifier in
+    // SYSCON registers at offset 0x900 (8 words). lib_dice::Cdi::from_reg returns
+    // None -- skipping ALL DICE cert generation -- if these are zero, so seed a
+    // stable non-zero CDI: the emulated device's DICE root (paired with the PUF
+    // seed for the persistid key). Re-seeded each boot since from_reg zeroizes it.
+    const DICE_CDI: [u32; 8] = [
+        0xc0de_d1ce, 0x0badf00d, 0x1234_5678, 0x9abc_def0, 0x0f1e_2d3c,
+        0x4b5a_6978, 0x8796_a5b4, 0xc3d2_e1f0,
+    ];
+    for (i, w) in DICE_CDI.iter().enumerate() {
+        bus.write32(0x4000_0900 + (i as u32) * 4, *w);
+    }
+    // (PUF at 0x4003_B000 is modeled by crate::puf::Puf, added above; the RoT's
+    // dice-self startup blocks+locks index 1 itself, which puf_check then checks.)
 }
 
 /// Minimal LPC55 flash controller model. The flash content is the memory-mapped
