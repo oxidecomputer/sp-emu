@@ -745,6 +745,20 @@ impl Cpu {
                 self.write_reg(reg(&ops[1])?, (p >> 32) as u32);
                 Ok(())
             }
+            // UMAAL: {RdHi:RdLo} = Rn*Rm + RdLo + RdHi (both accumulators added
+            // as separate u32s, unlike UMLAL's 64-bit accumulator). Used heavily
+            // by Ed25519 field arithmetic (salty), so the RoT's DICE key
+            // derivation needs it. Cannot overflow u64: max is (2^32-1)^2 + 2*(2^32-1) = 2^64-1.
+            Opcode::UMAAL => {
+                let rn = self.read_reg(reg(&ops[2])?) as u64;
+                let rm = self.read_reg(reg(&ops[3])?) as u64;
+                let lo = self.read_reg(reg(&ops[0])?) as u64;
+                let hi = self.read_reg(reg(&ops[1])?) as u64;
+                let p = rn.wrapping_mul(rm).wrapping_add(lo).wrapping_add(hi);
+                self.write_reg(reg(&ops[0])?, p as u32);
+                self.write_reg(reg(&ops[1])?, (p >> 32) as u32);
+                Ok(())
+            }
             Opcode::UDIV => {
                 let a = self.read_reg(reg(&ops[1])?);
                 let b = self.read_reg(reg(&ops[2])?);
