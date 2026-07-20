@@ -947,7 +947,14 @@ pub fn serve(
         // the loop stays full-speed and responsive; sleep only when MGS is quiet.
         if cpu.idle_skip > 0 {
             cpu.idle_skip = 0;
-            if !bus.any_pending_irq() && !rot_busy {
+            // Don't sleep while host-UART (IPCC / host console) input is pending:
+            // pump_uart just injected it into uart_rx but collect_irqs hasn't run
+            // yet, so any_pending_irq() doesn't see IRQ 82 here. Sleeping would
+            // stall the SP for idle_ms per byte -- and host_sp_comms only services
+            // the UART when it is back in sys_recv, not while blocked calling
+            // gimlet_seq, so the SP must keep running for both to make progress.
+            let host_uart_pending = !bus.uart_rx.borrow().is_empty();
+            if !bus.any_pending_irq() && !rot_busy && !host_uart_pending {
                 std::thread::sleep(std::time::Duration::from_millis(idle_ms));
             }
         }

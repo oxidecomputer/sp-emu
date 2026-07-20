@@ -361,6 +361,7 @@ name = "sp-emu"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "libc",
  "object",
  "sha3",
  "toml",
