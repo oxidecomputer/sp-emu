@@ -335,7 +335,15 @@ pub fn serve(
         rc.wfi_throttle = false;
         let t = std::time::Instant::now();
         let dbgtrap = crate::sprot::dbg();
-        for _ in 0..40_000_000u64 {
+        // Budget high enough for the dice-self startup to finish its DICE cert
+        // generation (PUF seed + several Ed25519 keygens/signs + SHA3) -- it
+        // breaks early on idle (WFI) once startup completes. Override with
+        // SP_EMU_ROT_PREBOOT.
+        let rot_preboot = std::env::var("SP_EMU_ROT_PREBOOT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(400_000_000);
+        for _ in 0..rot_preboot {
             if let Err(t) = rc.step(rb, host) {
                 if dbgtrap {
                     eprintln!("[rottrap-preboot] {:?}", t);
