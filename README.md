@@ -129,13 +129,39 @@ See `demo/README.md` for the walk-through.
 sp-emu flash <a|b> <image.bin | build-archive.zip>   program a flash slot
 sp-emu erase <a|b>                                   erase a slot
 sp-emu info                                          show each slot's reset vector
-sp-emu run [a|b] [max_insns]                         boot from a slot and run
+sp-emu run [a|b] [max_insns]                         boot from a slot and run (max_insns 0 = run forever)
 sp-emu gdb [a|b] [preboot]                           boot a slot, then serve GDB/OpenOCD/SWD for humility
 sp-emu rot <oxide-rot-1 image> [max]                 boot the LPC55 RoT firmware standalone
 sp-emu rot-serve <listen-addr> <rot-image>           run a shared RoT for SPs to connect to
 sp-emu i2c-sniff [listen-addr]                        observe I2C traffic from a running emulator
 sp-emu i2c-device [addr] [spec ...]                   stand in as I2C devices for a running emulator
 ```
+
+### How long `run` runs
+
+`run` takes an optional instruction cap, and which you want depends on the task:
+
+- A finite `max_insns` (default 5,000,000) boots to steady state and then stops.
+  Use this for a quick smoke boot, an instruction trace, or CI, where a bounded,
+  deterministic run is what you want.
+- `max_insns` of `0` runs until the firmware traps or halts — i.e. indefinitely.
+  Choose this when the SP must keep serving: answering MGS over the bridge, or a
+  firmware-update test that must stay up across the reset that activates the new
+  image (see below). This is the mode to reach for when you want a long-running
+  emulated SP on the network.
+
+### Firmware update and reboot into a new image
+
+A firmware update is driven entirely by the real Hubris firmware over MGS; the
+emulator just models the flash. The STM32H7 FLASH controller and the two banks
+are modeled with real unlock/erase/program semantics, the option-byte bank swap,
+and persistence, so an in-band MGS update programs the inactive bank, and the
+option-byte swap plus the SP reset that follows reboots into the newly written
+image — exactly as on silicon. Flash contents and the persisted swap survive
+across runs (`$SP_EMU_FLASH` plus a small `.nv` state file beside it).
+
+To exercise an update end to end the SP must run across that reset, so run it in
+the run-forever mode (`run <slot> 0`) with the MGS bridge bound.
 
 ## Environment variables
 
