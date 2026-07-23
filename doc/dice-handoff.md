@@ -58,12 +58,13 @@ The unmodified `-selfsigned` RoT image now derives its own DICE identity in sp-e
 and `faux-ipcc get-certs` returns the full chain (alias -> device-id -> persistid).
 Four pieces were needed:
 
-1. **DICE CDI** (`src/lpc55.rs`): seed a stable non-zero 256-bit CDI in the SYSCON
-   registers at offset 0x900. `lib_dice::Cdi::from_reg` returns None -- skipping ALL
-   DICE generation -- when these are zero, which the boot ROM normally fills.
+1. **DICE CDI** (`src/lpc55.rs`): seed the per-instance non-zero 256-bit CDI
+   (`crate::identity`) in the SYSCON registers at offset 0x900. `lib_dice::Cdi::from_reg`
+   returns None -- skipping ALL DICE generation -- when these are zero, which the
+   boot ROM normally fills.
 2. **PUF model** (`src/puf.rs`) at `0x4003_B000`: the `lpc55-puf` command engine --
    `CTRL`/`STAT` busy/avail handshake, `KEYINDEX`/`KEYSIZE`, the CODEOUTPUT/CODEINPUT/
-   KEYOUTPUT FIFOs -- returning a stable seed from GETKEY. `gen_mfg_artifacts_self`
+   KEYOUTPUT FIFOs -- returning the per-instance UDS seed from GETKEY. `gen_mfg_artifacts_self`
    drives GENERATEKEY -> GETKEY, then blocks+locks index 1 itself (IDXBLK_L starts
    unblocked; the old stub pre-blocked it and made GETKEY fail). Note GETKEY is
    CTRL bit6.
@@ -76,7 +77,10 @@ Four pieces were needed:
 Also: `SP_EMU_ROT_PREBOOT` (default 400M) gives the crypto-heavy startup room.
 
 Properties: no hubris change, no fixtures; identity binds to the real FWID; the
-measurement log populates with `SP_EMU_ROT_MEASURE=1`. Diagnostics used to find the
+measurement log populates with `SP_EMU_ROT_MEASURE=1`. The CDI and PUF seed are
+per-instance (`crate::identity`, selected by `--seed`), so each sp-emu instance
+derives a distinct self-signed chain; `--seed legacy` reproduces the old fixed
+identity. Diagnostics used to find the
 bugs: `SP_EMU_PUFDBG`, the spin-detector and preboot trace (`SP_EMU_SPROTDBG`,
 `SP_EMU_ROT_TRACE_FROM/TO`).
 

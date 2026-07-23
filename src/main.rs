@@ -24,6 +24,7 @@ mod flash;
 mod gdb;
 mod glasgow;
 mod host;
+mod identity;
 mod i2c_bridge;
 mod lpc55;
 mod mem;
@@ -168,8 +169,31 @@ fn nvm_path() -> String {
     std::env::var("SP_EMU_FLASH").unwrap_or_else(|_| "sp-flash.bin".to_string())
 }
 
+/// Remove `--flag <value>` (or `--flag=<value>`) from `args` and return the value.
+/// Used for global options that are not tied to a subcommand's positional args.
+fn extract_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
+    let eq = format!("{flag}=");
+    if let Some(i) = args.iter().position(|a| a == flag || a.starts_with(&eq)) {
+        let arg = args.remove(i);
+        if let Some(v) = arg.strip_prefix(&eq) {
+            return Some(v.to_string());
+        }
+        // `--flag value` form: the value is the next token.
+        if i < args.len() {
+            return Some(args.remove(i));
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Per-instance identity: `--seed <hex|string>` (or $SP_EMU_SEED) derives the
+    // instance's UID/UUID/DICE-CDI/PUF seeds; absent, a persisted or fresh-random
+    // seed is used. Pulled out of `args` before subcommand dispatch so it may
+    // appear anywhere on the line.
+    let seed = extract_flag_value(&mut args, "--seed").or_else(|| std::env::var("SP_EMU_SEED").ok());
+    identity::init(seed.as_deref())?;
     match args.first().map(|s| s.as_str()) {
         Some("flash") => cmd_flash(&args[1..]),
         Some("erase") => cmd_erase(&args[1..]),

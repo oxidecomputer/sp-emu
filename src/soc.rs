@@ -1878,11 +1878,11 @@ impl Mmio for Uid {
         "UID"
     }
     fn read(&mut self, off: u32) -> u32 {
-        match off & !3 {
-            0x0 => 0x5350_4D45,
-            0x4 => 0x2D45_4D55,
-            _ => 0x0000_0001,
-        }
+        // Per-instance 96-bit UID (3 words at 0x0/0x4/0x8); higher offsets read a
+        // stable non-zero filler. Firmware reads the UID early in boot (a zero /
+        // unmapped read faults a downstream slice), so it must be non-zero. The
+        // SP's MAC comes from the VPD EEPROM (`build_vpd_eeprom`), not this UID.
+        crate::identity::sp_uid_word(off & !3)
     }
     fn write(&mut self, _: u32, _: u32) {}
 }

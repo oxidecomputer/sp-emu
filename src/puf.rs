@@ -8,8 +8,13 @@
 //! and streams the derived key out of KEYOUTPUT, polling STAT for the busy/avail
 //! handshake. We model that handshake and return a *stable* seed from GETKEY, so
 //! the DICE identity is deterministic across boots -- like a real device's fixed
-//! UDS. This is not a real PUF: there is no unclonable secret, and the seed is a
-//! fixed constant, so the identity is emulator-wide, not per-instance.
+//! UDS. This is not a real PUF: there is no unclonable secret. The seed is the
+//! per-instance UDS from `crate::identity`, so each sp-emu instance derives a
+//! distinct DICE identity (a `--seed` selects it; see src/identity.rs).
+//!
+//! The UDS is a device secret on real silicon, but sp-emu's RoT is a deliberate
+//! open book (a derived, inspectable value); see the "Secrets policy exception"
+//! in src/identity.rs. That is why this seed is readable and reproducible here.
 //!
 //! Startup order matters (`lpc55-rot-startup::startup`): `dice::run` executes
 //! GENERATEKEY -> GETKEY -> `block_index(1)` -> `lock_indices_low`, then
@@ -50,13 +55,6 @@ const STAT_CODEOUTAVAIL: u32 = 1 << 7;
 // ALLOW: enroll(0), start(1), setkey(2), getkey(3) -- report all permitted.
 const ALLOW_ALL: u32 = 0x0F;
 
-/// Stable device seed returned by GETKEY -- the root of the emulated RoT's DICE
-/// identity. Any fixed non-zero value works.
-const PUF_SEED: [u8; 32] = [
-    0x53, 0x50, 0x2d, 0x45, 0x4d, 0x55, 0x2d, 0x50, 0x55, 0x46, 0x2d, 0x64, 0x69, 0x63, 0x65, 0x2d,
-    0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x2d, 0x21, 0x21, 0x21, 0x21,
-];
-
 pub struct Puf {
     keyindex: u32,
     keysize: u32,
@@ -64,6 +62,7 @@ pub struct Puf {
     busy: bool,
     success: bool,
     error: bool,
+    seed: [u8; 32],          // per-instance device seed (UDS) streamed from GETKEY
     codeout: VecDeque<u32>,  // keycode words to emit (GENERATEKEY)
     codein_left: usize,      // keycode words still to consume (GETKEY)
     keyout: VecDeque<u32>,   // key/seed words to emit (GETKEY)
@@ -79,6 +78,7 @@ impl Puf {
             busy: false,
             success: false,
             error: false,
+            seed: crate::identity::puf_uds(),
             codeout: VecDeque::new(),
             codein_left: 0,
             keyout: VecDeque::new(),
@@ -174,7 +174,7 @@ impl Puf {
                 // little-endian Cortex-M33).
                 let words = self.key_bytes() / 4;
                 for i in 0..words {
-                    let b: [u8; 4] = PUF_SEED[i * 4..i * 4 + 4].try_into().unwrap();
+                    let b: [u8; 4] = self.seed[i * 4..i * 4 + 4].try_into().unwrap();
                     self.keyout.push_back(u32::from_le_bytes(b));
                 }
             }

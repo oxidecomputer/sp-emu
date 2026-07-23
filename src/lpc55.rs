@@ -92,14 +92,13 @@ pub fn install_peripherals(bus: &mut Bus, image: &[u8]) {
     bus.write32(0x4000_0380, 0);
     // DICE CDI: the boot ROM deposits the 256-bit Compound Device Identifier in
     // SYSCON registers at offset 0x900 (8 words). lib_dice::Cdi::from_reg returns
-    // None -- skipping ALL DICE cert generation -- if these are zero, so seed a
-    // stable non-zero CDI: the emulated device's DICE root (paired with the PUF
-    // seed for the persistid key). Re-seeded each boot since from_reg zeroizes it.
-    const DICE_CDI: [u32; 8] = [
-        0xc0de_d1ce, 0x0badf00d, 0x1234_5678, 0x9abc_def0, 0x0f1e_2d3c,
-        0x4b5a_6978, 0x8796_a5b4, 0xc3d2_e1f0,
-    ];
-    for (i, w) in DICE_CDI.iter().enumerate() {
+    // None (skipping ALL DICE cert generation) when these are zero. Seed the
+    // per-instance CDI (crate::identity), so each sp-emu instance derives a
+    // distinct DICE identity and self-signed cert (paired with the per-instance
+    // PUF seed for the persistid key). Re-seeded each boot since from_reg zeroizes it.
+    // The CDI is a device secret on silicon, but sp-emu's RoT is a deliberate open
+    // book; see the "Secrets policy exception" in src/identity.rs.
+    for (i, w) in crate::identity::dice_cdi_words().iter().enumerate() {
         bus.write32(0x4000_0900 + (i as u32) * 4, *w);
     }
     // (PUF at 0x4003_B000 is modeled by crate::puf::Puf, added above; the RoT's

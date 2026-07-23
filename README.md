@@ -184,11 +184,39 @@ The ones you reach for most:
 - `SP_EMU_HOST_UART`: socket for the host-to-SP comms UART (IPCC).
 - `SP_EMU_NO_DEBUG`: suppress the humility debug listeners.
 - `SP_EMU_I2C_BRIDGE` / `SP_EMU_I2C_DEVICE`: socket for the I2C sniff and delegate bridges.
+- `SP_EMU_IDENTITY`: path to the per-instance identity file (default
+  `sp-emu-identity`). Give each instance in a fleet its own, like `SP_EMU_FLASH`.
+- `SP_EMU_SEED`: same as the `--seed` flag below.
 
 There are also `SP_EMU_*DBG` switches (`SP_EMU_SPROTDBG`, `SP_EMU_ETHDBG`,
 `SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, and so on) that turn on per-subsystem
 tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock, erase, program,
 and the option-byte bank swap.
+
+## Instance identity (`--seed`)
+
+Each instance has its own identity -- the SP UID, the RoT device UUID, and the
+RoT's DICE identity / self-signed certificate -- so a fleet of emulators is
+discoverable like real hardware. All of it derives from one seed:
+
+- `--seed <source>` (or `$SP_EMU_SEED`): the seed source. It is one of
+  - `legacy` -- reproduces the previous fixed constants exactly (same UID, DICE
+    CDI, and PUF seed, hence the same self-signed cert), for compatibility;
+  - a `0x`-prefixed hex `u64`, e.g. `--seed 0x1234` (malformed or over-64-bit
+    hex is an error);
+  - any other string, which is hashed.
+- With no `--seed`, the identity file is used if present, else a fresh random
+  seed is minted and persisted -- so each instance is unique yet stable across
+  runs.
+
+The SP's Ethernet MAC and serial come from its emulated VPD EEPROM
+(`build_vpd_eeprom`), which is already varied per instance by the `SP_EMU_BRIDGE`
+port index; folding the VPD identity into this seed is a follow-up.
+
+Note: sp-emu's root of trust is deliberately an open book. The seed (which
+derives the DICE/PUF secrets) is persisted in plaintext and logged on purpose --
+there is no real secret to protect, and reproducibility wins. See the "Secrets
+policy exception" note in `src/identity.rs`.
 
 ## Status and limits
 
