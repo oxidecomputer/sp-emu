@@ -177,6 +177,9 @@ The ones you reach for most:
 - `SP_EMU_ROT_FLASH`: instead of a service, run an in-process RoT core from this image.
   Unlike `SP_EMU_ROT_SERVICE`, this RoT drives the SP's debug port over an internal SWD
   link, so it can run the endoscope attestation measurement (see `demo/run-sp-measure.sh`).
+- `SP_EMU_ROT_NVM`: path to the RoT flash backing file (default `sp-rot-flash.bin`),
+  the RoT analog of `SP_EMU_FLASH`. A persisted file takes precedence over the image
+  passed on the command line, so delete it to reseed; give each instance its own.
 - `SP_EMU_SWD_TRIGGER`: fire one synthetic SP-reset measurement request after boot, so the
   in-process RoT measures the SP even when the SP image does not gate its boot on the token.
 - `SP_EMU_ROT_MEASURE`: let the SP self-reset until measured (drop the pre-seeded SKIP token)
