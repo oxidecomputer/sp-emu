@@ -1153,13 +1153,18 @@ impl Mmio for GpioBank {
         if reg == 0x10 {
             // IDR
             if port == 4 {
-                // GPIOE: PE3 is rot-irq (input from the RoT, active-low). Surface
-                // the sprot link's rot_irq on bit 3 so the SP's sprot-server sees it.
-                if let Some(lk) = crate::sprot::link() {
-                    let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
-                    let bit3 = if lk.borrow().rot_irq { 0 } else { 1 << 3 };
-                    return (odr & !(1 << 3)) | bit3;
-                }
+                // GPIOE: PE3 is rot-irq (input from the RoT, active-low). With a RoT
+                // attached, reflect the sprot link's rot_irq on bit 3. With no RoT,
+                // the line sits deasserted (high, pulled up) as on a board with no
+                // RoT populated — otherwise the SP's sprot driver sees ROT_IRQ stuck
+                // asserted and fails every RoT request with RotIrqRemainsAsserted
+                // (faux-mgs tolerates that field error; sp-test treats it as fatal).
+                let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
+                let asserted = crate::sprot::link()
+                    .map(|lk| lk.borrow().rot_irq)
+                    .unwrap_or(false);
+                let bit3 = if asserted { 0 } else { 1 << 3 };
+                return (odr & !(1 << 3)) | bit3;
             }
             if self.sidecar {
                 return match port {

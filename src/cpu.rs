@@ -322,6 +322,14 @@ impl Cpu {
         }
     }
 
+    /// Drop the entire decode cache. Required at a reset edge after a flash bank
+    /// swap: the cacheable window (`FLASH_LO..FLASH_HI`) spans both banks, so the
+    /// bytes at a given flash PC change identity when the swap takes effect, and
+    /// every cached decode there is stale.
+    pub fn flush_decode_cache(&mut self) {
+        self.dcache.clear();
+    }
+
     pub fn reset(&mut self, sp: u32, pc: u32) {
         self.msp = sp;
         self.r[SP] = sp;
