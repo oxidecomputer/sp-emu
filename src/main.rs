@@ -193,14 +193,14 @@ fn main() -> Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5_000_000);
             let image = std::fs::read(p).with_context(|| format!("read {p}"))?;
-            boot(&image, flash::FLASH_BASE, max)
+            boot(&image, Some(false), max)
         }
         _ => {
             eprintln!("usage:");
             eprintln!("  sp-emu flash <a|b> <image.bin>   program a slot");
             eprintln!("  sp-emu erase <a|b>               erase a slot");
             eprintln!("  sp-emu info                      show slot reset vectors");
-            eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot");
+            eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot (max 0 = run forever)");
             eprintln!("  sp-emu gdb [a|b] [preboot]       boot a slot, then serve a GDB stub for humility");
             eprintln!(
                 "  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone"
@@ -283,57 +283,76 @@ fn cmd_info() -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    // run [a|b] [max]
+    // run [a|b] [max] — max 0 means serve forever (needed for sp-test end-to-end).
     let mut slot = 'a';
+    let mut slot_given = false;
     let mut max = 5_000_000u64;
     for a in args {
         if let Ok(c) = slot_arg(a) {
             slot = c;
+            slot_given = true;
         } else if let Ok(n) = a.parse::<u64>() {
             max = n;
         }
     }
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
-    if !flash::slot_programmed(&nvm, slot)? {
+    // An explicit slot forces the boot bank; otherwise honor the persisted swap.
+    let swap_override = slot_given.then_some(slot == 'b');
+    let nv = flash::load_nv(&flash::nv_state_path(&path));
+    let boot_slot = if swap_override.unwrap_or(nv.swap_bank) {
+        'b'
+    } else {
+        'a'
+    };
+    if !flash::slot_programmed(&nvm, boot_slot)? {
         bail!(
             "slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
-            slot.to_ascii_uppercase(),
-            slot
+            boot_slot.to_ascii_uppercase(),
+            boot_slot
         );
     }
     eprintln!(
         "[sp] booting from slot {} ({})",
-        slot.to_ascii_uppercase(),
+        boot_slot.to_ascii_uppercase(),
         path
     );
-    boot(&nvm, flash::slot_base(slot)?, max)
+    boot(&nvm, swap_override, max)
 }
 
 /// gdb [a|b] [preboot] — boot a slot to steady state, then serve a GDB stub on
 /// 127.0.0.1:3333 for humility to attach to.
 fn cmd_gdb(args: &[String]) -> Result<()> {
     let mut slot = 'a';
+    let mut slot_given = false;
     let mut preboot = 3_000_000u64;
     for a in args {
         if let Ok(c) = slot_arg(a) {
             slot = c;
+            slot_given = true;
         } else if let Ok(n) = a.parse::<u64>() {
             preboot = n;
         }
     }
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
-    if !flash::slot_programmed(&nvm, slot)? {
+    let swap_override = slot_given.then_some(slot == 'b');
+    let nv = flash::load_nv(&flash::nv_state_path(&path));
+    let boot_slot = if swap_override.unwrap_or(nv.swap_bank) {
+        'b'
+    } else {
+        'a'
+    };
+    if !flash::slot_programmed(&nvm, boot_slot)? {
         bail!(
             "slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
-            slot.to_ascii_uppercase(),
-            slot
+            boot_slot.to_ascii_uppercase(),
+            boot_slot
         );
     }
     eprintln!(
         "[sp] booting from slot {} ({}) for GDB",
-        slot.to_ascii_uppercase(),
+        boot_slot.to_ascii_uppercase(),
         path
     );
     // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
@@ -349,7 +368,7 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     if std::env::var("SP_EMU_ROT_FLASH").is_ok() {
         rotswd::enable();
     }
-    let (cpu, bus) = setup(&nvm, flash::slot_base(slot)?)?;
+    let (cpu, bus) = setup(&nvm, swap_override)?;
     let rot = match (&rot_service, std::env::var("SP_EMU_ROT_FLASH")) {
         (None, Ok(p)) => {
             eprintln!("[rot] SP_EMU_ROT_FLASH={p}");
@@ -564,49 +583,80 @@ fn cmd_rot(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Build the SoC, load flash, and reset the CPU from `boot_base`'s vector table.
-/// Shared by `run` and `gdb`.
-fn setup(image: &[u8], boot_base: u32) -> Result<(Cpu, Bus)> {
+/// Build the SoC, install the flash model, and reset the CPU from the vector
+/// table. Shared by `run` and `gdb`. `swap_override` forces the effective bank
+/// swap (Some(false)=bank1/slot A, Some(true)=bank2/slot B); None honors the
+/// persisted NV swap. The reset vector is always read from 0x0800_0000 — which
+/// physical bank that is depends on the swap, exactly as on silicon.
+fn setup(image: &[u8], swap_override: Option<bool>) -> Result<(Cpu, Bus)> {
     let mut bus = Bus::new();
     soc::install_memory(&mut bus);
     soc::install_peripherals(&mut bus);
-    bus.load(flash::FLASH_BASE, image)?;
+
+    let path = nvm_path();
+    let nv = flash::load_nv(&flash::nv_state_path(&path));
+    let mut flashm = flash::Flash::new(&path, image.to_vec(), nv);
+    if let Some(s) = swap_override {
+        flashm.force_swap(s);
+    }
+    let swapped = flashm.effective_swap();
+    bus.install_flash(flashm);
     eprintln!(
-        "[boot] loaded {} bytes of flash @ {:#010x}",
+        "[boot] flash {} bytes, active bank {} ({})",
         image.len(),
-        flash::FLASH_BASE
+        if swapped { "2 / slot B" } else { "1 / slot A" },
+        path
     );
 
-    // Cortex-M reset protocol: SP = vector[0], reset PC = vector[1].
-    let initial_sp = bus.read32(boot_base);
-    let reset_pc = bus.read32(boot_base + 4) & !1;
+    // Cortex-M reset protocol: SP = vector[0], reset PC = vector[1]. Always from
+    // the aperture base; the flash model maps it to the active physical bank.
+    let initial_sp = bus.read32(flash::FLASH_BASE);
+    let reset_pc = bus.read32(flash::FLASH_BASE + 4) & !1;
     eprintln!(
-        "[boot] reset from {:#010x}: SP = {:#010x}, PC = {:#010x}",
-        boot_base, initial_sp, reset_pc
+        "[boot] reset: SP = {:#010x}, PC = {:#010x}",
+        initial_sp, reset_pc
     );
 
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
 
-    // Measurement-handoff token (RFD 568): production gimlet firmware spins
-    // resetting itself until the RoT deposits a VALID token at DTCM base, or a
-    // debugger deposits the SKIP token. By default we act as the debugger and
-    // deposit SKIP (0x9f38bd71) at 0x2000_0000 so the SP boots directly. In
-    // SP_EMU_ROT_MEASURE mode we skip that: the SP finds no token, self-resets,
-    // wakes the in-process RoT, which measures the SP over SWD and writes VALID
-    // (0x0c887a12) — the real RFD 568 dance.
-    if std::env::var("SP_EMU_ROT_MEASURE").is_err() {
-        bus.write32(0x2000_0000, 0x9f38_bd71);
-    }
+    // Measurement-handoff token (RFD 568) at initial boot — see the helper.
+    deposit_skip_token_if_debugger(&mut bus);
     Ok((cpu, bus))
 }
 
-/// Load `image` at FLASH_BASE, reset from `boot_base`'s vector table, and run.
-fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
+/// RFD 568 measurement handoff: DTCM base and the SKIP token a debugger deposits
+/// so the SP boots without a RoT measurement (the VALID token the RoT writes is
+/// 0x0c887a12).
+const RFD568_TOKEN_ADDR: u32 = 0x2000_0000;
+const RFD568_SKIP_TOKEN: u32 = 0x9f38_bd71;
+
+/// Model the three measurement flows at every boot/reset edge. Production gimlet
+/// firmware spins resetting itself until it finds a valid token at DTCM base:
+///
+/// 1. RoT present: the RoT measures the SP and deposits VALID (real dance).
+/// 2. No RoT, debugger present (default): we act as the debugger — as humility
+///    does — and deposit SKIP so the SP boots. Applied on warm resets too, so a
+///    firmware-update reboot completes without a RoT.
+/// 3. No RoT, no debugger (SP_EMU_ROT_MEASURE): deposit nothing, so a bare SP
+///    correctly reset-loops until its counter exhausts.
+///
+/// SP_EMU_ROT_MEASURE selects flows 1/3 (let the RoT measure, or loop); its
+/// absence selects flow 2.
+fn deposit_skip_token_if_debugger(bus: &mut Bus) {
+    if std::env::var("SP_EMU_ROT_MEASURE").is_err() {
+        bus.write32(RFD568_TOKEN_ADDR, RFD568_SKIP_TOKEN);
+    }
+}
+
+/// Install `image` as flash, reset from the active bank's vector table, and run.
+/// `max` == 0 runs until a trap/halt (serve MGS forever); otherwise it caps the
+/// instruction count. `swap_override` selects the initial boot bank (see `setup`).
+fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
     let trace = std::env::var("SP_EMU_TRACE").is_ok();
     let parse_env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
     let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
-    let (mut cpu, mut bus) = setup(image, boot_base)?;
+    let (mut cpu, mut bus) = setup(image, swap_override)?;
     let mut host = make_host();
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
@@ -619,7 +669,7 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
     // consumer (full trace, windowed trace, or the diff harness) will read it.
     cpu.record_disasm = trace || twin_from.is_some() || diff.is_some();
 
-    for _ in 0..max {
+    while max == 0 || cpu.cycles < max {
         let pc = cpu.pc;
         let (mode0, ipsr0) = (cpu.mode, cpu.ipsr);
         bus.mmio_hit = false;
@@ -691,7 +741,26 @@ fn boot(image: &[u8], boot_base: u32, max: u64) -> Result<()> {
                 bus.pump_uart(host.as_mut());
             }
         }
+        // Firmware self-reset (AIRCR.SYSRESETREQ), e.g. the MGS ResetSP that
+        // completes a firmware update. Persist + latch any committed bank swap,
+        // then reboot from the (possibly newly-active) bank's vector table.
+        if bus.reset_pending {
+            bus.flash_reset_latch();
+            let sp = bus.read32(flash::FLASH_BASE);
+            let pc = bus.read32(flash::FLASH_BASE + 4) & !1;
+            cpu.reset_for_reboot(sp, pc);
+            cpu.flush_decode_cache();
+            // Keep the RFD 568 measurement handoff consistent across the reset:
+            // by default sp-emu stands in for the humility debugger and re-deposits
+            // the SKIP token (so a firmware-update reboot boots fast, as voxel
+            // expects); SP_EMU_ROT_MEASURE opts out for hardware-faithful behavior
+            // (a bare SP then reset-loops to counter exhaustion, or a RoT measures).
+            deposit_skip_token_if_debugger(&mut bus);
+            bus.reset_pending = false;
+            eprintln!("[sp] reset: reboot SP={:#010x} PC={:#010x}", sp, pc);
+        }
     }
+    bus.flush_flash();
 
     eprintln!(
         "\n[done] {} instructions, unmapped reads={} writes={}",

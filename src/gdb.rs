@@ -671,9 +671,14 @@ pub fn serve(
         // measurement token is absent; it also wakes the RoT to measure the SP.
         let mut sp_reset_edge = false;
         if bus.reset_pending {
+            // Persist + latch any committed bank swap (a completed firmware
+            // update) before reading the vector table, so the reboot enters the
+            // now-active bank; then drop stale decodes for the swapped-in image.
+            bus.flash_reset_latch();
             let sp = bus.read32(0x0800_0000);
             let pc = bus.read32(0x0800_0004) & !1;
             cpu.reset_for_reboot(sp, pc);
+            cpu.flush_decode_cache();
             bus.reset_pending = false;
             sp_reset_edge = true;
         }
