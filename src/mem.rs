@@ -1,9 +1,11 @@
 //! Physical memory + MMIO dispatch for the emulated SoC.
 //!
-//! Two kinds of regions: flat RAM/flash (backed by a `Vec<u8>`) and MMIO
-//! peripherals (a `dyn Mmio`). Anything unmapped is logged and returns 0 / is
-//! swallowed, so the trace keeps moving and surfaces unmodeled accesses rather
-//! than faulting on the first one.
+//! Three kinds of regions: flat RAM (backed by a `Vec<u8>`), MMIO peripherals
+//! (a `dyn Mmio`), and the STM32H7 flash — its own `crate::flash::Flash` model
+//! (program/erase/bank-swap/persistence), routed directly here rather than being
+//! flat RAM. Anything unmapped is logged and returns 0 / is swallowed, so the
+//! trace keeps moving and surfaces unmodeled accesses rather than faulting on
+//! the first one.
 
 use anyhow::{bail, Result};
 
@@ -82,10 +84,23 @@ pub struct Bus {
     /// run loop applies it (re-boot the core from the vector table) and clears it,
     /// since an `Mmio` device write cannot reach the Cpu.
     pub reset_pending: bool,
+    /// STM32H7 embedded flash + FLASH controller (bank swap, program/erase,
+    /// persistence). Modeled in the Bus — like the Ethernet DMA — because the data
+    /// stores that program flash target the memory aperture, which only the Bus
+    /// reaches, and must be coordinated with the controller register state. `None`
+    /// on cores with no modeled flash (e.g. the RoT core in Phase 1).
+    flash: Option<crate::flash::Flash>,
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
 const SCB_AIRCR: u32 = 0xE000_ED0C;
+
+// STM32H7 embedded flash: the XIP memory aperture (both 1 MB banks) and the
+// FLASH controller register block. Routed to the Bus-owned `flash` model.
+const FLASH_WIN_LO: u32 = crate::flash::FLASH_BASE;
+const FLASH_WIN_HI: u32 = crate::flash::FLASH_BASE + crate::flash::TOTAL as u32;
+const FLASH_REG_LO: u32 = 0x5200_2000;
+const FLASH_REG_HI: u32 = 0x5200_4000;
 
 // ---- STM32H7 Ethernet (base 0x4002_8000; DMA block at +0x1000) -------------
 const ETH_BASE: u32 = 0x4002_8000;
@@ -178,6 +193,29 @@ impl Bus {
             tim5_base: 0,
             tim5_regs: [0; TIM5_NREGS],
             reset_pending: false,
+            flash: None,
+        }
+    }
+
+    /// Install the STM32H7 flash model (SP core only). Replaces the flat flash
+    /// `add_ram` + FLASH RegFile stub with real program/erase/bank-swap semantics.
+    pub fn install_flash(&mut self, flash: crate::flash::Flash) {
+        self.flash = Some(flash);
+    }
+
+    /// Latch a committed bank swap into effect (called at each reset edge) and
+    /// flush flash contents to the backing file.
+    pub fn flash_reset_latch(&mut self) {
+        if let Some(f) = self.flash.as_mut() {
+            f.flush();
+            f.reset_latch();
+        }
+    }
+
+    /// Persist flash contents to the backing file (called on clean exit).
+    pub fn flush_flash(&mut self) {
+        if let Some(f) = self.flash.as_mut() {
+            f.flush();
         }
     }
 
@@ -588,6 +626,15 @@ impl Bus {
             self.eth.irq = false;
             self.nvic_pend[(ETH_IRQ / 32) as usize] |= 1 << (ETH_IRQ % 32);
         }
+        // The FLASH controller raises IRQ 4 on erase completion (EOP); the update
+        // server's bank_erase() blocks on this notification. Like the eth DMA, the
+        // event is not gated by the dev-touched device poll.
+        if let Some(f) = self.flash.as_mut() {
+            if f.take_erase_irq() {
+                self.nvic_pend[(crate::flash::FLASH_IRQ / 32) as usize] |=
+                    1 << (crate::flash::FLASH_IRQ % 32);
+            }
+        }
         // UART7 (host-sp-comms) RX: like the eth DMA, host input is asynchronous
         // (not gated by the dev-touched poll). Keep IRQ 82 pending while a host
         // byte waits — level-triggered, matching the H7 FIFO RXFNE the task
@@ -657,6 +704,12 @@ impl Bus {
 
     /// Bulk-load bytes into a backing RAM/flash region (used by the image loader).
     pub fn load(&mut self, addr: u32, bytes: &[u8]) -> Result<()> {
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_mut() {
+                f.load_image_at(addr, bytes);
+                return Ok(());
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, bytes.len() as u32) {
             r.data[off..off + bytes.len()].copy_from_slice(bytes);
             Ok(())
@@ -670,6 +723,20 @@ impl Bus {
     }
 
     pub fn read32(&mut self, addr: u32) -> u32 {
+        // Flash aperture (XIP): the hottest path — instruction fetch and constant
+        // loads — so it is checked first. A range test + one XOR (bank remap) +
+        // slice read, no device dispatch.
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                return f.read_mem32(addr);
+            }
+        }
+        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                self.mmio_hit = true;
+                return f.reg_read((addr & !3) - FLASH_REG_LO);
+            }
+        }
         if (NVIC_LO..NVIC_HI).contains(&addr) {
             if let Some(v) = self.nvic_read(addr & !3) {
                 self.mmio_hit = true;
@@ -709,6 +776,12 @@ impl Bus {
     }
 
     pub fn read16(&mut self, addr: u32) -> u16 {
+        // Flash aperture fast path (instruction fetch reads halfwords).
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                return f.read_mem16(addr);
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, 2) {
             u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap())
         } else {
@@ -717,6 +790,11 @@ impl Bus {
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                return f.read_mem8(addr);
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, 1) {
             r.data[off]
         } else {
@@ -731,6 +809,20 @@ impl Bus {
                     "[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})",
                     addr, val, self.cur_pc, self.cur_cyc
                 );
+            }
+        }
+        // Flash aperture (program cycle) and FLASH controller registers.
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_mut() {
+                f.write_mem(addr, val, 4);
+                return;
+            }
+        }
+        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_mut() {
+                self.mmio_hit = true;
+                f.reg_write((addr & !3) - FLASH_REG_LO, val);
+                return;
             }
         }
         if (NVIC_LO..NVIC_HI).contains(&addr) && self.nvic_write(addr & !3, val) {
@@ -962,5 +1054,176 @@ mod tests {
         assert!(!bus.reset_pending);
         bus.write32(SCB_AIRCR, 0x05FA_0000); // key but no SYSRESETREQ (e.g. PRIGROUP)
         assert!(!bus.reset_pending);
+    }
+
+    /// Drive the exact STM32H7 update-server register sequence against the flash
+    /// model and assert bank erase (+ its IRQ), NOR word programming, the
+    /// option-byte bank swap (staged -> committed -> reset-latched), and that the
+    /// swap + programmed image survive a reload from the backing file.
+    #[test]
+    fn flash_update_and_bank_swap_persist() {
+        use crate::flash;
+        const REG: u32 = FLASH_REG_LO;
+        const BANK1_VEC: u32 = 0x1111_1111;
+        const BANK2_VEC: u32 = 0x2222_2222;
+
+        // A private backing file for this test (removed at the end).
+        let path = std::env::temp_dir()
+            .join(format!("sp-emu-flashtest-{}.bin", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let nv_file = flash::nv_state_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&nv_file);
+
+        // Image: bank1 (slot A) holds a vector, bank2 (slot B) is erased.
+        let mut img = vec![flash::ERASED; flash::TOTAL];
+        img[0..4].copy_from_slice(&BANK1_VEC.to_le_bytes());
+        let mut bus = Bus::new();
+        bus.install_flash(flash::Flash::new(&path, img, flash::NvState::default()));
+        bus.write32(0xE000_E100, 1 << flash::FLASH_IRQ); // NVIC enable IRQ 4
+
+        // 1. Unlock bank2 (KEYR2) and the option bytes (OPTKEYR).
+        bus.write32(REG + 0x104, 0x4567_0123);
+        bus.write32(REG + 0x104, 0xCDEF_89AB);
+        bus.write32(REG + 0x08, 0x0819_2A3B);
+        bus.write32(REG + 0x08, 0x4C5D_6E7F);
+
+        // 2. Whole-bank erase: CR2 = BER | START | EOPIE. EOP latches and IRQ 4
+        //    pends (the driver blocks on this notification).
+        bus.write32(REG + 0x10C, (1 << 3) | (1 << 7) | (1 << 16));
+        assert_ne!(
+            bus.read32(REG + 0x110) & (1 << 16),
+            0,
+            "SR2.EOP set after erase"
+        );
+        bus.collect_irqs();
+        assert_eq!(
+            bus.next_irq(),
+            Some(flash::FLASH_IRQ),
+            "erase pends FLASH IRQ 4"
+        );
+        bus.write32(REG + 0x114, 1 << 16); // CCR2: clear EOP (W1C)
+        assert_eq!(
+            bus.read32(REG + 0x110) & (1 << 16),
+            0,
+            "EOP cleared via CCR2"
+        );
+
+        // 3. Program a 256-bit word: CR2 = PSIZE(0b11) | PG, then store into the
+        //    bank2 aperture (0x0810_0000). NOR: 0xFF & value = value; QW reads 0.
+        bus.write32(REG + 0x10C, (0b11 << 4) | (1 << 1));
+        bus.write32(0x0810_0000, BANK2_VEC);
+        assert_eq!(
+            bus.read32(REG + 0x110) & (1 << 2),
+            0,
+            "SR2.QW reads 0 (instant)"
+        );
+        assert_eq!(bus.read32(0x0810_0000), BANK2_VEC, "bank2 programmed");
+        assert_eq!(
+            bus.read32(0x0800_0000),
+            BANK1_VEC,
+            "bank1 still active pre-swap"
+        );
+
+        // A store without PG must be ignored (flash is not RAM).
+        bus.write32(REG + 0x10C, 0); // clear PG
+        bus.write32(0x0810_0004, 0xDEAD_BEEF);
+        assert_eq!(bus.read32(0x0810_0004), u32::MAX, "no PG -> write dropped");
+
+        // 4. Bank swap: stage OPTSR_PRG.SWAP_BANK_OPT, commit via OPTCR.OPTSTART.
+        //    Committed (OPTSR_CUR) flips now; effective (OPTCR.SWAP_BANK) only at
+        //    reset, so the running image is not remapped underfoot.
+        bus.write32(REG + 0x20, 1 << 31);
+        bus.write32(REG + 0x18, 1 << 1);
+        assert_ne!(
+            bus.read32(REG + 0x1C) & (1 << 31),
+            0,
+            "OPTSR_CUR committed swap"
+        );
+        assert_eq!(
+            bus.read32(REG + 0x18) & (1 << 31),
+            0,
+            "OPTCR effective swap not yet"
+        );
+        assert_eq!(
+            bus.read32(0x0800_0000),
+            BANK1_VEC,
+            "still bank1 until reset"
+        );
+        assert!(
+            flash::load_nv(&nv_file).swap_bank,
+            "OPTSTART persisted the swap"
+        );
+
+        // 5. Reset latch: effective <- committed; the aperture now maps bank2.
+        bus.flash_reset_latch();
+        assert_ne!(
+            bus.read32(REG + 0x18) & (1 << 31),
+            0,
+            "OPTCR effective swap latched"
+        );
+        assert_eq!(
+            bus.read32(0x0800_0000),
+            BANK2_VEC,
+            "bank2 active after reset"
+        );
+
+        // 6. Reload from the backing file + state file: the swap and the programmed
+        //    image persist across a run.
+        let img2 = flash::load_nvm(&path).unwrap();
+        let nv2 = flash::load_nv(&nv_file);
+        let mut bus2 = Bus::new();
+        bus2.install_flash(flash::Flash::new(&path, img2, nv2));
+        assert_eq!(bus2.read32(0x0800_0000), BANK2_VEC, "swapped bank persists");
+        assert_eq!(
+            bus2.read32(0x0810_0000),
+            BANK1_VEC,
+            "old bank at inactive aperture"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&nv_file);
+    }
+
+    /// An access straddling the very top of the 2 MB flash window must not panic
+    /// (the dispatch range-checks only the base address): reads return erased
+    /// bytes and a program store drops the overrun. Regression guard for the
+    /// width handling in the aperture accessors.
+    #[test]
+    fn flash_boundary_access_does_not_panic() {
+        use crate::flash;
+        let path = std::env::temp_dir()
+            .join(format!("sp-emu-flashbound-{}.bin", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(flash::nv_state_path(&path));
+
+        let mut bus = Bus::new();
+        bus.install_flash(flash::Flash::new(
+            &path,
+            vec![flash::ERASED; flash::TOTAL],
+            flash::NvState::default(),
+        ));
+
+        // Last aligned word is fully in range; the straddling reads in the top
+        // few bytes must not panic and read as erased flash.
+        assert_eq!(bus.read32(FLASH_WIN_HI - 4), u32::MAX);
+        assert_eq!(bus.read32(FLASH_WIN_HI - 2), u32::MAX, "straddling read32");
+        assert_eq!(bus.read32(FLASH_WIN_HI - 1), u32::MAX);
+        assert_eq!(bus.read16(FLASH_WIN_HI - 1), u16::MAX, "straddling read16");
+
+        // A program store that straddles the end: unlock + PG, then write. Only
+        // the in-range bytes are programmed; the overrun is dropped (no panic).
+        bus.write32(FLASH_REG_LO + 0x104, 0x4567_0123);
+        bus.write32(FLASH_REG_LO + 0x104, 0xCDEF_89AB);
+        bus.write32(FLASH_REG_LO + 0x10C, (0b11 << 4) | (1 << 1)); // PSIZE|PG
+        bus.write32(FLASH_WIN_HI - 2, 0);
+        // Top two bytes cleared to 0, the two below them untouched (0xFF).
+        assert_eq!(bus.read32(FLASH_WIN_HI - 4), 0x0000_FFFF);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(flash::nv_state_path(&path));
     }
 }

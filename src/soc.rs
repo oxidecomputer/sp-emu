@@ -27,7 +27,9 @@ pub type Spi5Cs = Rc<Cell<u32>>;
 // ---- standard STM32H7 memory map (gimletlet uses the AXI-SRAM layout) -------
 
 pub fn install_memory(bus: &mut Bus) {
-    bus.add_ram(0x0800_0000, 0x0020_0000); // Flash bank 1 (2 MB window)
+    // The 2 MB flash window (0x0800_0000, both banks) is not a flat RAM: it is the
+    // `Flash` model installed via `bus.install_flash()` in `setup()`, which gives
+    // it real program/erase/bank-swap/persistence semantics.
     bus.add_ram(0x0000_0000, 0x0001_0000); // ITCM (also boot alias)
     bus.add_ram(0x2000_0000, 0x0002_0000); // DTCM (128 KB)
     bus.add_ram(0x2400_0000, 0x0008_0000); // AXI SRAM (512 KB) — initial SP lives here
@@ -40,9 +42,8 @@ pub fn install_peripherals(bus: &mut Bus) {
     bus.add_device(0x5802_4400, 0x400, Box::new(Rcc::new()));
     bus.add_device(0x5802_4800, 0x400, Box::new(Pwr::new()));
     bus.add_device(0xE000_E000, 0x1000, Box::new(Scs::new())); // SysTick/NVIC/SCB/CPACR
-                                                               // FLASH controller: config registers are write-then-readback (e.g. ACR
-                                                               // latency), so a plain store/return register file is the correct model.
-    bus.add_device(0x5200_2000, 0x100, Box::new(RegFile::new("FLASH")));
+                                                               // The FLASH controller (0x5200_2000) and the flash memory aperture are the
+                                                               // `Flash` model owned by the Bus (installed in `setup()`), not a device here.
 
     // Ethernet MAC/MTL/DMA (0x40028000) is modeled directly in the Bus (src/mem.rs
     // `EthDma`) — its DMA engine needs to read/write descriptor rings + packet
