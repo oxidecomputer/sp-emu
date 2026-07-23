@@ -186,7 +186,9 @@ The ones you reach for most:
 - `SP_EMU_I2C_BRIDGE` / `SP_EMU_I2C_DEVICE`: socket for the I2C sniff and delegate bridges.
 
 There are also `SP_EMU_*DBG` switches (`SP_EMU_SPROTDBG`, `SP_EMU_ETHDBG`,
-`SP_EMU_SPIDBG`, and so on) that turn on per-subsystem tracing.
+`SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, and so on) that turn on per-subsystem
+tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock, erase, program,
+and the option-byte bank swap.
 
 ## Status and limits
 
