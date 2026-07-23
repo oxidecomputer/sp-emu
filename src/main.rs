@@ -29,6 +29,7 @@ mod i2c_bridge;
 mod lpc55;
 mod mem;
 mod puf;
+mod rot_flash;
 mod rot_service;
 mod rotswd;
 mod soc;
@@ -415,8 +416,11 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     let base = lpc55::IMAGE_A_BASE;
     let mut bus = Bus::new();
     lpc55::install_memory(&mut bus);
-    lpc55::install_peripherals(&mut bus, image);
-    bus.load(base, image)?;
+    lpc55::install_peripherals(&mut bus);
+    // The RoT flash model owns the 0x0 window and the 0x4003_4000 controller: it
+    // seeds slot A from `image` plus the protected flash region (CMPA/CFPA/NMPA),
+    // backed by a persistent file, and gives real erase/program/blank-check.
+    bus.install_rot_flash(rot_flash::RotFlash::new(&rot_flash::nvm_path(), image));
     publish_rot_bootstate(&mut bus, image);
     publish_dice_handoff(&mut bus);
     let initial_sp = bus.read32(base);

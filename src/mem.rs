@@ -90,6 +90,10 @@ pub struct Bus {
     /// reaches, and must be coordinated with the controller register state. `None`
     /// on cores with no modeled flash (e.g. the RoT core in Phase 1).
     flash: Option<crate::flash::Flash>,
+    /// LPC55 RoT flash + flash controller (command engine, per-page erased
+    /// tracking, CMPA/CFPA/NMPA). `Some` only on the RoT core, where it owns both
+    /// the flash memory window (0x0..0x100000) and the controller registers.
+    rot_flash: Option<crate::rot_flash::RotFlash>,
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
@@ -101,6 +105,14 @@ const FLASH_WIN_LO: u32 = crate::flash::FLASH_BASE;
 const FLASH_WIN_HI: u32 = crate::flash::FLASH_BASE + crate::flash::TOTAL as u32;
 const FLASH_REG_LO: u32 = 0x5200_2000;
 const FLASH_REG_HI: u32 = 0x5200_4000;
+
+// LPC55 RoT flash: the XIP memory window (both image slots + the protected flash
+// region) and the flash-controller register block. Routed to the Bus-owned
+// `rot_flash` model (RoT core only).
+const ROT_FLASH_WIN_LO: u32 = crate::rot_flash::BASE;
+const ROT_FLASH_WIN_HI: u32 = crate::rot_flash::BASE + crate::rot_flash::SIZE as u32;
+const ROT_FLASH_REG_LO: u32 = 0x4003_4000;
+const ROT_FLASH_REG_HI: u32 = 0x4003_5000;
 
 // ---- STM32H7 Ethernet (base 0x4002_8000; DMA block at +0x1000) -------------
 const ETH_BASE: u32 = 0x4002_8000;
@@ -194,6 +206,7 @@ impl Bus {
             tim5_regs: [0; TIM5_NREGS],
             reset_pending: false,
             flash: None,
+            rot_flash: None,
         }
     }
 
@@ -215,6 +228,19 @@ impl Bus {
     /// Persist flash contents to the backing file (called on clean exit).
     pub fn flush_flash(&mut self) {
         if let Some(f) = self.flash.as_mut() {
+            f.flush();
+        }
+    }
+
+    /// Install the LPC55 RoT flash model (RoT core only). Replaces the flat flash
+    /// `add_ram` window and the read-only `LpcFlash` stub.
+    pub fn install_rot_flash(&mut self, flash: crate::rot_flash::RotFlash) {
+        self.rot_flash = Some(flash);
+    }
+
+    /// Persist RoT flash contents to the backing file (called on clean exit).
+    pub fn flush_rot_flash(&mut self) {
+        if let Some(f) = self.rot_flash.as_mut() {
             f.flush();
         }
     }
@@ -710,6 +736,12 @@ impl Bus {
                 return Ok(());
             }
         }
+        if let Some(f) = self.rot_flash.as_mut() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                f.load_image_at(addr, bytes);
+                return Ok(());
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, bytes.len() as u32) {
             r.data[off..off + bytes.len()].copy_from_slice(bytes);
             Ok(())
@@ -735,6 +767,17 @@ impl Bus {
             if let Some(f) = self.flash.as_ref() {
                 self.mmio_hit = true;
                 return f.reg_read((addr & !3) - FLASH_REG_LO);
+            }
+        }
+        // LPC55 RoT flash window (XIP) + controller registers. `Some` only on the
+        // RoT core, so the Option check short-circuits on the SP core.
+        if let Some(f) = self.rot_flash.as_ref() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                return f.read_mem32(addr);
+            }
+            if (ROT_FLASH_REG_LO..ROT_FLASH_REG_HI).contains(&addr) {
+                self.mmio_hit = true;
+                return f.reg_read((addr & !3) - ROT_FLASH_REG_LO);
             }
         }
         if (NVIC_LO..NVIC_HI).contains(&addr) {
@@ -782,6 +825,11 @@ impl Bus {
                 return f.read_mem16(addr);
             }
         }
+        if let Some(f) = self.rot_flash.as_ref() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                return f.read_mem16(addr);
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, 2) {
             u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap())
         } else {
@@ -792,6 +840,11 @@ impl Bus {
     pub fn read8(&mut self, addr: u32) -> u8 {
         if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
             if let Some(f) = self.flash.as_ref() {
+                return f.read_mem8(addr);
+            }
+        }
+        if let Some(f) = self.rot_flash.as_ref() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
                 return f.read_mem8(addr);
             }
         }
@@ -822,6 +875,19 @@ impl Bus {
             if let Some(f) = self.flash.as_mut() {
                 self.mmio_hit = true;
                 f.reg_write((addr & !3) - FLASH_REG_LO, val);
+                return;
+            }
+        }
+        // LPC55 RoT flash: a store into the window is ignored (flash is written
+        // only via the command engine); the register block drives that engine.
+        if let Some(f) = self.rot_flash.as_mut() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                f.write_mem(addr, val, 4);
+                return;
+            }
+            if (ROT_FLASH_REG_LO..ROT_FLASH_REG_HI).contains(&addr) {
+                self.mmio_hit = true;
+                f.reg_write((addr & !3) - ROT_FLASH_REG_LO, val);
                 return;
             }
         }

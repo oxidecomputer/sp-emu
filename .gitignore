@@ -1,15 +1,2 @@
-# Build artifacts
+# Rust build output.
 /target
-
-# Flash images (regenerable via `sp-emu flash a <image.zip>`)
-*.bin
-
-# Logs / scratch
-*.log
-
-# Prebuilt faux-mgs binary (version-matched, rebuilt per gateway-messages rev)
-demo/faux-mgs
-
-# Editor / harness state
-.claude/
-old/
