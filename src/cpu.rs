@@ -81,6 +81,11 @@ pub struct Cpu {
     pub halted: bool,       // external debug halt (DHCSR C_HALT via the SWD debug port)
     pub debug_en: bool,     // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
     pub bkpt_hit: bool,     // last halt was a BKPT instruction (reported as DFSR.BKPT)
+    // Boot-ROM API emulation (RoT core, config::rot_rom). When `rom_traps` is set,
+    // a branch into the boot-ROM trap window is serviced by `crate::romapi`;
+    // `rom_call` carries an in-flight call's resumable state across steps/interrupts.
+    pub rom_traps: bool,
+    pub rom_call: crate::romapi::RomCall,
     pub trace_svc: bool,    // log Hubris syscalls (Sysnum in r11) at each SVC — RoT IPC tracing
     pub last_disasm: String,
     decoder: InstDecoder,
@@ -193,6 +198,8 @@ impl Cpu {
             halted: false,
             debug_en: false,
             bkpt_hit: false,
+            rom_traps: false,
+            rom_call: crate::romapi::RomCall::Idle,
             trace_svc: false,
             last_disasm: String::new(),
             decoder: InstDecoder::default_thumb(),
@@ -383,6 +390,18 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus, host: &mut dyn HostIo) -> Result<(), Trap> {
         let pc = self.pc;
+        // Boot-ROM API trap (RoT core, config::rot_rom): the guest branched into
+        // the synthesized boot-ROM window. Service it in host code; the call may
+        // park here for several steps so the run loop's per-instruction tick and
+        // interrupt delivery keep running between them (interrupt-safety).
+        if self.rom_traps && crate::romapi::is_trap(pc) {
+            self.cur_insn = pc;
+            bus.cur_pc = pc;
+            bus.cur_cyc = self.cycles;
+            self.cycles += 1;
+            crate::romapi::rom_dispatch(self, bus);
+            return Ok(());
+        }
         self.cur_insn = pc;
         bus.cur_pc = pc;
         bus.cur_cyc = self.cycles;

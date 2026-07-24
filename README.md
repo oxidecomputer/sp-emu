@@ -182,11 +182,19 @@ The ones you reach for most:
   link, so it can run the endoscope attestation measurement (see `demo/run-sp-measure.sh`).
 - `SP_EMU_ROT_NVM`: path to the RoT flash backing file (default `sp-rot-flash.bin`),
   the RoT analog of `SP_EMU_FLASH`. A persisted file takes precedence over the image
-  passed on the command line, so delete it to reseed; give each instance its own.
+  passed on the command line, so delete it to reseed (or set `SP_EMU_ROT_FRESH`); give
+  each instance its own. A persisted file that would shadow the protected-flash
+  overrides below warns rather than silently ignoring them.
 - `SP_EMU_SWD_TRIGGER`: fire one synthetic SP-reset measurement request after boot, so the
   in-process RoT measures the SP even when the SP image does not gate its boot on the token.
 - `SP_EMU_ROT_MEASURE`: let the SP self-reset until measured (drop the pre-seeded SKIP token)
   rather than short-circuiting the RFD 568 handoff.
+- `SP_EMU_ROT_ROM`: emulate the LPC55 boot-ROM signature API (`skboot_authenticate`), so
+  the RoT pre-kernel's image authentication runs the real secure-boot check -- the cert
+  chain to the CMPA RKTH, via the host verifier (`lpc55_sign`) -- instead of being skipped.
+  Off by default.
+- `SP_EMU_ROT_FRESH`: ignore any persisted RoT flash and re-seed it from scratch this run,
+  so there is no doubt about whether persistent state is in use.
 - `SP_EMU_HOST_UART`: socket for the host-to-SP comms UART (IPCC).
 - `SP_EMU_NO_DEBUG`: suppress the humility debug listeners.
 - `SP_EMU_I2C_BRIDGE` / `SP_EMU_I2C_DEVICE`: socket for the I2C sniff and delegate bridges.
@@ -195,9 +203,16 @@ The ones you reach for most:
 - `SP_EMU_SEED`: same as the `--seed` flag below.
 
 There are also `SP_EMU_*DBG` switches (`SP_EMU_SPROTDBG`, `SP_EMU_ETHDBG`,
-`SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, and so on) that turn on per-subsystem
-tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock, erase, program,
-and the option-byte bank swap.
+`SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, `SP_EMU_ROMDBG`, and so on) that turn on
+per-subsystem tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock,
+erase, program, and the option-byte bank swap; `SP_EMU_ROMDBG` traces boot-ROM
+API calls (each `skboot_authenticate` and its verdict).
+
+Running the real bootleby bootloader for genuine A/B image selection is a work in
+progress: `SP_EMU_ROT_BOOTLEBY=<image>` loads bootleby at the flash base and boots
+it (with `SP_EMU_ROT_CMPA` / `SP_EMU_ROT_CFPA` supplying the real device
+protected-flash pages its validation requires). It boots and verifies an image via
+the boot-ROM shim, but does not yet complete the full boot.
 
 ## Configuration
 

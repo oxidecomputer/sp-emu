@@ -135,6 +135,13 @@ config! {
     },
 
     // ---- behavior toggles (presence = on) ----
+    // Emulate the LPC55 boot-ROM signature API (skboot_authenticate) so the RoT
+    // pre-kernel's authenticate_image() runs for real. Off by default: keeps the
+    // fast direct-boot path unchanged (spemu-z89).
+    rot_rom: bool = "SP_EMU_ROT_ROM" => |v| v.is_some(),
+    // Ignore any persisted RoT flash and re-seed from scratch this run (removes doubt
+    // about whether persistent state is in use). Default off = backward compatible.
+    rot_fresh: bool = "SP_EMU_ROT_FRESH" => |v| v.is_some(),
     rot_measure: bool = "SP_EMU_ROT_MEASURE" => |v| v.is_some(),
     well_known_ports: bool = "SP_EMU_WELL_KNOWN_PORTS" => |v| v.is_some(),
     no_debug: bool = "SP_EMU_NO_DEBUG" => |v| v.is_some(),
@@ -166,6 +173,7 @@ config! {
     svcdbg: bool = "SP_EMU_SVCDBG" => |v| v.is_some(),
     excdbg: bool = "SP_EMU_EXCDBG" => |v| v.is_some(),
     sprotdbg: bool = "SP_EMU_SPROTDBG" => |v| v.is_some(),
+    romdbg: bool = "SP_EMU_ROMDBG" => |v| v.is_some(), // boot-ROM API calls (skboot)
     // print the full resolved config table to stderr
     configdbg: bool = "SP_EMU_CONFIGDBG" => |v| v.is_some(),
 
@@ -174,6 +182,13 @@ config! {
     // addr; empty treated as unset
     rot_service: Option<String> = "SP_EMU_ROT_SERVICE" => |v| v.filter(|s| !s.is_empty()),
     rot_flash: Option<String> = "SP_EMU_ROT_FLASH" => |v| v,
+    // Path to a real bootleby image: load it at flash base 0x0 and boot IT (secure
+    // aliases + boot-ROM API on), so bootleby does genuine A/B selection (spemu-kx3).
+    rot_bootleby: Option<String> = "SP_EMU_ROT_BOOTLEBY" => |v| v,
+    // Real device CMPA/CFPA pages (512 bytes each) to seed instead of the synthesized
+    // ones, so real bootleby's PFR validation passes (spemu-kx3).
+    rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
+    rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
     rot_dice: Option<String> = "SP_EMU_ROT_DICE" => |v| v,
     archive: Option<String> = "SP_EMU_ARCHIVE" => |v| v,
     diff: Option<String> = "SP_EMU_DIFF" => |v| v,

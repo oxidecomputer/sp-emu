@@ -24,12 +24,14 @@ mod debugport;
 mod flash;
 mod gdb;
 mod glasgow;
+mod hashcrypt;
 mod host;
 mod identity;
 mod i2c_bridge;
 mod lpc55;
 mod mem;
 mod puf;
+mod romapi;
 mod rot_flash;
 mod rot_service;
 mod rotswd;
@@ -429,7 +431,7 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // The RoT flash model owns the 0x0 window and the 0x4003_4000 controller: it
     // seeds slot A from `image` plus the protected flash region (CMPA/CFPA/NMPA),
     // backed by a persistent file, and gives real erase/program/blank-check.
-    bus.install_rot_flash(rot_flash::RotFlash::new(&rot_flash::nvm_path(), image));
+    bus.install_rot_flash(rot_flash::RotFlash::new(&rot_flash::nvm_path(), image)?);
     publish_rot_bootstate(&mut bus, image);
     publish_dice_handoff(&mut bus);
     let initial_sp = bus.read32(base);
@@ -444,10 +446,46 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
     cpu.wfi_throttle = true;
+    // Boot-ROM API emulation (SP_EMU_ROT_ROM): install the synthesized ROM pointer
+    // graph and trap `skboot_authenticate` so the RoT pre-kernel's
+    // authenticate_image() runs the real signature check (spemu-z89). Off by
+    // default -- the direct-boot path above is unchanged.
+    if config::get().rot_rom {
+        cpu.rom_traps = true;
+        bus.rom_enabled = true;
+        eprintln!("[rot] boot-ROM API emulation enabled (skboot_authenticate)");
+    }
+    // Bootleby mode (SP_EMU_ROT_BOOTLEBY): load real bootleby at the flash base and
+    // boot IT instead of jumping to the image; bootleby does genuine A/B selection
+    // via the boot-ROM skboot_authenticate shim. It links at the TrustZone secure
+    // aliases (flash 0x1000_0000, SRAM 0x3000_0000), so fold those onto the modeled
+    // non-secure memory, and turn on the boot-ROM API it calls. (spemu-kx3)
+    if let Some(path) = config::get().rot_bootleby.clone() {
+        let bl = flash::load_image(&path)?;
+        bus.load_rot_bootleby(&bl);
+        bus.secure_alias = true;
+        cpu.rom_traps = true;
+        bus.rom_enabled = true;
+        let sp = bus.read32(0); // bootleby vector table at flash base
+        let pc = bus.read32(4) & !1;
+        eprintln!(
+            "[rot] bootleby: {} bytes @ 0x0; SP={:#010x} PC={:#010x} (secure-alias + boot-ROM on)",
+            bl.len(),
+            sp,
+            pc
+        );
+        cpu.reset(sp, pc);
+        // bootleby executes from the secure flash alias (the non-secure flash base
+        // OR'd with the secure-alias bit).
+        let secure_base = mem::LPC55_SECURE_ALIAS_BIT | rot_flash::BASE;
+        cpu.set_flash_cache(secure_base..(secure_base + bl.len() as u32));
+        bus.write32(mem::SCB_VTOR, rot_flash::BASE); // VTOR at the flash base
+        return Ok((cpu, bus));
+    }
     // The RoT executes in place from its LPC55 image (immutable XIP flash) at
     // 0x0001_0000, outside the SP's default cache window, so cache decodes there.
     cpu.set_flash_cache(base..(base + image.len() as u32));
-    bus.write32(0xE000_ED08, base);
+    bus.write32(mem::SCB_VTOR, base);
     Ok((cpu, bus))
 }
 
