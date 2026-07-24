@@ -128,6 +128,24 @@ fn seed_cfpa() -> [u8; PAGE] {
     page
 }
 
+/// Load a real 512-byte CMPA/CFPA page from an override file (SP_EMU_ROT_CMPA/CFPA),
+/// used to run real bootleby whose PFR validation is stricter than our synthesized
+/// pages. Fails loudly on an unreadable file or a wrong-sized page.
+fn load_page_override(path: &Option<String>) -> Result<Option<[u8; PAGE]>> {
+    let Some(path) = path.as_deref() else {
+        return Ok(None);
+    };
+    let bytes =
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("rot CMPA/CFPA override {path}: {e}"))?;
+    let page: [u8; PAGE] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "rot CMPA/CFPA override {path}: {} bytes, need {PAGE}",
+            bytes.len()
+        )
+    })?;
+    Ok(Some(page))
+}
+
 pub struct RotFlash {
     mem: Vec<u8>,
     /// Packed per-page erased bitset (bit set = page never programmed). A read of
@@ -151,8 +169,9 @@ fn bitset_path(path: &str) -> String {
 impl RotFlash {
     /// Build the model: load a persisted image + bitset if present, else seed a
     /// fresh device from `image` (into slot A) plus the protected flash region.
-    pub fn new(path: &str, image: &[u8]) -> RotFlash {
-        let dbg = crate::config::get().rotflashdbg;
+    /// `SP_EMU_ROT_FRESH` forces the seed path, ignoring any persisted state.
+    pub fn new(path: &str, image: &[u8]) -> Result<RotFlash> {
+        let cfg = crate::config::get();
         let mut f = RotFlash {
             mem: vec![ERASED; SIZE],
             erased: vec![0xFF; NPAGES / 8], // every page erased to start
@@ -163,17 +182,26 @@ impl RotFlash {
             status: 0,
             file: None,
             path: path.to_string(),
-            dbg,
+            dbg: cfg.rotflashdbg,
         };
 
-        // A persisted image takes precedence over `image`, so say which path was
-        // taken: a stale backing file silently shadowing a freshly passed image is
-        // otherwise a confusing surprise.
-        let bin_exists = Path::new(path).exists();
-        if bin_exists {
+        // Persisted state takes precedence over `image` and the CMPA/CFPA/bootleby
+        // overrides, so be explicit about which path was taken -- a stale backing
+        // file silently shadowing them is otherwise a confusing surprise. Setting
+        // SP_EMU_ROT_FRESH removes all doubt by forcing a re-seed.
+        let persisted = Path::new(path).exists();
+        let use_persisted = persisted && !cfg.rot_fresh;
+        if use_persisted {
             eprintln!(
                 "[rotflash] loaded persisted RoT flash from {path} (ignoring the passed image)"
             );
+            // Warn loudly if provisioning overrides are being shadowed by the file.
+            if cfg.rot_cmpa.is_some() || cfg.rot_cfpa.is_some() || cfg.rot_bootleby.is_some() {
+                eprintln!(
+                    "[rotflash] WARNING: persisted {path} shadows SP_EMU_ROT_CMPA/CFPA/BOOTLEBY \
+                     (ignored). Set SP_EMU_ROT_FRESH=1 or delete the file to apply them."
+                );
+            }
             if let Ok(data) = std::fs::read(path) {
                 let n = data.len().min(SIZE);
                 f.mem[..n].copy_from_slice(&data[..n]);
@@ -183,10 +211,13 @@ impl RotFlash {
                 f.erased[..n].copy_from_slice(&bits[..n]);
             }
         } else {
+            if persisted {
+                eprintln!("[rotflash] SP_EMU_ROT_FRESH: ignoring persisted {path}, re-seeding");
+            }
             eprintln!(
                 "[rotflash] seeded fresh RoT flash (slot A image + CMPA/CFPA/NMPA) to {path}"
             );
-            f.seed_fresh(image);
+            f.seed_fresh(image)?;
         }
 
         // Open the backing file read-write for write-through and seed it.
@@ -198,24 +229,28 @@ impl RotFlash {
             .open(path)
             .map_err(|e| eprintln!("[rotflash] open {path} failed: {e}"))
             .ok();
-        if !bin_exists {
+        if !use_persisted {
             f.persist_all();
         }
-        f
+        Ok(f)
     }
 
     /// Seed a fresh device: the firmware image into slot A, and the protected
     /// flash region (CMPA / CFPA ping+pong / NMPA) from the captured pages. Each
     /// seeded page is marked programmed so its reads do not fault.
-    fn seed_fresh(&mut self, image: &[u8]) {
+    fn seed_fresh(&mut self, image: &[u8]) -> Result<()> {
         self.write_pages(IMAGE_A_BASE as usize, image);
-        self.write_pages(CMPA, &seed_cmpa());
-        let cfpa = seed_cfpa();
+        // Real device CMPA/CFPA pages if provided (SP_EMU_ROT_CMPA/CFPA, for running
+        // real bootleby), else the synthesized pages.
+        let cmpa = load_page_override(&crate::config::get().rot_cmpa)?.unwrap_or_else(seed_cmpa);
+        self.write_pages(CMPA, &cmpa);
+        let cfpa = load_page_override(&crate::config::get().rot_cfpa)?.unwrap_or_else(seed_cfpa);
         self.write_pages(CFPA_PING, &cfpa);
         self.write_pages(CFPA_PONG, &cfpa);
         // NMPA: a placeholder programmed page so a read does not fault; the real
         // device UUID lives here (spemu-f27.3). CFPA scratch is left erased.
         self.write_pages(NMPA, &[0u8; PAGE]);
+        Ok(())
     }
 
     /// Copy `bytes` to `off` and mark every touched 512-byte page programmed.
@@ -378,9 +413,15 @@ impl RotFlash {
             if base + WORD > self.mem.len() {
                 break;
             }
-            if self.mem[base..base + WORD].iter().any(|&b| b != ERASED) {
+            // "Blank" reflects a page's programmed state, not its byte content: on
+            // real flash a programmed word carries ECC, so a page written with 0xFF
+            // data still reads as *not* blank. (A pure content check wrongly calls a
+            // programmed-but-0xFF page blank -- e.g. a firmware image with a 0xFF run,
+            // which broke bootleby's per-page is_programmed scan.) sp-emu tracks
+            // programmed-ness per page in the erased bitset.
+            if !self.is_erased(base / PAGE) {
                 self.dataw[0] = w;
-                self.status |= ST_DONE | ST_FAIL;
+                self.status |= ST_DONE | ST_FAIL; // not blank -> FAIL (== success, per UM)
                 return;
             }
             w = w.wrapping_add(1);
@@ -423,6 +464,25 @@ impl RotFlash {
         } else {
             CFPA_PONG
         }
+    }
+
+    /// The 512-byte CMPA page, for the boot-ROM signature verifier (spemu-z89).
+    pub fn cmpa_bytes(&self) -> [u8; PAGE] {
+        self.mem[CMPA..CMPA + PAGE].try_into().unwrap()
+    }
+
+    /// The active CFPA page (higher ping/pong version) as 512 bytes.
+    pub fn active_cfpa_bytes(&self) -> [u8; PAGE] {
+        let a = self.active_cfpa();
+        self.mem[a..a + PAGE].try_into().unwrap()
+    }
+
+    /// Borrow up to `len` bytes of flash starting at `addr` (bounded to the window),
+    /// so the ROM shim can hand a slot image to the verifier without copying.
+    pub fn slice(&self, addr: u32, len: usize) -> &[u8] {
+        let o = (addr as usize).min(self.mem.len());
+        let end = o.saturating_add(len).min(self.mem.len());
+        &self.mem[o..end]
     }
 
     /// The PERSISTENT boot-preferred slot from the active CFPA (bit0 of the Oxide
@@ -513,7 +573,7 @@ mod tests {
         let mut img = vec![0u8; PAGE];
         img[0..4].copy_from_slice(&0x2004_0000u32.to_le_bytes()); // SP into RAM
         img[4..8].copy_from_slice(&(IMAGE_A_BASE + 0x181).to_le_bytes()); // reset PC
-        RotFlash::new(&path, &img)
+        RotFlash::new(&path, &img).unwrap()
     }
 
     fn cleanup(f: &RotFlash) {
@@ -679,7 +739,7 @@ mod tests {
         f.flush();
 
         let path = f.path.clone();
-        let f2 = RotFlash::new(&path, &[]);
+        let f2 = RotFlash::new(&path, &[]).unwrap();
         assert_eq!(
             f2.read_mem32(addr as u32),
             0xAABB_0000,

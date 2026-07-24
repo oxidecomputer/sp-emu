@@ -94,10 +94,27 @@ pub struct Bus {
     /// tracking, CMPA/CFPA/NMPA). `Some` only on the RoT core, where it owns both
     /// the flash memory window (0x0..0x100000) and the controller registers.
     rot_flash: Option<crate::rot_flash::RotFlash>,
+    /// Boot-ROM API emulation installed (RoT core, `config::rot_rom`): synthesize
+    /// the ROM pointer-graph words on read. See `crate::romapi`.
+    pub rom_enabled: bool,
+    /// Fold the LPC55 TrustZone secure aliases (flash 0x1000_0000, SRAM 0x3000_0000)
+    /// onto their non-secure images, so real bootleby -- which links at the secure
+    /// aliases -- reaches the same RotFlash + RAM. RoT (bootleby) core only; the
+    /// STM32 SP uses 0x3000_0000 as a distinct SRAM, so this stays off there.
+    pub secure_alias: bool,
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
+pub const SCB_VTOR: u32 = 0xE000_ED08;
 const SCB_AIRCR: u32 = 0xE000_ED0C;
+
+// LPC55 TrustZone address aliases (UM11126 §2.4.1, "Memory map"). The CODE (flash)
+// and SRAM regions are each visible at a non-secure base and a secure alias equal to
+// the non-secure address OR'd with the IDAU secure-alias bit (bit 28). bootleby links
+// at the secure aliases; `Bus::fold` maps them onto the modeled non-secure memory.
+pub const LPC55_SECURE_ALIAS_BIT: u32 = 0x1000_0000;
+const LPC55_SRAM_BASE: u32 = 0x2000_0000; // non-secure main SRAM (SRAMX/SRAM0..)
+const LPC55_SRAM_SIZE: u32 = 0x0008_0000; // main SRAM window folded (covers the RoT's use)
 
 // STM32H7 embedded flash: the XIP memory aperture (both 1 MB banks) and the
 // FLASH controller register block. Routed to the Bus-owned `flash` model.
@@ -205,6 +222,33 @@ impl Bus {
             reset_pending: false,
             flash: None,
             rot_flash: None,
+            rom_enabled: false,
+            secure_alias: false,
+        }
+    }
+
+    /// The RoT flash model, if this is the RoT core (used by `crate::romapi`).
+    pub fn rot_flash(&self) -> Option<&crate::rot_flash::RotFlash> {
+        self.rot_flash.as_ref()
+    }
+
+    /// Fold a secure-alias address onto its non-secure image when secure aliasing is
+    /// on (bootleby): the CODE (flash) and SRAM secure aliases map onto the modeled
+    /// non-secure `RotFlash` and RAM. Secure == non-secure | `LPC55_SECURE_ALIAS_BIT`.
+    #[inline]
+    fn fold(&self, addr: u32) -> u32 {
+        // On the hot path (every fetch/load/store); do the least work when off.
+        if !self.secure_alias {
+            return addr;
+        }
+        let flash_secure =
+            LPC55_SECURE_ALIAS_BIT..(LPC55_SECURE_ALIAS_BIT | crate::rot_flash::SIZE as u32);
+        let sram_secure = (LPC55_SECURE_ALIAS_BIT | LPC55_SRAM_BASE)
+            ..(LPC55_SECURE_ALIAS_BIT | (LPC55_SRAM_BASE + LPC55_SRAM_SIZE));
+        if flash_secure.contains(&addr) || sram_secure.contains(&addr) {
+            addr & !LPC55_SECURE_ALIAS_BIT
+        } else {
+            addr
         }
     }
 
@@ -234,6 +278,14 @@ impl Bus {
     /// `add_ram` window and the read-only `LpcFlash` stub.
     pub fn install_rot_flash(&mut self, flash: crate::rot_flash::RotFlash) {
         self.rot_flash = Some(flash);
+    }
+
+    /// Load a bootleby image at the RoT flash base (0x0), so the core boots bootleby
+    /// rather than jumping straight to a slot image (spemu-kx3).
+    pub fn load_rot_bootleby(&mut self, bytes: &[u8]) {
+        if let Some(f) = self.rot_flash.as_mut() {
+            f.load_image_at(0, bytes);
+        }
     }
 
     /// Persist RoT flash contents to the backing file (called on clean exit).
@@ -753,6 +805,7 @@ impl Bus {
     }
 
     pub fn read32(&mut self, addr: u32) -> u32 {
+        let addr = self.fold(addr);
         // Flash aperture (XIP): the hottest path — instruction fetch and constant
         // loads — so it is checked first. A range test + one XOR (bank remap) +
         // slice read, no device dispatch.
@@ -776,6 +829,13 @@ impl Bus {
             if (ROT_FLASH_REG_LO..ROT_FLASH_REG_HI).contains(&addr) {
                 self.mmio_hit = true;
                 return f.reg_read((addr & !3) - ROT_FLASH_REG_LO);
+            }
+        }
+        // Boot-ROM pointer graph (RoT core, config::rot_rom): synthesize the words
+        // the guest loads to reach `skboot_authenticate`. See `crate::romapi`.
+        if self.rom_enabled {
+            if let Some(v) = crate::romapi::rom_read32(addr & !3) {
+                return v;
             }
         }
         if (NVIC_LO..NVIC_HI).contains(&addr) {
@@ -817,6 +877,7 @@ impl Bus {
     }
 
     pub fn read16(&mut self, addr: u32) -> u16 {
+        let addr = self.fold(addr);
         // Flash aperture fast path (instruction fetch reads halfwords).
         if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
             if let Some(f) = self.flash.as_ref() {
@@ -836,6 +897,7 @@ impl Bus {
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
+        let addr = self.fold(addr);
         if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
             if let Some(f) = self.flash.as_ref() {
                 return f.read_mem8(addr);
@@ -854,6 +916,7 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32) {
+        let addr = self.fold(addr);
         if let Some(w) = self.watch {
             if addr == w {
                 eprintln!(
@@ -950,6 +1013,7 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
+        let addr = self.fold(addr);
         if self.rec && self.ram_for(addr, 2).is_some() {
             self.writes.push((addr, val as u32, 2));
         }
@@ -963,6 +1027,7 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8) {
+        let addr = self.fold(addr);
         if self.rec && self.ram_for(addr, 1).is_some() {
             self.writes.push((addr, val as u32, 1));
         }
@@ -979,6 +1044,27 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_alias_fold() {
+        let mut bus = Bus::new();
+        // Off by default: nothing folds.
+        assert_eq!(bus.fold(0x1001_0000), 0x1001_0000);
+        assert_eq!(bus.fold(0x3000_4000), 0x3000_4000);
+
+        bus.secure_alias = true;
+        // Secure flash/SRAM aliases fold onto their non-secure images.
+        assert_eq!(bus.fold(0x1001_0000), 0x0001_0000); // slot A
+        assert_eq!(bus.fold(0x1000_0000), 0x0000_0000); // flash window start
+        assert_eq!(bus.fold(0x3000_4000), 0x2000_4000); // RAM (bootleby stack/bss)
+        assert_eq!(bus.fold(0x3007_ffff), 0x2007_ffff); // top of the SRAM window
+        // Just past each window: untouched (boundary check).
+        assert_eq!(bus.fold(0x1010_0000), 0x1010_0000);
+        assert_eq!(bus.fold(0x3008_0000), 0x3008_0000);
+        // Unrelated addresses (peripherals, the ROM table) are never folded.
+        assert_eq!(bus.fold(0x4003_4000), 0x4003_4000);
+        assert_eq!(bus.fold(0x1300_10f0), 0x1300_10f0);
+    }
 
     // Stands in for soc's RegFile catch-all (store/return over the whole
     // peripheral space). TIM5 must be served by the Bus interception, not this

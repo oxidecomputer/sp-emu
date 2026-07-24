@@ -101,8 +101,17 @@ pub fn install_peripherals(bus: &mut Bus) {
     // image generates its own cert handoff (get-certs works). Added before the
     // catch-alls so it owns 0x4003_Bxxx.
     bus.add_device(0x4003_B000, 0x1000, Box::new(crate::puf::Puf::new()));
+    // HASHCRYPT SHA-256 engine (0x400A_4000): real bootleby drives it to fold the
+    // selected image's measurement into the DICE CDI (sha256::update_cdi). Added
+    // before the catch-alls so it owns 0x400A_4xxx rather than reading back 0 from
+    // the RegFile -- which would spin bootleby forever on STATUS.DIGEST. (spemu-kx3)
+    bus.add_device(
+        0x400A_4000,
+        0x1000,
+        Box::new(crate::hashcrypt::HashCrypt::new()),
+    );
     // Permissive catch-all for the rest of the peripheral block (SYSCON, IOCON,
-    // GPIO, FLEXCOMM, HASHCRYPT...), split around the flash controller window.
+    // GPIO, FLEXCOMM, ...), split around the flash controller window.
     bus.add_device(
         0x4000_0000,
         0x0003_4000,
