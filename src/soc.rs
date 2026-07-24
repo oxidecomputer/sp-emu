@@ -80,10 +80,7 @@ pub fn install_peripherals(bus: &mut Bus) {
     // VSC7448 management switch, net's KSZ8463 is on SPI3 (0x4000_3C00), and the
     // mainboard ECP5 (drv-fpga-server) is on SPI5 (0x4001_5000). The sidecar
     // devices are only installed for that board so they don't shadow gimlet's map.
-    if std::env::var("SP_EMU_BOARD")
-        .map(|b| b == "sidecar")
-        .unwrap_or(false)
-    {
+    if crate::config::get().board.is_sidecar() {
         bus.add_device(0x4000_3800, 0x400, Box::new(Vsc7448::new())); // monorail ⇄ VSC7448
         bus.add_device(0x4000_3C00, 0x400, Box::new(Spi4::new())); // net ⇄ KSZ8463 (reuse KSZ model)
         bus.add_device(0x4001_5000, 0x400, Box::new(Spi5::new(spi5_cs)));
@@ -249,7 +246,7 @@ impl Uart7 {
             regs: std::collections::HashMap::new(),
             tx,
             rx,
-            dbg: std::env::var("SP_EMU_UARTDBG").is_ok(),
+            dbg: crate::config::get().uartdbg,
         }
     }
 }
@@ -480,7 +477,7 @@ impl Vsc7448 {
             waddr: 0,
             rval: 0,
             wval: 0,
-            vscdbg: std::env::var("SP_EMU_VSCDBG").is_ok(),
+            vscdbg: crate::config::get().vscdbg,
         }
     }
     fn vsc_read(&self, waddr: u32) -> u32 {
@@ -858,8 +855,7 @@ fn seed_ignition(fpga: &mut std::collections::HashMap<u16, u8>) {
     const PORT_STRIDE: u16 = 0x100;
     const NUM_PORTS: u8 = 35;
 
-    let spec = std::env::var("SP_EMU_IGNITION")
-        .unwrap_or_else(|_| "0:gimlet,1:sidecar,2:gimlet,3:gimlet".to_string());
+    let spec = crate::config::get().ignition.clone();
 
     fpga.insert(CONTROLLERS_COUNT, NUM_PORTS);
 
@@ -1107,9 +1103,7 @@ pub struct GpioBank {
 impl GpioBank {
     pub fn new(cs: Spi2Cs, spi5_cs: Spi5Cs) -> Self {
         // $SP_EMU_BOARD selects the board profile for synthesized input pins.
-        let sidecar = std::env::var("SP_EMU_BOARD")
-            .map(|b| b == "sidecar")
-            .unwrap_or(false);
+        let sidecar = crate::config::get().board.is_sidecar();
         GpioBank {
             regs: std::collections::HashMap::new(),
             cs,
@@ -1258,12 +1252,9 @@ pub struct SensorEnv {
 pub type Sensors = Rc<RefCell<SensorEnv>>;
 impl SensorEnv {
     pub fn from_env() -> Sensors {
-        let default_temp_c = std::env::var("SP_EMU_AMBIENT_C")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(30.0);
+        let default_temp_c = crate::config::get().ambient_c;
         let mut temp_override = std::collections::HashMap::new();
-        if let Ok(s) = std::env::var("SP_EMU_SENSORS") {
+        if let Some(s) = crate::config::get().sensors.clone() {
             for kv in s.split(',') {
                 if let Some((a, v)) = kv.split_once('=') {
                     let a = a.trim().trim_start_matches("0x");
@@ -1444,16 +1435,15 @@ impl Mmio for Rng {
 
 fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     let mut img = vec![0xFFu8; 1024];
-    let sidecar = std::env::var("SP_EMU_BOARD")
-        .map(|b| b == "sidecar")
-        .unwrap_or(false);
+    let sidecar = crate::config::get().board.is_sidecar();
     // Per-instance index from the bridge port (33300->0, 33310->1, ...) so the
     // emulated gimlet SPs get distinct serials and MACs. Inventory keys SPs on
     // serial, and a shared MAC (the old blank-VPD gimlet default) caused L2
     // collisions => intermittent "no answer" on the management net.
-    let idx: u8 = std::env::var("SP_EMU_BRIDGE")
-        .ok()
-        .and_then(|b| b.rsplit(':').next().map(str::to_string))
+    let idx: u8 = crate::config::get()
+        .bridge
+        .as_deref()
+        .and_then(|b| b.rsplit(':').next())
         .and_then(|p| p.parse::<u32>().ok())
         .map(|p| ((p.wrapping_sub(33300)) / 10) as u8)
         .unwrap_or(0);

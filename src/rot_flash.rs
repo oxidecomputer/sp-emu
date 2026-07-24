@@ -152,7 +152,7 @@ impl RotFlash {
     /// Build the model: load a persisted image + bitset if present, else seed a
     /// fresh device from `image` (into slot A) plus the protected flash region.
     pub fn new(path: &str, image: &[u8]) -> RotFlash {
-        let dbg = std::env::var("SP_EMU_ROTFLASHDBG").is_ok();
+        let dbg = crate::config::get().rotflashdbg;
         let mut f = RotFlash {
             mem: vec![ERASED; SIZE],
             erased: vec![0xFF; NPAGES / 8], // every page erased to start
@@ -483,7 +483,7 @@ impl RotFlash {
 
 /// Default backing-file path for the RoT flash, `$SP_EMU_ROT_NVM` or a default.
 pub fn nvm_path() -> String {
-    std::env::var("SP_EMU_ROT_NVM").unwrap_or_else(|_| "sp-rot-flash.bin".to_string())
+    crate::config::get().rot_nvm_path.clone()
 }
 
 pub fn load_image(path: &str) -> Result<Vec<u8>> {

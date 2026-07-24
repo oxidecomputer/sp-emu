@@ -179,9 +179,7 @@ impl Default for Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        let watch = std::env::var("SP_EMU_WATCH")
-            .ok()
-            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        let watch = crate::config::get().watch;
         Bus {
             rams: Vec::new(),
             devs: Vec::new(),
