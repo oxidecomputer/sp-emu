@@ -189,6 +189,15 @@ config! {
     // ones, so real bootleby's PFR validation passes (spemu-kx3).
     rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
     rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
+    // A slot-B image (flash.b, 0x50000) to seed alongside slot A, so real bootleby
+    // can perform genuine A/B selection. Absent => slot B left erased/invalid (spemu-kzi).
+    rot_image_b: Option<String> = "SP_EMU_ROT_IMAGE_B" => |v| v,
+    // Leave slot A (flash.a, 0x10000) erased instead of seeding the passed image, to
+    // drive bootleby's B-only and neither(panic) selection cases (spemu-kzi).
+    rot_erase_a: bool = "SP_EMU_ROT_ERASE_A" => |v| v.is_some(),
+    // Persistent CFPA boot preference for the synthesized CFPA: "b" prefers slot B,
+    // otherwise slot A. Ignored when SP_EMU_ROT_CFPA overrides the page (spemu-kzi).
+    rot_boot_pref: Option<String> = "SP_EMU_ROT_BOOT_PREF" => |v| v,
     rot_dice: Option<String> = "SP_EMU_ROT_DICE" => |v| v,
     archive: Option<String> = "SP_EMU_ARCHIVE" => |v| v,
     diff: Option<String> = "SP_EMU_DIFF" => |v| v,
