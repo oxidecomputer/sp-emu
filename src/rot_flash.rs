@@ -40,6 +40,8 @@ pub const ERASED: u8 = 0xFF;
 
 /// RoT Hubris image slot A base (chips/lpc55/memory.toml `flash.a`).
 pub const IMAGE_A_BASE: u32 = 0x0001_0000;
+/// RoT Hubris image slot B base (chips/lpc55/memory.toml `flash.b`).
+pub const IMAGE_B_BASE: u32 = 0x0005_0000;
 
 // Protected flash region page byte-addresses (from the lpc55-pac peripheral
 // bases: FLASH_CFPA0 = 0x9_E000, FLASH_CMPA = 0x9_E400, key store 0x9_E600).
@@ -110,10 +112,10 @@ fn seed_cmpa() -> [u8; PAGE] {
     to_page(cmpa.to_vec().expect("pack CMPA"))
 }
 
-/// CFPA for a fresh device: version counter at 0, boot preference Slot A
-/// (customer_defined0 bit0 = 0, the default), and a valid self-hash recomputed
-/// from the fields.
-fn seed_cfpa() -> [u8; PAGE] {
+/// CFPA for a fresh device: version counter at 0, a persistent boot preference
+/// (customer_defined0 bit0: clear = Slot A, set = Slot B; offset 0x100, matching
+/// bootleby's `boot_flags`), and a valid self-hash recomputed from the fields.
+fn seed_cfpa(pref_b: bool) -> [u8; PAGE] {
     use sha2::{Digest, Sha256};
     let mut cfpa = lpc55_areas::CFPAPage {
         version: 0,
@@ -122,6 +124,9 @@ fn seed_cfpa() -> [u8; PAGE] {
         dcfg_cc_socu_ns_dflt: DCFG_CC_SOCU,
         ..Default::default()
     };
+    if pref_b {
+        cfpa.customer_defined0[0] |= 1;
+    }
     let mut page = to_page(cfpa.to_vec().expect("pack CFPA"));
     let digest = Sha256::digest(&page[..CFPA_HASH_OFF]);
     page[CFPA_HASH_OFF..PAGE].copy_from_slice(&digest);
@@ -239,12 +244,28 @@ impl RotFlash {
     /// flash region (CMPA / CFPA ping+pong / NMPA) from the captured pages. Each
     /// seeded page is marked programmed so its reads do not fault.
     fn seed_fresh(&mut self, image: &[u8]) -> Result<()> {
-        self.write_pages(IMAGE_A_BASE as usize, image);
+        let cfg = crate::config::get();
+        // Slot A: the passed image, unless asked to leave it erased. An erased slot
+        // is bootleby's "empty/invalid", used to drive the B-only / neither cases.
+        if cfg.rot_erase_a {
+            eprintln!("[rotflash] SP_EMU_ROT_ERASE_A: leaving slot A erased");
+        } else {
+            self.write_pages(IMAGE_A_BASE as usize, image);
+        }
+        // Slot B: a second image if provided, so real bootleby can do genuine A/B
+        // selection; absent, slot B stays erased (invalid).
+        if let Some(path) = cfg.rot_image_b.as_deref() {
+            let img_b = crate::flash::load_image(path)?;
+            eprintln!("[rotflash] seeded slot B ({} bytes) from {path}", img_b.len());
+            self.write_pages(IMAGE_B_BASE as usize, &img_b);
+        }
         // Real device CMPA/CFPA pages if provided (SP_EMU_ROT_CMPA/CFPA, for running
-        // real bootleby), else the synthesized pages.
-        let cmpa = load_page_override(&crate::config::get().rot_cmpa)?.unwrap_or_else(seed_cmpa);
+        // real bootleby), else the synthesized pages. The synthesized CFPA's
+        // persistent boot preference follows SP_EMU_ROT_BOOT_PREF.
+        let cmpa = load_page_override(&cfg.rot_cmpa)?.unwrap_or_else(seed_cmpa);
         self.write_pages(CMPA, &cmpa);
-        let cfpa = load_page_override(&crate::config::get().rot_cfpa)?.unwrap_or_else(seed_cfpa);
+        let pref_b = cfg.rot_boot_pref.as_deref() == Some("b");
+        let cfpa = load_page_override(&cfg.rot_cfpa)?.unwrap_or_else(|| seed_cfpa(pref_b));
         self.write_pages(CFPA_PING, &cfpa);
         self.write_pages(CFPA_PONG, &cfpa);
         // NMPA: a placeholder programmed page so a read does not fault; the real
@@ -681,7 +702,7 @@ mod tests {
     #[test]
     fn cfpa_self_hash_is_valid() {
         use sha2::{Digest, Sha256};
-        let p = seed_cfpa();
+        let p = seed_cfpa(false);
         let want = Sha256::digest(&p[..CFPA_HASH_OFF]);
         assert_eq!(
             &p[CFPA_HASH_OFF..PAGE],
@@ -705,7 +726,7 @@ mod tests {
             "CMPA matches the captured device",
         );
         assert_eq!(
-            Sha256::digest(seed_cfpa())[..],
+            Sha256::digest(seed_cfpa(false))[..],
             hex32("dc81d4c0429548776a9db89ffc2221725b04b2ed86c036f35e444270a4c7deb5")[..],
             "CFPA (fresh) matches the generated template",
         );
