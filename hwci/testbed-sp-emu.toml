@@ -1,0 +1,32 @@
+# sp-emu loopback testbed for RoT boot-path tests.
+#
+# Boot sp-emu with its bridge on [::1]:33300 so MGS discovery lands there, an
+# in-process RoT (SP_EMU_ROT_FLASH=<rot image>) reachable over sprot, and the SWD
+# debug port on tcp 127.0.0.1:4444 (swd = 4444 + (bridge - 33300)):
+#
+#   SP_EMU_BRIDGE='[::1]:33300' SP_EMU_ROT_FLASH=<rot image> \
+#     sp-emu gdb a 0
+#
+# `discover` will overwrite the name/board fields below with what it reads.
+
+[testbed]
+interface = "lo"
+discovery_addr = "[::1]:33300"
+simulator = true
+
+[testbed.sp]
+name = "gimlet-c"
+board = "gimlet-c"
+# SWD (Glasgow) debug port, passed verbatim to `humility -p`; gives
+# testbed:probe:sp so probe-gated tests run against sp-emu.
+usb_probe = "20b7:9db1:tcp:127.0.0.1:4444"
+
+# The emulated LPC55S69 RoT, present when sp-emu is started with SP_EMU_ROT_FLASH.
+# Without it, the RoT tests here SKIP (no rot:task:* capabilities).
+[testbed.rot]
+name = "oxide-rot-1"
+board = "oxide-rot-1"
+
+[testbed.stage0]
+name = "oxide-rot-1"
+board = "oxide-rot-1"

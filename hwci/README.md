@@ -1,0 +1,100 @@
+# hwci/
+
+sp-emu's own [`sp-test`](https://github.com/oxidecomputer/sp-test) tests,
+focused on the emulated LPC55S69 RoT boot path (bootleby A/B/panic slot
+selection, transient boot-preference override, and RoT firmware / stage0
+update). It mirrors the layout of `sp-test/hwci/` and is meant to be run as an
+out-of-tree test root:
+
+```
+hwci/
+├── README.md               # this file
+├── testbed-sp-emu.toml     # testbed config pointing sp-test at a running sp-emu
+├── suites/                 # named sets of tests
+│   └── suite-rot-boot.toml
+└── tests/                  # one directory per test
+    └── rot-boot-state/     # read RoT boot state (active slot + FWIDs) over MGS
+        ├── test-info.toml
+        └── check-boot-state.sh
+```
+
+Tests are bash scripts driving `faux-mgs`/`humility` through the sp-test helper
+library (`lib/sp-test.sh`, provided by the sp-test checkout via `SP_TEST_LIB`),
+gated by `required_capabilities` so they SKIP rather than FAIL where they don't
+apply. See `sp-test/hwci/README.md` for the framework walkthrough.
+
+## Running against sp-emu
+
+Start sp-emu in run-forever serve mode with the MGS bridge and an in-process
+RoT, then point sp-test at it with this testbed config and the `--test-root`
+here.
+
+```bash
+# 1. Build sp-emu (RUSTC_BOOTSTRAP=1 is required by the pinned toolchain).
+RUSTC_BOOTSTRAP=1 cargo build --release --bin sp-emu
+
+# 2. Flash a gimlet SP image into sp-emu's SP flash (once).
+SP_EMU_FLASH=./sp-flash.bin ./target/release/sp-emu flash a <gimlet SP archive>
+
+# 3. Run it forever: SP on slot A, RoT reachable over sprot, MGS on [::1]:33300.
+#    `run <slot> 0` is the serve-forever mode; it wires the in-process RoT when
+#    SP_EMU_ROT_FLASH is set and exposes the Glasgow SWD probe (:4444).
+SP_EMU_FLASH=./sp-flash.bin \
+SP_EMU_BRIDGE='[::1]:33300' \
+SP_EMU_ROT_FLASH=<oxide-rot-1 SELF-SIGNED image> \
+SP_EMU_ROT_ROM=1 \
+  ./target/release/sp-emu run a 0 &
+#  wait for: [sp-emu] online   (takes ~30s)
+
+# 4. Run the RoT-boot suite. faux-mgs cannot reach sp-emu over loopback with
+#    --interface/--discovery-addr ("no interface name found for index 0"); the
+#    sp-test-workshop shim rewrites that to --sp-sim-addr. Put it ahead on PATH.
+HWCI=~/Oxide/src/sp-emu/hwci
+SHIM=~/Oxide/src/sp-test-workshop/stages/1-sp-emu/shim
+PATH="$SHIM:$PATH" SP_EMU_SHIM=1 SP_EMU_ATTEMPT_MS=30000 \
+sp-test suite run suite-rot-boot \
+    --testbed   $HWCI/testbed-sp-emu.toml \
+    --archive   <gimlet SP archive> \
+    --rot-archive <oxide-rot-1 self-signed archive> \
+    --test-root $HWCI/tests \
+    -o ~/out/rot-boot
+```
+
+Two RoT-image requirements make the emulated RoT boot to its sprot server:
+
+- **Use the SELF-SIGNED image** (`build-oxide-rot-1-selfsigned-image-*`). It is
+  still Bart secure-boot-signed (so `skboot_authenticate` passes against the
+  default CMPA) but uses the `dice-self` identity path (PUF, no USART). The
+  production `dice-mfg` image wedges in DICE startup polling the unmodeled
+  FLEXCOMM0 manufacturing USART (see `spemu-9oc`).
+- **`SP_EMU_ROT_ROM=1`** is required in serve mode: the RoT pre-kernel's
+  `authenticate_image` reaches the boot-ROM `skboot_authenticate`; without the
+  ROM shim it branches to an unmapped ROM pointer and faults.
+
+`SP_EMU_ROT_FLASH` gives a real emulated RoT so `rot_state` returns real data
+over the SP -> sprot -> RoT relay. To exercise genuine bootleby A/B selection
+(rather than the fabricated boot-state handoff), also set
+`SP_EMU_ROT_BOOTLEBY`/`SP_EMU_ROT_CMPA` (see the sp-emu README) once bootleby
+runs in serve mode.
+
+## Status and roadmap
+
+Real bootleby boots the emulated RoT end-to-end in standalone `sp-emu rot` mode
+(genuine `skboot_authenticate` + CDI measurement via HASHCRYPT + `boot_into`),
+and all four A/B/panic selection outcomes are validated there via slot-seeding
+knobs (`SP_EMU_ROT_IMAGE_B`, `SP_EMU_ROT_ERASE_A`, `SP_EMU_ROT_BOOT_PREF`). The
+sp-test tests here wrap that as MGS-driven regressions:
+
+- `rot-boot-state` — read the RoT active slot + FWIDs over MGS. Passes today
+  end-to-end against sp-emu (sp-test -> faux-mgs shim -> SP -> sprot -> RoT).
+- `rot-ab-selection` (planned) — assert the booted slot for A-only / B-only /
+  both+preference / neither(panic). Needs bootleby running in the two-core
+  serve mode.
+- `rot-transient-override` (planned) — set the transient RAM preference, reset,
+  confirm it boots the transient slot once, then falls back to the persistent
+  slot. Needs serve-mode bootleby + RoT reset re-run.
+- `rot-fw-update` / `rot-stage0-update` (planned) — `builtin:update` against
+  `--rot-archive` / `--rot-bootloader-archive`, then confirm the new slot boots
+  after reset.
+
+See the `spemu-6sw` bead umbrella for the tracked work.
