@@ -1,290 +1,24 @@
-//! Minimal GDB Remote Serial Protocol (RSP) server for humility to attach to
-//! the running emulated SP and inspect it.
+//! Run-forever serve loop for the emulated SP (and, in the two-core setup, an
+//! in-process RoT), plus a debug port for humility.
 //!
-//! humility's GDB core (humility-probes-core/src/gdb.rs) connects to
-//! 127.0.0.1:3333, speaks RSP, and is read-only — it sends `qSupported`,
-//! `m addr,len` (read memory), `p reg` (read register), `c` (continue), and a
-//! raw 0x03 byte (halt). It never writes target state. A server answering
-//! those reads lets `humility tasks` / `dump` / `ringbuf` work against sp-emu.
+//! The debug transport is the Glasgow SWD probe (`crate::glasgow`): a stock
+//! humility (probe-rs) attaches to it via a `20b7:9db1:tcp:127.0.0.1:<port>`
+//! selector, which drives halt/run/step/read/write over an emulated SWD DP/AP.
+//! The older GDB-RSP (`-p ocdgdb`) and OpenOCD (`-p ocd`) transports this module
+//! used to serve were dropped once humility removed those probe backends.
 //!
-//! Ack discipline (matched to humility's `recv`):
-//!  - a data response to a `$..#xx` command is `+` then `$payload#xx`,
-//!  - `c` (continue) is answered with a bare `+`,
-//!  - the 0x03 halt is answered with a stop reply `$S05#xx` (no leading `+`).
+//! Between connections the emulator keeps running, so time advances across a
+//! series of humility commands, and the MGS bridge (`crate::bridge`) stays live
+//! for faux-mgs / sp-test.
 
 use crate::cpu::Cpu;
 use crate::host::HostIo;
 use crate::mem::Bus;
 use anyhow::Result;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 
-/// One message pulled off the wire.
-enum Msg {
-    Interrupt,      // raw 0x03 — halt request
-    Packet(String), // a `$payload#xx` command (payload only)
-}
-
-/// Pull the next complete message out of `buf`, discarding bare `+`/`-` acks and
-/// junk. Returns None if only a partial packet is buffered (wait for more bytes).
-fn take_message(buf: &mut Vec<u8>) -> Option<Msg> {
-    loop {
-        match buf.first().copied() {
-            None => return None,
-            Some(0x03) => {
-                buf.remove(0);
-                return Some(Msg::Interrupt);
-            }
-            Some(b'+') | Some(b'-') => {
-                buf.remove(0);
-            } // ack — skip
-            Some(b'$') => {
-                let hash = buf.iter().position(|&c| c == b'#')?;
-                if buf.len() < hash + 3 {
-                    return None;
-                } // checksum bytes not here yet
-                let payload = String::from_utf8_lossy(&buf[1..hash]).into_owned();
-                buf.drain(0..hash + 3);
-                return Some(Msg::Packet(payload));
-            }
-            Some(_) => {
-                buf.remove(0);
-            } // stray byte — skip
-        }
-    }
-}
-
-/// Frame a payload as `$payload#xx` with the RSP modulo-256 checksum.
-fn frame(payload: &str) -> Vec<u8> {
-    let cksum: u32 = payload.bytes().map(|b| b as u32).sum::<u32>() & 0xff;
-    format!("${}#{:02x}", payload, cksum).into_bytes()
-}
-
-/// 32-bit value as little-endian hex (target byte order), the way GDB sends
-/// register/word values: 0x12345678 -> "78563412".
-fn le_hex32(v: u32) -> String {
-    v.to_le_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
-}
-
-/// Reply with data: ack the command (`+`) then the response packet.
-fn reply_data(s: &mut TcpStream, payload: &str) -> Result<()> {
-    s.write_all(b"+")?;
-    s.write_all(&frame(payload))?;
-    Ok(())
-}
-
-fn parse_m(p: &str) -> Option<(u32, u32)> {
-    let rest = &p[1..];
-    let (a, l) = rest.split_once(',')?;
-    Some((
-        u32::from_str_radix(a, 16).ok()?,
-        u32::from_str_radix(l, 16).ok()?,
-    ))
-}
-
-/// Handle one command packet. Returns true if the target should resume running.
-fn handle(s: &mut TcpStream, p: &str, cpu: &Cpu, bus: &mut Bus) -> Result<bool> {
-    match p.as_bytes().first().copied() {
-        Some(b'q') => {
-            if p.starts_with("qSupported") {
-                reply_data(s, "PacketSize=4000")?;
-            } else if p.starts_with("qAttached") {
-                reply_data(s, "1")?;
-            } else if p == "qC" {
-                reply_data(s, "QC1")?;
-            } else if p.starts_with("qfThreadInfo") {
-                reply_data(s, "m1")?;
-            } else if p.starts_with("qsThreadInfo") {
-                reply_data(s, "l")?;
-            } else {
-                reply_data(s, "")?;
-            }
-        }
-        Some(b'?') => reply_data(s, "S05")?, // last-stop reason
-        Some(b'm') => {
-            let payload = match parse_m(p) {
-                Some((addr, len)) => (0..len)
-                    .map(|i| format!("{:02x}", bus.read8(addr.wrapping_add(i))))
-                    .collect::<String>(),
-                None => "E01".to_string(),
-            };
-            reply_data(s, &payload)?;
-        }
-        Some(b'p') => {
-            let reg = u16::from_str_radix(&p[1..], 16).unwrap_or(0xffff);
-            reply_data(s, &le_hex32(cpu.gdb_reg(reg)))?;
-        }
-        Some(b'g') => {
-            // r0..r15 then xPSR — the core general-register block GDB expects.
-            let mut out = String::new();
-            for n in 0..16 {
-                out.push_str(&le_hex32(cpu.gdb_reg(n)));
-            }
-            out.push_str(&le_hex32(cpu.gdb_reg(16)));
-            reply_data(s, &out)?;
-        }
-        Some(b'c') => {
-            s.write_all(b"+")?;
-            return Ok(true);
-        } // continue: bare ack, resume
-        // Unsupported (vCont, H thread-select, write packets, ...): empty reply.
-        _ => reply_data(s, "")?,
-    }
-    Ok(false)
-}
-
-// ---- OpenOCD Tcl RPC (humility's `-p ocd` core: reads and writes) -----------
-//
-// Protocol: each command and each reply is terminated by a 0x1a byte. humility
-// treats a reply containing "Error: " / "invalid command name " as failure.
-// Commands used: `version`, `mrw addr` (read word, decimal), `array unset
-// output` + `mem2array output 8 addr len` + `return $output` (read bytes as
-// space-separated `idx val` decimal pairs), `reg N` (read register), `mww/mwb
-// addr val` (write). halt/run are client-side no-ops, so the target stays
-// frozen for the duration of an OpenOCD connection (a consistent snapshot).
-
-const OCD_DELIM: u8 = 0x1a;
-
-fn parse_hex_or_dec(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if let Some(h) = s.strip_prefix("0x") {
-        u32::from_str_radix(h, 16).ok()
-    } else {
-        s.parse().ok()
-    }
-}
-
-/// Produce the reply body for one OpenOCD Tcl command. `pending` carries the
-/// `mem2array` result across to the following `return $output`.
-fn handle_ocd(cmd: &str, cpu: &Cpu, bus: &mut Bus, pending: &mut String) -> String {
-    let mut t = cmd.split_whitespace();
-    match t.next() {
-        Some("version") => "Open On-Chip Debugger 0.12.0 (sp-emu)".to_string(),
-        Some("mrw") => match t.next().and_then(parse_hex_or_dec) {
-            Some(addr) => format!("{}", bus.read32(addr)), // decimal, per humility
-            None => String::new(),
-        },
-        Some("mem2array") => {
-            // mem2array output 8 <addr> <len>
-            let _var = t.next();
-            let _width = t.next();
-            let addr = t.next().and_then(parse_hex_or_dec).unwrap_or(0);
-            let len = t.next().and_then(parse_hex_or_dec).unwrap_or(0);
-            // Stash "idx val idx val ..." (decimal) for the next `return $output`.
-            let mut s = String::new();
-            for i in 0..len {
-                if i > 0 {
-                    s.push(' ');
-                }
-                s.push_str(&format!("{} {}", i, bus.read8(addr.wrapping_add(i))));
-            }
-            *pending = s;
-            String::new()
-        }
-        Some("return") => std::mem::take(pending), // `return $output`
-        Some("reg") => match t.next().and_then(|n| n.parse::<u16>().ok()) {
-            Some(n) => format!("reg{} (/32): 0x{:08x}", n, cpu.gdb_reg(n)),
-            None => String::new(),
-        },
-        Some("mww") => {
-            let addr = t.next().and_then(parse_hex_or_dec);
-            let val = t.next().and_then(parse_hex_or_dec);
-            if let (Some(a), Some(v)) = (addr, val) {
-                bus.write32(a, v);
-            }
-            String::new()
-        }
-        Some("mwb") => {
-            let addr = t.next().and_then(parse_hex_or_dec);
-            let val = t.next().and_then(parse_hex_or_dec);
-            if let (Some(a), Some(v)) = (addr, val) {
-                bus.write8(a, v as u8);
-            }
-            String::new()
-        }
-        // array unset / capture / unknown: succeed silently (no "Error:").
-        _ => String::new(),
-    }
-}
-
-/// Serve one OpenOCD-Tcl connection to completion (target frozen throughout).
-fn serve_ocd(mut stream: TcpStream, cpu: &Cpu, bus: &mut Bus) -> Result<()> {
-    // Accepted sockets can inherit the listener's non-blocking flag; this loop
-    // uses blocking reads, so force it.
-    stream.set_nonblocking(false)?;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut rbuf = [0u8; 8192];
-    let mut pending = String::new();
-    loop {
-        // Accumulate a 0x1a-delimited command.
-        while !buf.contains(&OCD_DELIM) {
-            let n = stream.read(&mut rbuf)?;
-            if n == 0 {
-                return Ok(());
-            } // client closed
-            buf.extend_from_slice(&rbuf[..n]);
-        }
-        let pos = buf.iter().position(|&b| b == OCD_DELIM).unwrap();
-        let cmd = String::from_utf8_lossy(&buf[..pos]).into_owned();
-        buf.drain(0..=pos);
-        let mut reply = handle_ocd(cmd.trim(), cpu, bus, &mut pending).into_bytes();
-        reply.push(OCD_DELIM);
-        stream.write_all(&reply)?;
-    }
-}
-
-/// Serve one GDB-RSP connection to completion.
-fn serve_gdb(
-    mut stream: TcpStream,
-    cpu: &mut Cpu,
-    bus: &mut Bus,
-    host: &mut dyn HostIo,
-) -> Result<()> {
-    stream.set_nonblocking(true)?;
-    stream.set_nodelay(true).ok();
-    let mut inbuf: Vec<u8> = Vec::new();
-    let mut rbuf = [0u8; 8192];
-    let mut running = false;
-    loop {
-        match stream.read(&mut rbuf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => inbuf.extend_from_slice(&rbuf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
-        }
-        while let Some(msg) = take_message(&mut inbuf) {
-            match msg {
-                Msg::Interrupt => {
-                    running = false;
-                    stream.write_all(&frame("S05"))?;
-                }
-                Msg::Packet(p) => {
-                    running = handle(&mut stream, &p, cpu, bus)?;
-                }
-            }
-        }
-        if running {
-            for _ in 0..50_000 {
-                if cpu.step(bus, host).is_err() {
-                    running = false;
-                    break;
-                }
-                cpu.maybe_tick(bus);
-                cpu.maybe_interrupt(bus);
-            }
-            bus.pump_eth(host);
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-}
-
-/// Pre-boot to steady state, then serve both humility debug transports:
-///  - GDB RSP on :3333  (`humility -p ocdgdb`, read-only)
-///  - OpenOCD Tcl on :6666 (`humility -p ocd`, reads + writes)
+/// Pre-boot to steady state, then serve the Glasgow SWD debug probe on
+/// 127.0.0.1:<swd_port> (`humility -p 20b7:9db1:tcp:127.0.0.1:<swd_port>`).
 ///
 /// Between connections the emulator keeps running, so time advances across a
 /// series of humility commands.
@@ -442,16 +176,15 @@ pub fn serve(
     let txbreak = crate::config::get().eth_txbreak;
     eprintln!("[gdb] eth-service: quantum={} txbreak={}", quantum, txbreak);
 
-    // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the gdb/ocd debug listeners
-    // entirely — MGS only needs the bridge UDP. Otherwise bind them.
+    // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the SWD debug listener
+    // entirely — MGS only needs the bridge UDP. Otherwise bind it.
     let listeners = if crate::config::get().no_debug {
         eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG) — serving the bridge only");
         None
     } else {
-        // Per-instance ports so every sp-emu in a shared switch zone is
-        // debuggable simultaneously: offset by the bridge port (33300->0,
-        // 33310->10, ...). gdb=3333+off, ocd=6666+off. Pair with humility's
-        // HUMILITY_OCD_PORT env to attach to a specific SP.
+        // Per-instance port so every sp-emu in a shared switch zone is debuggable
+        // simultaneously: offset the SWD port by the bridge port (33300->0,
+        // 33310->10, ...), so swd = 4444 + off. Pair with the matching selector.
         let off: u16 = crate::config::get()
             .bridge
             .as_deref()
@@ -459,20 +192,12 @@ pub fn serve(
             .and_then(|p| p.parse::<u16>().ok())
             .map(|p| p.wrapping_sub(33300))
             .unwrap_or(0);
-        let gdb_port = 3333u16.wrapping_add(off);
-        let ocd_port = 6666u16.wrapping_add(off);
         let swd_port = 4444u16.wrapping_add(off);
-        let gdb_l = TcpListener::bind(("127.0.0.1", gdb_port))?;
-        let ocd_l = TcpListener::bind(("127.0.0.1", ocd_port))?;
         let swd_l = TcpListener::bind(("127.0.0.1", swd_port))?;
-        gdb_l.set_nonblocking(true)?;
-        ocd_l.set_nonblocking(true)?;
         swd_l.set_nonblocking(true)?;
-        eprintln!("[gdb] ready (gdb :{gdb_port}, ocd :{ocd_port}, swd :{swd_port}). attach with:");
-        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (SWD debug port: halt/run/hiffy; works with a stock humility)");
-        eprintln!("[gdb]   humility -a <archive.zip> -p ocdgdb <cmd>   (reads: tasks, readmem, ringbuf; needs a pre-removal humility)");
-        eprintln!("[gdb]   humility -a <archive.zip> -p ocd    <cmd>   (reads + writes; needs a pre-removal humility)");
-        Some((gdb_l, ocd_l, swd_l))
+        eprintln!("[gdb] ready (swd :{swd_port}). attach with:");
+        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (Glasgow SWD debug port: halt/run/hiffy; stock humility)");
+        Some(swd_l)
     };
 
     // Pump-cadence diagnostics (SP_EMU_PUMPSTATS): distinguishes the SP being
@@ -520,29 +245,7 @@ pub fn serve(
     let mut sp_swdp = crate::debugport::SwDp::new();
 
     loop {
-        if let Some((gdb_l, ocd_l, swd_l)) = &listeners {
-            match gdb_l.accept() {
-                Ok((stream, peer)) => {
-                    eprintln!("[gdb] RSP client {peer}");
-                    if let Err(e) = serve_gdb(stream, &mut cpu, &mut bus, host) {
-                        eprintln!("[gdb] RSP connection ended: {e}");
-                    }
-                    continue;
-                }
-                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e.into()),
-                Err(_) => {}
-            }
-            match ocd_l.accept() {
-                Ok((stream, peer)) => {
-                    eprintln!("[gdb] OpenOCD client {peer}");
-                    if let Err(e) = serve_ocd(stream, &cpu, &mut bus) {
-                        eprintln!("[gdb] OpenOCD connection ended: {e}");
-                    }
-                    continue;
-                }
-                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e.into()),
-                Err(_) => {}
-            }
+        if let Some(swd_l) = &listeners {
             match swd_l.accept() {
                 Ok((stream, peer)) => {
                     eprintln!("[gdb] SWD (Glasgow applet) client {peer}");

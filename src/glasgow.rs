@@ -48,7 +48,7 @@ const RSP_ACK_FAULT: u8 = 0x04;
 const RUN_BATCH: usize = 50_000;
 
 /// Serve one Glasgow-applet connection to completion. Owns the SP core for the
-/// duration (RoT/eth pump is frozen, like `serve_ocd`); hiffy and endoscope are
+/// duration (RoT/eth pump is frozen while a command runs); hiffy and endoscope are
 /// self-contained SP work, so that is fine.
 pub fn serve(
     mut stream: TcpStream,
