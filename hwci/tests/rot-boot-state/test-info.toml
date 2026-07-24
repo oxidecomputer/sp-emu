@@ -1,0 +1,22 @@
+# Read the RoT boot state (active slot + image FWIDs) through the SP.
+# Exercises the sprot -> RoT path through control_plane_agent, the same relay a
+# bootleby A/B-selection assertion will read. Checks reachability and that a
+# plausible active slot is reported, not selection correctness (that arrives with
+# the serve-mode bootleby tests).
+
+[test]
+id = "rot-boot-state"
+name = "RoT boot state via SP"
+description = "Query RoT boot state through the SP's sprot interface and verify the active slot is reported"
+required_capabilities = [
+    "sp:task:control_plane_agent",
+    "sp:task:sprot",
+]
+category = "regression"
+
+[[steps]]
+type = "external"
+command = "./check-boot-state.sh"
+# Generous: the emulated RoT services sprot far slower than silicon.
+timeout_ms = 60000
+description = "Query RoT boot state and verify the active slot is reported"
