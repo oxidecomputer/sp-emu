@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 mod bridge;
+mod config;
 mod cpu;
 mod dbg;
 mod debugport;
@@ -49,15 +50,15 @@ use mem::Bus;
 /// so tools reach the emulated SP exactly as they would real hardware. The
 /// default `$SP_EMU_BRIDGE` port-offset mode is unchanged.
 fn make_host() -> Box<dyn HostIo> {
-    if std::env::var("SP_EMU_WELL_KNOWN_PORTS").is_ok() {
+    if config::get().well_known_ports {
         return make_well_known_host();
     }
-    match std::env::var("SP_EMU_BRIDGE") {
-        Ok(v) => {
+    match config::get().bridge.as_deref() {
+        Some(v) => {
             let bind = if v.is_empty() || v == "1" {
                 "[::1]:11111".to_string()
             } else {
-                v
+                v.to_string()
             };
             match bridge::Bridge::new(&bind) {
                 Ok(b) => Box::new(b),
@@ -67,7 +68,7 @@ fn make_host() -> Box<dyn HostIo> {
                 }
             }
         }
-        Err(_) => Box::new(StdoutHost),
+        None => Box::new(StdoutHost),
     }
 }
 
@@ -116,33 +117,31 @@ fn default_socket_ports(sidecar: bool) -> Vec<u16> {
 fn make_well_known_host() -> Box<dyn HostIo> {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-    let sidecar = std::env::var("SP_EMU_BOARD")
-        .map(|b| b == "sidecar")
-        .unwrap_or(false);
-    let env_vid = |k: &str, d: u16| {
-        std::env::var(k)
-            .ok()
-            .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(d)
-    };
-    let parse_ip = |k: &str| -> Option<IpAddr> {
-        std::env::var(k).ok().and_then(|s| s.parse().ok())
+    let cfg = config::get();
+    let sidecar = cfg.board.is_sidecar();
+    let parse_ip = |s: &Option<String>| -> Option<IpAddr> {
+        s.as_deref().and_then(|s| s.parse().ok())
     };
 
     // switch0 view: $SP_EMU_ADDR0 (default ::1). switch1 view: $SP_EMU_ADDR1 if
     // set (a distinct address, since both views bind the same real ports).
-    let addr0 = parse_ip("SP_EMU_ADDR0").unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
-    let (def0, def1) = if sidecar { (0x130, 0x302) } else { (0x301, 0x302) };
-    let mut views = vec![(SocketAddr::new(addr0, 0), env_vid("SP_EMU_VID0", def0))];
-    if let Some(addr1) = parse_ip("SP_EMU_ADDR1") {
-        views.push((SocketAddr::new(addr1, 0), env_vid("SP_EMU_VID1", def1)));
+    let addr0 = parse_ip(&cfg.addr0).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    let (def0, def1) = if sidecar {
+        (bridge::VID_SIDECAR0, bridge::VID_SWITCH1)
+    } else {
+        (bridge::VID_SWITCH0, bridge::VID_SWITCH1)
+    };
+    let mut views = vec![(SocketAddr::new(addr0, 0), cfg.vid0.unwrap_or(def0))];
+    if let Some(addr1) = parse_ip(&cfg.addr1) {
+        views.push((SocketAddr::new(addr1, 0), cfg.vid1.unwrap_or(def1)));
     }
 
     // Prefer the socket set the flashed image actually declares (its app.toml in
     // $SP_EMU_ARCHIVE); fall back to the board-keyed union when no archive path
     // is given.
-    let ports = std::env::var("SP_EMU_ARCHIVE")
-        .ok()
+    let ports = cfg
+        .archive
+        .clone()
         .and_then(|a| {
             let p = archive_socket_ports(&a);
             match &p {
@@ -167,7 +166,7 @@ fn make_well_known_host() -> Box<dyn HostIo> {
 }
 
 fn nvm_path() -> String {
-    std::env::var("SP_EMU_FLASH").unwrap_or_else(|_| "sp-flash.bin".to_string())
+    config::get().flash_path.clone()
 }
 
 /// Remove `--flag <value>` (or `--flag=<value>`) from `args` and return the value.
@@ -189,12 +188,17 @@ fn extract_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // Per-instance identity: `--seed <hex|string>` (or $SP_EMU_SEED) derives the
-    // instance's UID/UUID/DICE-CDI/PUF seeds; absent, a persisted or fresh-random
-    // seed is used. Pulled out of `args` before subcommand dispatch so it may
-    // appear anywhere on the line.
-    let seed = extract_flag_value(&mut args, "--seed").or_else(|| std::env::var("SP_EMU_SEED").ok());
-    identity::init(seed.as_deref())?;
+    // Ingest all configuration once (env, an optional --load-config file, and the
+    // --seed flag). After this, subsystems read config::get(), never the environment.
+    // These flags are pulled out of `args` before subcommand dispatch so they may
+    // appear anywhere on the line. `--seed <hex|string>` (or $SP_EMU_SEED) derives the
+    // instance's UID/UUID/DICE/PUF; `--load-config`/`--dump-config` read/write a TOML
+    // config file (see config.rs).
+    let seed = extract_flag_value(&mut args, "--seed");
+    let load_config = extract_flag_value(&mut args, "--load-config");
+    let dump_config = extract_flag_value(&mut args, "--dump-config");
+    config::init(seed, load_config, dump_config)?;
+    identity::init(config::get().seed.as_deref())?;
     match args.first().map(|s| s.as_str()) {
         Some("flash") => cmd_flash(&args[1..]),
         Some("erase") => cmd_erase(&args[1..]),
@@ -235,6 +239,11 @@ fn main() -> Result<()> {
             eprintln!(
                 "                                   spec: addr/reg=val  or  addr@eeprom-file"
             );
+            eprintln!();
+            eprintln!("global flags (any position):");
+            eprintln!("  --seed <hex|string>              per-instance identity seed (or $SP_EMU_SEED)");
+            eprintln!("  --load-config <path>             read a TOML config file as the base layer");
+            eprintln!("  --dump-config <path>             write the effective configuration to a TOML file");
             Ok(())
         }
     }
@@ -382,21 +391,20 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
     // in-process RoT core), or an in-process RoT core (SP_EMU_ROT_FLASH, the
     // two-core path). The service wins if both are set.
-    let rot_service = std::env::var("SP_EMU_ROT_SERVICE")
-        .ok()
-        .filter(|s| !s.is_empty());
-    if rot_service.is_some() || std::env::var("SP_EMU_ROT_FLASH").is_ok() {
+    let rot_service = config::get().rot_service.clone();
+    let rot_flash = config::get().rot_flash.clone();
+    if rot_service.is_some() || rot_flash.is_some() {
         sprot::enable();
     }
     // The in-process RoT drives the SP's debug port over an internal SWD link.
-    if std::env::var("SP_EMU_ROT_FLASH").is_ok() {
+    if rot_flash.is_some() {
         rotswd::enable();
     }
     let (cpu, bus) = setup(&nvm, swap_override)?;
-    let rot = match (&rot_service, std::env::var("SP_EMU_ROT_FLASH")) {
-        (None, Ok(p)) => {
+    let rot = match (&rot_service, &rot_flash) {
+        (None, Some(p)) => {
             eprintln!("[rot] SP_EMU_ROT_FLASH={p}");
-            let img = flash::load_image(&p)?;
+            let img = flash::load_image(p)?;
             Some(build_rot_core(&img)?)
         }
         _ => None,
@@ -513,7 +521,7 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
 /// stage0/bootleby so the identity binds to the actual FWID) is future work; see
 /// doc/dice-handoff.md.
 fn publish_dice_handoff(bus: &mut Bus) {
-    let Ok(dir) = std::env::var("SP_EMU_ROT_DICE") else {
+    let Some(dir) = config::get().rot_dice.clone() else {
         return;
     };
     // DICE_RANGE = 0x4010_0000..0x4010_2000: CertData at start (CERTS_RANGE),
@@ -566,7 +574,7 @@ fn cmd_rot(args: &[String]) -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(20_000_000);
     let (mut cpu, mut bus) = build_rot_core(&image)?;
-    let trace = std::env::var("SP_EMU_TRACE").is_ok();
+    let trace = config::get().trace;
     cpu.record_disasm = trace;
     let mut host = make_host();
     let mut stopped = false;
@@ -671,7 +679,7 @@ const RFD568_SKIP_TOKEN: u32 = 0x9f38_bd71;
 /// SP_EMU_ROT_MEASURE selects flows 1/3 (let the RoT measure, or loop); its
 /// absence selects flow 2.
 fn deposit_skip_token_if_debugger(bus: &mut Bus) {
-    if std::env::var("SP_EMU_ROT_MEASURE").is_err() {
+    if !config::get().rot_measure {
         bus.write32(RFD568_TOKEN_ADDR, RFD568_SKIP_TOKEN);
     }
 }
@@ -680,16 +688,16 @@ fn deposit_skip_token_if_debugger(bus: &mut Bus) {
 /// `max` == 0 runs until a trap/halt (serve MGS forever); otherwise it caps the
 /// instruction count. `swap_override` selects the initial boot bank (see `setup`).
 fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
-    let trace = std::env::var("SP_EMU_TRACE").is_ok();
-    let parse_env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
-    let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
+    let trace = config::get().trace;
+    let (twin_from, twin_to) = (config::get().trace_from, config::get().trace_to);
     let (mut cpu, mut bus) = setup(image, swap_override)?;
     let mut host = make_host();
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
     use std::io::Write;
-    let mut diff = std::env::var("SP_EMU_DIFF")
-        .ok()
+    let mut diff = config::get()
+        .diff
+        .clone()
         .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("diff file")));
     bus.rec = diff.is_some();
     // Per-instruction disasm formatting is a heap alloc; only enable it when a

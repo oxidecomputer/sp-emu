@@ -35,8 +35,12 @@ const VLAN_TPID: u16 = 0x8100;
 /// a4x2 port map exposes switch0 at base_port+0 and switch1 at base_port+1, so
 /// each bound socket is tied to the matching VLAN. control_plane_agent listens
 /// on BOTH, so a centralized emulator must answer on both switch views per SP.
-const VID_SWITCH0: u16 = 0x301;
-const VID_SWITCH1: u16 = 0x302;
+// Trusted management-VLAN defaults, shared with the well-known-port host in
+// main.rs so the two bind paths can't drift. Gimlet uses switch0/switch1; the
+// sidecar swaps switch0 for its local_sidecar VLAN. SP_EMU_VID0/VID1 override.
+pub(crate) const VID_SWITCH0: u16 = 0x301;
+pub(crate) const VID_SWITCH1: u16 = 0x302;
+pub(crate) const VID_SIDECAR0: u16 = 0x130;
 
 /// A bidirectional byte channel to the host CPU over the host-facing UART. A
 /// unix socket (voxel/propolis) and a pty master (faux-ipcc and other serial
@@ -80,7 +84,7 @@ fn open_host_pty() -> Option<Box<dyn HostUartIo>> {
                 .into_owned()
         };
         libc::close(slave); // the tool opens the slave by path
-        // Non-blocking master: host_uart_rx polls it.
+                            // Non-blocking master: host_uart_rx polls it.
         let fl = libc::fcntl(master, libc::F_GETFL);
         libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
         eprintln!(
@@ -93,10 +97,10 @@ fn open_host_pty() -> Option<Box<dyn HostUartIo>> {
 /// Connect the host UART to `$SP_EMU_HOST_PTY` (a pty sp-emu creates) or
 /// `$SP_EMU_HOST_UART` (a unix socket to connect to), whichever is set.
 fn open_host_uart() -> Option<Box<dyn HostUartIo>> {
-    if std::env::var("SP_EMU_HOST_PTY").is_ok() {
+    if crate::config::get().host_pty {
         return open_host_pty();
     }
-    let p = std::env::var("SP_EMU_HOST_UART").ok()?;
+    let p = crate::config::get().host_uart.clone()?;
     match UnixStream::connect(&p) {
         Ok(s) => {
             let _ = s.set_nonblocking(true);
@@ -183,22 +187,14 @@ impl Bridge {
         // port 2 -> switch1 view); both are `trusted=true`, which MGS state/
         // inventory require (the tech-port VLANs 0x12c/0x12d are untrusted). The
         // gimlet uses 0x301/0x302. SP_EMU_VID0/VID1 still override either default.
-        let sidecar = std::env::var("SP_EMU_BOARD")
-            .map(|b| b == "sidecar")
-            .unwrap_or(false);
+        let sidecar = crate::config::get().board.is_sidecar();
         let (def0, def1) = if sidecar {
-            (0x130, 0x302)
+            (VID_SIDECAR0, VID_SWITCH1)
         } else {
             (VID_SWITCH0, VID_SWITCH1)
         };
-        let env_vid = |k: &str, d: u16| {
-            std::env::var(k)
-                .ok()
-                .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(d)
-        };
-        let vid0 = env_vid("SP_EMU_VID0", def0);
-        let vid1 = env_vid("SP_EMU_VID1", def1);
+        let vid0 = crate::config::get().vid0.unwrap_or(def0);
+        let vid1 = crate::config::get().vid1.unwrap_or(def1);
         let mut socks = Vec::new();
         for (off, vid) in [(0u16, vid0), (1u16, vid1)] {
             let mut a = base;
@@ -317,7 +313,7 @@ impl Bridge {
     fn dbg(&self) -> bool {
         // Bridge-specific var traces relay traffic without enabling the per-IRQ
         // output that $SP_EMU_ETHDBG turns on in cpu.rs.
-        std::env::var("SP_EMU_BRIDGEDBG").is_ok() || std::env::var("SP_EMU_ETHDBG").is_ok()
+        crate::config::get().bridgedbg || crate::config::get().ethdbg
     }
 
     // ---- SP -> host (parse transmitted frames) ----------------------------
@@ -368,7 +364,7 @@ impl Bridge {
                 // first reply isn't dropped pending NDP resolution.
                 let na = self.build_neighbor_advert(vid, src_mac, &src_ip);
                 self.push_rx(0, na);
-                if std::env::var("SP_EMU_PINGTEST").is_ok() {
+                if crate::config::get().pingtest {
                     eprintln!("[bridge] PINGTEST: echo-request -> SP vid {:#x}", vid);
                     let ping = self.build_echo_request(vid, src_mac, &src_ip);
                     self.push_rx(0, ping);
@@ -431,7 +427,11 @@ impl Bridge {
         // broadcast/echo chatter from unbridged sockets. In the default mode that
         // is exactly {mgmt 11111, ereport 57005}; in well-known-port mode it is
         // whatever socket set the instance binds.
-        if !self.socks.iter().any(|s| s.vid == vid && s.sp_port == src_port) {
+        if !self
+            .socks
+            .iter()
+            .any(|s| s.vid == vid && s.sp_port == src_port)
+        {
             return;
         }
         // Route the reply to the specific MGS client that sent the request: the
@@ -501,7 +501,7 @@ impl Bridge {
             }
         }
         self.n_recv += got.len() as u64;
-        if std::env::var("SP_EMU_RXSTATS").is_ok() && self.n_recv % 500 < got.len() as u64 {
+        if crate::config::get().rxstats && self.n_recv % 500 < got.len() as u64 {
             eprintln!(
                 "[rxstats] recv={} evict={} pop={} qdepth={}",
                 self.n_recv,
@@ -546,7 +546,7 @@ impl Bridge {
     fn push_rx(&mut self, flow: u16, frame: Vec<u8>) {
         // Flow != 0 is a real MGS client request (flow 0 = bridge control: NA/echo).
         // Stamp its arrival so the SP's reply can report the round-trip latency.
-        if flow != 0 && std::env::var("SP_EMU_RTTSTATS").is_ok() {
+        if flow != 0 && crate::config::get().rttstats {
             self.last_req_at = Some(std::time::Instant::now());
         }
         const RX_BACKLOG_CAP: usize = 32;
@@ -697,7 +697,7 @@ impl HostIo for Bridge {
     }
 
     fn host_uart_flush(&mut self) {
-        let dbg = std::env::var("SP_EMU_UARTDBG").is_ok();
+        let dbg = crate::config::get().uartdbg;
         let s = match self.host_uart.as_mut() {
             Some(s) => s,
             None => {
@@ -737,7 +737,7 @@ impl HostIo for Bridge {
         let mut b = [0u8; 1];
         match s.read(&mut b) {
             Ok(1) => {
-                if std::env::var("SP_EMU_UARTDBG").is_ok() {
+                if crate::config::get().uartdbg {
                     eprintln!("[host-uart] socket RX {:#04x}", b[0]);
                 }
                 Some(b[0])

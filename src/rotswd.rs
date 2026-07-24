@@ -91,7 +91,7 @@ impl RotSwdSpi {
             link,
             rx: VecDeque::new(),
             phase: Phase::Idle,
-            trace: std::env::var("SP_EMU_SWD_TRACE").is_ok(),
+            trace: crate::config::get().swd_trace,
             n_fwr: 0,
         }
     }

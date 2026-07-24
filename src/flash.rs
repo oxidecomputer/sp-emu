@@ -320,7 +320,7 @@ impl Flash {
             sr2: 0,
             erase_irq: false,
             regs: HashMap::new(),
-            dbg: std::env::var("SP_EMU_FLASHDBG").is_ok(),
+            dbg: crate::config::get().flashdbg,
         }
     }
 

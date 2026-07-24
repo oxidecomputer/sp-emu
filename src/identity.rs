@@ -46,7 +46,7 @@ use std::sync::OnceLock;
 /// way to run a fleet; two instances sharing one cwd without setting this would
 /// share an identity, so a fleet must give each its own path.
 fn identity_path() -> String {
-    std::env::var("SP_EMU_IDENTITY").unwrap_or_else(|_| "sp-emu-identity".to_string())
+    crate::config::get().identity_path.clone()
 }
 
 /// Domain tags. Changing a tag changes that field's value for a given seed, so

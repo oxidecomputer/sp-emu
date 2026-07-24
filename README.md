@@ -137,6 +137,9 @@ sp-emu i2c-sniff [listen-addr]                        observe I2C traffic from a
 sp-emu i2c-device [addr] [spec ...]                   stand in as I2C devices for a running emulator
 ```
 
+Global flags may appear anywhere on the line: `--seed <hex|string>` (see Instance
+identity), and `--load-config <path>` / `--dump-config <path>` (see Configuration).
+
 ### How long `run` runs
 
 `run` takes an optional instruction cap, and which you want depends on the task:
@@ -195,6 +198,23 @@ There are also `SP_EMU_*DBG` switches (`SP_EMU_SPROTDBG`, `SP_EMU_ETHDBG`,
 `SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, and so on) that turn on per-subsystem
 tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock, erase, program,
 and the option-byte bank swap.
+
+## Configuration
+
+sp-emu takes its `SP_EMU_*` settings from the environment -- or, with
+`--load-config`, from a saved config file *instead of* the environment. The two are
+alternatives, never mixed, and command-line flags always win, so precedence is
+flag > (config file | environment) > default. Everything is read and vetted once at
+startup; nothing consults the environment after that.
+
+- `--load-config <path>`: read all `SP_EMU_*` settings from a TOML file (a flat table
+  keyed by the variable names) and ignore the environment, so a saved run reproduces
+  exactly regardless of your shell. Flags still override.
+- `--dump-config <path>`: write the effective configuration as TOML, so a run can be
+  captured and replayed with `--load-config`.
+- `SP_EMU_CONFIGDBG`: print the full resolved configuration to stderr. It is an
+  environment variable, so it has no effect under `--load-config` -- use
+  `--dump-config` (a flag) to inspect a loaded configuration.
 
 ## Instance identity (`--seed`)
 

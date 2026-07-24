@@ -300,8 +300,10 @@ pub fn serve(
         "[gdb] pre-booting {} instructions to steady state...",
         preboot
     );
-    let parse_env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
-    let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
+    let (twin_from, twin_to) = (
+        crate::config::get().trace_from,
+        crate::config::get().trace_to,
+    );
     // Pay the per-instruction disasm-formatting cost only when the windowed trace is on.
     cpu.record_disasm = twin_from.is_some();
     let preboot_start = std::time::Instant::now();
@@ -339,18 +341,13 @@ pub fn serve(
         // generation (PUF seed + several Ed25519 keygens/signs + SHA3) -- it
         // breaks early on idle (WFI) once startup completes. Override with
         // SP_EMU_ROT_PREBOOT.
-        let rot_preboot = std::env::var("SP_EMU_ROT_PREBOOT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(400_000_000);
+        let rot_preboot = crate::config::get().rot_preboot.unwrap_or(400_000_000);
         // Optional windowed instruction trace during preboot (where DICE runs),
         // SP_EMU_ROT_TRACE_FROM/TO as hex pc bounds.
-        let pbf = |k: &str| {
-            std::env::var(k)
-                .ok()
-                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        };
-        let (pb_from, pb_to) = (pbf("SP_EMU_ROT_TRACE_FROM"), pbf("SP_EMU_ROT_TRACE_TO"));
+        let (pb_from, pb_to) = (
+            crate::config::get().rot_trace_from,
+            crate::config::get().rot_trace_to,
+        );
         rc.record_disasm |= pb_from.is_some();
         for _ in 0..rot_preboot {
             let pc_before = rc.pc;
@@ -398,7 +395,7 @@ pub fn serve(
             }
         }
         rc.wfi_throttle = true;
-        rc.trace_svc = std::env::var("SP_EMU_ROTSVC").is_ok();
+        rc.trace_svc = crate::config::get().rotsvc;
         eprintln!(
             "[rot] RoT core booted (pc={:#010x}, {} insns) in {:.2}s",
             rc.pc,
@@ -407,27 +404,16 @@ pub fn serve(
         );
     }
 
-    let rotpc_every = parse_env("SP_EMU_ROTPC");
+    let rotpc_every = crate::config::get().rotpc;
     let mut rotpc_next = 0u64;
     let mut last_rottrap = u32::MAX;
     // SP_EMU_ROT_TRACE_FROM/TO="0xADDR": log the RoT's pc + disasm + r0..r3,r6 for
     // every instruction whose pc is in [FROM,TO] — an instruction-level window to
     // debug a specific RoT function's execution.
-    let parse_hex = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-    };
-    let rot_trace_from = parse_hex("SP_EMU_ROT_TRACE_FROM");
-    let rot_trace_to = parse_hex("SP_EMU_ROT_TRACE_TO");
+    let rot_trace_from = crate::config::get().rot_trace_from;
+    let rot_trace_to = crate::config::get().rot_trace_to;
     // SP_EMU_ROTDUMP="0xADDR:LEN" dumps that RoT RAM range every ~8s for task-table introspection.
-    let rotdump: Option<(u32, u32)> = std::env::var("SP_EMU_ROTDUMP").ok().and_then(|s| {
-        let (a, l) = s.split_once(':')?;
-        Some((
-            u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
-            l.parse().ok()?,
-        ))
-    });
+    let rotdump: Option<(u32, u32)> = crate::config::get().rotdump;
     let mut rotdump_last = std::time::Instant::now();
 
     // Post-preboot: enable the WFI idle-throttle so an idle SP sleeps the host
@@ -437,10 +423,7 @@ pub fn serve(
     // idle CPU but slower background sim-time; an incoming packet's eth-irq wakes
     // the SP immediately regardless. 10ms ≈ 4x CPU cut; tune via SP_EMU_IDLE_MS
     // for denser fleets.
-    let idle_ms: u64 = std::env::var("SP_EMU_IDLE_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    let idle_ms: u64 = crate::config::get().idle_ms;
 
     // Eth-service quantum: instructions the SP runs between bridge pumps (the
     // only place TX frames flush out and RX frames poll in). Under sustained MGS
@@ -452,22 +435,16 @@ pub fn serve(
     // GET /ignition) times out -> empty SP inventory. A small quantum bounds
     // inbound latency; the `eth_has_tx` break (below) bounds outbound. The preboot
     // loop is separate, so full-speed boot throughput is unaffected.
-    let quantum: u32 = std::env::var("SP_EMU_ETH_QUANTUM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&q| q > 0)
-        .unwrap_or(4096);
+    let quantum: u32 = crate::config::get().eth_quantum;
     // TX-break: end the batch the instant the SP queues a reply so it flushes
     // immediately instead of waiting out the rest of the quantum. On by default;
     // SP_EMU_ETH_TXBREAK=0 disables it (A/B against the once-per-batch behavior).
-    let txbreak = std::env::var("SP_EMU_ETH_TXBREAK")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let txbreak = crate::config::get().eth_txbreak;
     eprintln!("[gdb] eth-service: quantum={} txbreak={}", quantum, txbreak);
 
     // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the gdb/ocd debug listeners
     // entirely — MGS only needs the bridge UDP. Otherwise bind them.
-    let listeners = if std::env::var("SP_EMU_NO_DEBUG").is_ok() {
+    let listeners = if crate::config::get().no_debug {
         eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG) — serving the bridge only");
         None
     } else {
@@ -475,9 +452,10 @@ pub fn serve(
         // debuggable simultaneously: offset by the bridge port (33300->0,
         // 33310->10, ...). gdb=3333+off, ocd=6666+off. Pair with humility's
         // HUMILITY_OCD_PORT env to attach to a specific SP.
-        let off: u16 = std::env::var("SP_EMU_BRIDGE")
-            .ok()
-            .and_then(|b| b.rsplit(':').next().map(str::to_string))
+        let off: u16 = crate::config::get()
+            .bridge
+            .as_deref()
+            .and_then(|b| b.rsplit(':').next())
             .and_then(|p| p.parse::<u16>().ok())
             .map(|p| p.wrapping_sub(33300))
             .unwrap_or(0);
@@ -504,12 +482,8 @@ pub fn serve(
     // (a smaller quantum / TX-break helps); a long gap with ~0 instructions = the
     // OS descheduled the whole process (only CPU priority helps, not the quantum).
     // Logged only for gaps over the threshold (default 50ms).
-    let pumpstats = std::env::var("SP_EMU_PUMPSTATS").is_ok();
-    let pump_thresh_us: u128 = std::env::var("SP_EMU_PUMPSTATS_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50)
-        * 1000;
+    let pumpstats = crate::config::get().pumpstats;
+    let pump_thresh_us: u128 = crate::config::get().pumpstats_ms as u128 * 1000;
     let mut last_pump = std::time::Instant::now();
     let mut last_cyc = cpu.cycles;
 
@@ -517,7 +491,7 @@ pub fn serve(
     // find hot firmware (e.g. an SPI/IPC spin loop behind bulk-ignition latency).
     // Sampled every 256 instrs; cumulative top-30 dumped every 15s. Map PCs to
     // functions offline with the Hubris archive (addr2line/nm).
-    let pcprof = std::env::var("SP_EMU_PCPROF").is_ok();
+    let pcprof = crate::config::get().pcprof;
     let mut pchist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let mut pcprof_samp: u64 = 0;
     let mut pcprof_last = std::time::Instant::now();
@@ -526,8 +500,8 @@ pub fn serve(
     // appears, write a humility-hydrate-compatible RAM dump to <dir> and swap the
     // trigger for `.done`. Reads a wedged SP's task table with no probe:
     //   touch <dir>/.trigger; zip <dir>; humility -a <ar> hydrate; humility -d tasks
-    let dump_dir = std::env::var("SP_EMU_DUMP_DIR").ok();
-    let dump_archive_id = std::env::var("SP_EMU_DUMP_ARCHIVE_ID").unwrap_or_default();
+    let dump_dir = crate::config::get().dump_dir.clone();
+    let dump_archive_id = crate::config::get().dump_archive_id.clone();
     let mut dump_last = std::time::Instant::now();
     // Previous rot-irq level, for edge-detecting ROT_IRQ to raise the SP's EXTI.
     let mut prev_rot_irq = false;
@@ -539,7 +513,7 @@ pub fn serve(
     // Synthetic one-shot RoT measurement trigger (SP_EMU_SWD_TRIGGER): pend the
     // RoT's sp_reset-irq once, to exercise the RoT-drives-SP-SWD path without a
     // full SP self-reset (whose measurement gate depends on the SP image).
-    let swd_trigger = std::env::var("SP_EMU_SWD_TRIGGER").is_ok();
+    let swd_trigger = crate::config::get().swd_trigger;
     let mut swd_triggered = false;
     // The SP's debug port, driven by the in-process RoT over the internal SWD link.
     // Loop-lifetime so its DP/AP/CoreDebug state persists across transactions.
