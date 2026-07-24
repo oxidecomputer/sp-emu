@@ -319,7 +319,10 @@ fn cmd_info() -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    // run [a|b] [max] — max 0 means serve forever (needed for sp-test end-to-end).
+    // run [a|b] [max] — max 0 serves forever (the preferred serve mode for
+    // sp-test): the SP over the MGS bridge + Glasgow SWD probe, plus the
+    // in-process/shared RoT when SP_EMU_ROT_FLASH/SERVICE is set. A nonzero max
+    // is a bounded, SP-only batch run.
     let mut slot = 'a';
     let mut slot_given = false;
     let mut max = 5_000_000u64;
@@ -330,6 +333,11 @@ fn cmd_run(args: &[String]) -> Result<()> {
         } else if let Ok(n) = a.parse::<u64>() {
             max = n;
         }
+    }
+    if max == 0 {
+        // Serve forever. SP preboot 0 — the serve loop advances the SP as MGS
+        // traffic arrives (the RoT, if any, preboots per SP_EMU_ROT_PREBOOT).
+        return serve_forever(slot, slot_given, 0);
     }
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
@@ -356,8 +364,9 @@ fn cmd_run(args: &[String]) -> Result<()> {
     boot(&nvm, swap_override, max)
 }
 
-/// gdb [a|b] [preboot] — boot a slot to steady state, then serve a GDB stub on
-/// 127.0.0.1:3333 for humility to attach to.
+/// gdb [a|b] [preboot] — boot a slot to steady state, then run the serve loop
+/// (MGS bridge + Glasgow SWD probe, plus the in-process RoT when configured).
+/// Legacy alias for `run <slot> 0`; kept for the `preboot`-count argument.
 fn cmd_gdb(args: &[String]) -> Result<()> {
     let mut slot = 'a';
     let mut slot_given = false;
@@ -370,6 +379,14 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
             preboot = n;
         }
     }
+    serve_forever(slot, slot_given, preboot)
+}
+
+/// Boot a slot, wire the optional RoT (an in-process two-core RoT via
+/// SP_EMU_ROT_FLASH, or a shared out-of-process RoT via SP_EMU_ROT_SERVICE),
+/// then run the serve loop forever: the MGS bridge for faux-mgs/sp-test and the
+/// Glasgow SWD probe for humility. Shared by `run <slot> 0` and `gdb`.
+fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     let path = nvm_path();
     let mut nvm = flash::load_nvm(&path)?;
     let swap_override = slot_given.then_some(slot == 'b');
@@ -389,7 +406,11 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     // Present a caboose in the inactive bank too, so wicketd's inventory poll
     // caches it instead of re-reading NoCaboose forever (see mirror docs).
     flash::mirror_unprogrammed_slot(&mut nvm);
-    eprintln!("[sp] booting from slot {} ({}) for GDB", slot.to_ascii_uppercase(), path);
+    eprintln!(
+        "[sp] booting from slot {} ({})",
+        boot_slot.to_ascii_uppercase(),
+        path
+    );
     // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
     // in-process RoT core), or an in-process RoT core (SP_EMU_ROT_FLASH, the
     // two-core path). The service wins if both are set.
