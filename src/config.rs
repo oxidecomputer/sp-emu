@@ -248,6 +248,16 @@ config! {
     },
     // on by default; "0" disables
     eth_txbreak: bool = "SP_EMU_ETH_TXBREAK" => |v| v.map(|s| s != "0").unwrap_or(true),
+    // sprot SP->RoT artificial flow control (NOT on the real schematic): stall the
+    // SP's serve-loop burst once the shared mosi buffer reaches this many bytes, so
+    // the RoT is stepped to drain its RX FIFO before it overruns. Compensates for
+    // the coarse two-core scheduling (the SP runs a whole quantum before the RoT
+    // runs), which otherwise truncates any >16-byte request. Default = the RoT SPI
+    // RX FIFO depth (16); "0" disables it (restores the real overrun-and-drop
+    // behavior, e.g. to study the failure). See spemu-1c4.
+    sprot_flowctl: u32 = "SP_EMU_SPROT_FLOWCTL" => |v| {
+        v.and_then(|s| s.parse().ok()).unwrap_or(16)
+    },
     pumpstats_ms: u64 = "SP_EMU_PUMPSTATS_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(50),
     // trim before parsing, matching the historical read (a padded value parsed)
     ambient_c: f32 = "SP_EMU_AMBIENT_C" => |v| v.and_then(|s| s.trim().parse().ok()).unwrap_or(30.0),
