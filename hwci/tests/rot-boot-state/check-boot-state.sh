@@ -11,7 +11,7 @@ sp_assert_json_field "$state" '.[].Ok' "SP state response Ok"
 
 sp_step "Extracting RoT boot state"
 # V2 and V3 state formats carry the RoT boot state under .rot.
-rot_state=$(echo "$state" | jq '.[].Ok | .V2.rot // .V3.rot // empty' 2>/dev/null)
+rot_state=$(echo "$state" | jq '.[].Ok | .V2.rot // .V3.rot // empty')
 if [ -z "$rot_state" ] || [ "$rot_state" = "null" ]; then
     # No RoT boot state: sp-emu was started without SP_EMU_ROT_FLASH, or the SP
     # reports V1 state. Not applicable rather than a failure.
@@ -20,7 +20,7 @@ fi
 sp_log INFO "RoT boot state" raw="$(echo "$rot_state" | jq -c .)"
 
 sp_step "Checking RoT active slot"
-active=$(echo "$rot_state" | jq -r '.Ok.active // empty' 2>/dev/null)
+active=$(echo "$rot_state" | jq -r '.Ok.active // empty')
 if [ -z "$active" ] || [ "$active" = "null" ]; then
     sp_fail "RoT boot state present but reports no active slot"
 fi

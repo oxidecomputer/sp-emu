@@ -892,6 +892,8 @@ impl Bus {
         if let Some((r, off)) = self.ram_for(addr, 2) {
             u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap())
         } else {
+            // `addr` is already folded; read32 re-folds it, which is an idempotent
+            // no-op here (only non-secure MMIO reaches this sub-word fallback).
             (self.read32(addr & !3) >> (8 * (addr & 2))) as u16
         }
     }

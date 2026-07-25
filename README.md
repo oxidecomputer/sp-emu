@@ -15,11 +15,10 @@ answer the management gateway (MGS) over UDP.
   hardware does: `discover`, `state`, `inventory`, `read-sensor-value`,
   `power-state`, `rot-boot-info`, caboose reads, dumps, and the rest of the
   faux-mgs surface.
-- Lets `humility` attach to the running firmware three ways: a read-only GDB-RSP
-  listener and a read/write OpenOCD listener (live task table, per-task stack
-  backtraces, `readmem`, ringbufs, `writemem`), plus a real SWD debug port exposed
-  as a Glasgow Interface Explorer probe that models actual halt/run/step -- so
-  halt-and-run commands like `hiffy` work, not just memory reads.
+- Lets `humility` attach to the running firmware over a real SWD debug port
+  exposed as a Glasgow Interface Explorer probe that models actual halt/run/step
+  -- so halt-and-run commands like `hiffy` work, alongside the live task table,
+  per-task stack backtraces, `readmem`/`writemem`, and ringbufs.
 - Runs the SP and RoT together over an emulated sprot SPI link, so
   `drv-stm32h7-sprot-server` on the emulated SP talks to `drv-lpc55-sprot-server`
   on the emulated RoT. The RoT publishes boot-state measurements (sha3-256 of the
@@ -100,15 +99,10 @@ humility -a <gimlet-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:4454 tasks
 humility -a <gimlet-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:4454 hiffy -c Jefe.get_state
 ```
 
-`sp-emu gdb` prints the exact `gdb`, `ocd`, and `swd` ports and the attach lines on
-startup (the `ready (gdb :... ocd :... swd :...)` line), so you do not have to do
-the port arithmetic by hand.
-
-sp-emu also serves the older read-only GDB-RSP (`-p ocdgdb`, port `3333 + off`) and
-read/write OpenOCD-Tcl (`-p ocd`, port `6666 + off`) transports, but recent
-humility removed those probe cores (`unrecognized probe: ocdgdb`), so they need a
-pre-removal humility build, and they fake the debug core -- `hiffy` hangs on them.
-Prefer the SWD port.
+sp-emu prints the exact `swd` port and the attach line on startup (the
+`ready (swd :...)` line), so you do not have to do the port arithmetic by hand.
+(Older `-p ocdgdb`/`-p ocd` transports were removed once humility dropped those
+probe backends; the SWD/Glasgow probe is the one a stock humility drives.)
 
 The `demo/` directory wraps all of this in scripts:
 
@@ -130,7 +124,7 @@ sp-emu flash <a|b> <image.bin | build-archive.zip>   program a flash slot
 sp-emu erase <a|b>                                   erase a slot
 sp-emu info                                          show each slot's reset vector
 sp-emu run [a|b] [max_insns]                         boot from a slot and run (max_insns 0 = run forever)
-sp-emu gdb [a|b] [preboot]                           boot a slot, then serve GDB/OpenOCD/SWD for humility
+sp-emu gdb [a|b] [preboot]                           legacy alias for `run <slot> 0` (serve SWD + MGS)
 sp-emu rot <oxide-rot-1 image> [max]                 boot the LPC55 RoT firmware standalone
 sp-emu rot-serve <listen-addr> <rot-image>           run a shared RoT for SPs to connect to
 sp-emu i2c-sniff [listen-addr]                        observe I2C traffic from a running emulator
@@ -196,7 +190,7 @@ The ones you reach for most:
 - `SP_EMU_ROT_FRESH`: ignore any persisted RoT flash and re-seed it from scratch this run,
   so there is no doubt about whether persistent state is in use.
 - `SP_EMU_HOST_UART`: socket for the host-to-SP comms UART (IPCC).
-- `SP_EMU_NO_DEBUG`: suppress the humility debug listeners.
+- `SP_EMU_NO_DEBUG`: suppress the SWD debug listener (serve the MGS bridge only).
 - `SP_EMU_I2C_BRIDGE` / `SP_EMU_I2C_DEVICE`: socket for the I2C sniff and delegate bridges.
 - `SP_EMU_IDENTITY`: path to the per-instance identity file (default
   `sp-emu-identity`). Give each instance in a fleet its own, like `SP_EMU_FLASH`.

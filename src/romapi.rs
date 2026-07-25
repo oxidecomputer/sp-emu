@@ -24,7 +24,8 @@ use crate::mem::Bus;
 const LPC55_ROM_TABLE: u32 = 0x1300_10f0;
 /// Byte offset of `BootloaderTree.skboot` (ten preceding 4-byte fields on thumbv8m;
 /// see hubris `lpc55-romapi` `BootloaderTree`). Holds a pointer to `SKBootFns`.
-const BOOTLOADER_TREE_SKBOOT_OFFSET: u32 = 0x28;
+/// Written as `10 * 4` so the "ten preceding fields" derivation is explicit.
+const BOOTLOADER_TREE_SKBOOT_OFFSET: u32 = 10 * 4;
 const SKBOOT_PTR_ADDR: u32 = LPC55_ROM_TABLE + BOOTLOADER_TREE_SKBOOT_OFFSET;
 
 /// LPC55 boot-ROM image window (hubris `lpc55-romapi::LPC55_BOOT_ROM`, 64 KiB). We
@@ -96,28 +97,36 @@ pub fn is_trap(pc: u32) -> bool {
 /// `skboot_authenticate` computes its verdict once, then parks for `SETTLE_STEPS`
 /// so interrupts flow; other ROM entries return immediately via `LR`.
 pub fn rom_dispatch(cpu: &mut Cpu, bus: &mut Bus) {
+    // Only AUTH_TRAP drives the settle state machine. The HASHCRYPT irq handler
+    // (and any other/unknown trap) returns immediately via LR and must NOT touch
+    // `cpu.rom_call`: a foreign trap taken *during* an in-flight AUTH_TRAP settle
+    // would otherwise be absorbed by a Settling arm and corrupt both calls' returns.
+    if cpu.pc != AUTH_TRAP {
+        cpu.pc = cpu.r[14] & !1;
+        return;
+    }
     match std::mem::take(&mut cpu.rom_call) {
-        RomCall::Idle => match cpu.pc {
-            AUTH_TRAP => {
-                let start = cpu.r[0];
-                let is_verified_ptr = cpu.r[1];
-                let ok = verify_slot(bus, start);
-                if crate::config::get().romdbg {
-                    eprintln!(
-                        "[rom] skboot_authenticate(start={start:#010x}) -> {}",
-                        if ok { "OK" } else { "FAIL" }
-                    );
+        RomCall::Idle => {
+            let start = cpu.r[0];
+            let is_verified_ptr = cpu.r[1];
+            let result = verify_slot(bus, start);
+            if crate::config::get().romdbg {
+                match &result {
+                    Ok(()) => {
+                        eprintln!("[rom] skboot_authenticate(start={start:#010x}) -> OK")
+                    }
+                    Err(e) => {
+                        eprintln!("[rom] skboot_authenticate(start={start:#010x}) -> FAIL ({e:?})")
+                    }
                 }
-                // Park at AUTH_TRAP (pc unchanged) while the "operation" settles.
-                cpu.rom_call = RomCall::Settling {
-                    left: SETTLE_STEPS,
-                    is_verified_ptr,
-                    ok,
-                };
             }
-            // HASHCRYPT irq handler (and any unknown trap): no-op, return via LR.
-            _ => cpu.pc = cpu.r[14] & !1,
-        },
+            // Park at AUTH_TRAP (pc unchanged) while the "operation" settles.
+            cpu.rom_call = RomCall::Settling {
+                left: SETTLE_STEPS,
+                is_verified_ptr,
+                ok: result.is_ok(),
+            };
+        }
         RomCall::Settling {
             left,
             is_verified_ptr,
@@ -149,12 +158,25 @@ pub fn rom_dispatch(cpu: &mut Cpu, bus: &mut Bus) {
     }
 }
 
+/// Why `verify_slot` rejected an image. Distinct variants so the `romdbg` trace can
+/// tell a mis-provisioned CMPA/CFPA apart from a genuine signature failure during
+/// triage (the caller still reduces this to the ABI success/fail bool).
+#[derive(Debug)]
+enum VerifyError {
+    /// No RoT flash is installed, so there's nothing to verify against.
+    NoRotFlash,
+    /// The CMPA page (root-key hashes) didn't parse.
+    Cmpa,
+    /// The active CFPA page didn't parse.
+    Cfpa,
+    /// The cert chain / RSA / SHA-256 verification failed.
+    Signature,
+}
+
 /// Verify the signed image at `start` against the RoT's own CMPA + active CFPA,
-/// using the host verifier. Returns true iff the signature/cert chain is valid.
-fn verify_slot(bus: &Bus, start: u32) -> bool {
-    let Some(f) = bus.rot_flash() else {
-        return false;
-    };
+/// using the host verifier. `Ok(())` iff the signature/cert chain is valid.
+fn verify_slot(bus: &Bus, start: u32) -> Result<(), VerifyError> {
+    let f = bus.rot_flash().ok_or(VerifyError::NoRotFlash)?;
     // bootleby passes the image's link address, which may be the TrustZone secure
     // flash alias; fold it onto the modeled non-secure window that `RotFlash` indexes.
     // (The Bus folds this for guest accesses, but here we read `RotFlash` directly.)
@@ -167,15 +189,11 @@ fn verify_slot(bus: &Bus, start: u32) -> bool {
     } else {
         crate::rot_flash::SIZE
     };
-    let cmpa = match lpc55_areas::CMPAPage::from_bytes(&f.cmpa_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let cfpa = match lpc55_areas::CFPAPage::from_bytes(&f.active_cfpa_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    lpc55_sign::verify::verify_image(f.slice(start, len), cmpa, cfpa).is_ok()
+    let cmpa = lpc55_areas::CMPAPage::from_bytes(&f.cmpa_bytes()).map_err(|_| VerifyError::Cmpa)?;
+    let cfpa =
+        lpc55_areas::CFPAPage::from_bytes(&f.active_cfpa_bytes()).map_err(|_| VerifyError::Cfpa)?;
+    lpc55_sign::verify::verify_image(f.slice(start, len), cmpa, cfpa)
+        .map_err(|_| VerifyError::Signature)
 }
 
 #[cfg(test)]
@@ -232,6 +250,49 @@ mod tests {
         rom_dispatch(&mut cpu, &mut bus);
         assert_eq!(cpu.pc, 0x0001_0330); // returned via LR, no parking
         assert!(matches!(cpu.rom_call, RomCall::Idle));
+    }
+
+    #[test]
+    fn settle_success_writes_verified_and_success() {
+        // Drive the Settling -> complete branch with ok=true directly (a real signed
+        // image + verifier isn't available in a unit test), covering the success
+        // write-back the fail-path tests don't reach.
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        bus.add_ram(0x2000_0000, 0x1000); // backing for the is_verified out-ptr
+        cpu.pc = AUTH_TRAP;
+        cpu.r[14] = 0x0001_0201; // LR
+        cpu.rom_call = RomCall::Settling {
+            left: 0,
+            is_verified_ptr: 0x2000_0000,
+            ok: true,
+        };
+        rom_dispatch(&mut cpu, &mut bus);
+        assert_eq!(cpu.r[0], SKBOOT_SUCCESS);
+        assert_eq!(bus.read32(0x2000_0000), SECURE_TRACKER_VERIFIED);
+        assert_eq!(cpu.pc, 0x0001_0200); // returned via LR
+        assert!(matches!(cpu.rom_call, RomCall::Idle));
+    }
+
+    #[test]
+    fn foreign_trap_during_settle_does_not_disturb_it() {
+        // A HASHCRYPT_TRAP taken while an AUTH_TRAP call is settling must return via
+        // LR and leave the settle state intact (regression for the state-vs-PC guard).
+        let mut cpu = Cpu::new();
+        let mut bus = Bus::new();
+        cpu.rom_call = RomCall::Settling {
+            left: 5,
+            is_verified_ptr: 0x2000_0000,
+            ok: false,
+        };
+        cpu.pc = HASHCRYPT_TRAP;
+        cpu.r[14] = 0x0001_0331; // LR (Thumb)
+        rom_dispatch(&mut cpu, &mut bus);
+        assert_eq!(cpu.pc, 0x0001_0330, "returned via LR");
+        assert!(
+            matches!(cpu.rom_call, RomCall::Settling { left: 5, .. }),
+            "the in-flight AUTH settle is untouched"
+        );
     }
 
     #[test]
