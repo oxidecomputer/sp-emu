@@ -5,7 +5,7 @@
 # debug port on tcp 127.0.0.1:4444 (swd = 4444 + (bridge - 33300)):
 #
 #   SP_EMU_BRIDGE='[::1]:33300' SP_EMU_ROT_FLASH=<rot image> \
-#     sp-emu gdb a 0
+#     sp-emu run a 0
 #
 # `discover` will overwrite the name/board fields below with what it reads.
 

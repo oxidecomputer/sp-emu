@@ -483,8 +483,8 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
         bus.secure_alias = true;
         cpu.rom_traps = true;
         bus.rom_enabled = true;
-        let sp = bus.read32(0); // bootleby vector table at flash base
-        let pc = bus.read32(4) & !1;
+        let sp = bus.read32(rot_flash::BASE); // bootleby vector table at flash base
+        let pc = bus.read32(rot_flash::BASE + 4) & !1;
         eprintln!(
             "[rot] bootleby: {} bytes @ 0x0; SP={:#010x} PC={:#010x} (secure-alias + boot-ROM on)",
             bl.len(),

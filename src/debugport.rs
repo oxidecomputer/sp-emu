@@ -2,10 +2,10 @@
 //!
 //! This is the register-level model probe-rs drives over SWD. The Glasgow-applet
 //! server (`glasgow.rs`) decodes `CMD_TRANSFER` into calls to [`SwDp::transfer`];
-//! a later phase can drive the same model from the emulated RoT. Unlike the
-//! read-only GDB stub and the OpenOCD-Tcl RPC in `gdb.rs`, this offers a *real*
-//! debug core — halt/run/step plus register access via DCRSR/DCRDR — which is
-//! what hiffy (halt, write program, run, read results) and endoscope need.
+//! a later phase can drive the same model from the emulated RoT. Unlike a
+//! read-only, memory-only stub, this offers a *real* debug core — halt/run/step
+//! plus register access via DCRSR/DCRDR — which is what hiffy (halt, write
+//! program, run, read results) and endoscope need.
 //!
 //! sp-emu speaks the Glasgow *applet* protocol, not raw SWD line bits, so there
 //! is no parity/turnaround/clocking here — just ADIv5 register semantics.
