@@ -174,7 +174,13 @@ pub fn serve(
     // immediately instead of waiting out the rest of the quantum. On by default;
     // SP_EMU_ETH_TXBREAK=0 disables it (A/B against the once-per-batch behavior).
     let txbreak = crate::config::get().eth_txbreak;
-    eprintln!("[gdb] eth-service: quantum={} txbreak={}", quantum, txbreak);
+    // sprot SP->RoT artificial flow-control threshold (0 = disabled). See the
+    // phase-1 lockstep break in the SP burst below and config::sprot_flowctl.
+    let sprot_flowctl = crate::config::get().sprot_flowctl as usize;
+    eprintln!(
+        "[gdb] eth-service: quantum={} txbreak={} sprot_flowctl={}",
+        quantum, txbreak, sprot_flowctl
+    );
 
     // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the SWD debug listener
     // entirely — MGS only needs the bridge UDP. Otherwise bind it.
@@ -328,11 +334,29 @@ pub fn serve(
             if cpu.idle_skip > 0 {
                 break;
             }
-            // Phase-2 lockstep: if the RoT is replying and its TX FIFO (miso) has
-            // drained, stop so the RoT can refill before clocking more.
+            // sprot lockstep. On hardware the SP TX FIFO and the RoT RX FIFO are
+            // separate devices joined only by the SPI wires -- there is NO flow
+            // control, the SP clocks at its own pace and the RoT must keep up. The
+            // emulator collapses both into the one shared `mosi`/`miso` buffer and
+            // runs the SP a whole quantum before the RoT ever steps, so a >16-byte
+            // request would overrun the RoT's 16-deep RX FIFO and truncate the frame
+            // (the cause of "sprot: timeout" on RoT/stage0 updates). These two breaks
+            // add a deliberately non-physical flow-control signal to compensate for
+            // that coarse scheduling; they are not on the schematic. (spemu-1c4)
             if let Some(l) = crate::sprot::link() {
                 let l = l.borrow();
+                // Phase-2 (RoT->SP): the RoT is replying and its TX FIFO (miso) has
+                // drained -- stop so the RoT can refill before the SP clocks more.
                 if l.rot_irq && l.cs && l.miso.is_empty() {
+                    break;
+                }
+                // Phase-1 (SP->RoT request): the SP has filled the shared buffer to
+                // the RoT RX-FIFO depth -- stop so the RoT is stepped to drain FIFORD
+                // before the next byte overruns it. Gate on !rot_irq: during a reply
+                // (rot_irq asserted) the SP's TXDR clock-in dummies also land in
+                // `mosi` but the RoT is sending, not draining, so applying this then
+                // would wedge the SP mid-reply. `sprot_flowctl == 0` disables it.
+                if sprot_flowctl != 0 && !l.rot_irq && l.mosi.len() >= sprot_flowctl {
                     break;
                 }
             }
@@ -492,6 +516,13 @@ pub fn serve(
                 if rot_idled {
                     break;
                 }
+                // The RoT-side reply direction already has flow control: FIFOSTAT
+                // (sprot.rs) reports TXNOTFULL gated on `miso` depth, so the RoT
+                // firmware stalls itself when its TX FIFO is full, and the existing
+                // rot-irq break lets the SP clock the reply out. (A symmetric
+                // serve-loop break on `miso` full was tried but starved the RoT
+                // mid-reply-construction -- before it asserts rot-irq the SP isn't
+                // clocking, so a full buffer can't drain and the exchange hangs.)
                 if crate::sprot::link()
                     .map(|l| l.borrow().rot_irq)
                     .unwrap_or(false)
