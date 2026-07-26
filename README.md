@@ -127,6 +127,8 @@ sp-emu run [a|b] [max_insns]                         boot from a slot and run (m
 sp-emu gdb [a|b] [preboot]                           legacy alias for `run <slot> 0` (serve SWD + MGS)
 sp-emu rot <oxide-rot-1 image> [max]                 boot the LPC55 RoT firmware standalone
 sp-emu rot-serve <listen-addr> <rot-image>           run a shared RoT for SPs to connect to
+sp-emu pack [bundle.zip]                             bundle this instance (flash + archives) into one portable zip
+sp-emu unpack <bundle.zip> [dir]                     extract an instance bundle, ready to run and inspect with humility
 sp-emu i2c-sniff [listen-addr]                        observe I2C traffic from a running emulator
 sp-emu i2c-device [addr] [spec ...]                   stand in as I2C devices for a running emulator
 ```
@@ -155,17 +157,46 @@ are modeled with real unlock/erase/program semantics, the option-byte bank swap,
 and persistence, so an in-band MGS update programs the inactive bank, and the
 option-byte swap plus the SP reset that follows reboots into the newly written
 image — exactly as on silicon. Flash contents and the persisted swap survive
-across runs (`$SP_EMU_FLASH` plus a small `.nv` state file beside it).
+across runs (`$SP_EMU_FLASH` plus a small `.nv` state file beside it, which also
+records the Hubris archive the slot was flashed from).
 
 To exercise an update end to end the SP must run across that reset, so run it in
 the run-forever mode (`run <slot> 0`) with the MGS bridge bound.
+
+### Instance archives and portable bundles
+
+Flash from a full **Hubris build archive**, not a bare `.bin`. sp-emu now relies on
+archive content both to initialize the instance (the SP's Ethernet ports come from
+the image's `app.toml`) and for humility tooling (`ringbuf`/`hiffy` verify the
+archive's image id against the running image). Flashing a bare image still works but
+prints a warning that a flash image alone is inadequate; set `SP_EMU_NO_ARCHIVE_WARN`
+to silence it.
+
+When you flash from an archive, sp-emu copies it into an `archives/` directory beside
+the flash image and records the reference in the `.nv` companion file, so a
+run-from-flash instance keeps its archive without re-supplying it. The SP flash, the
+RoT flash, and their archives all anchor to one instance base (the SP flash's
+directory), so the two cores travel together.
+
+`sp-emu pack [bundle.zip]` bundles the whole instance (the flash images, their `.nv`
+files, identity, a bundle-relative `config.toml`, the stowed Hubris archives, and a
+`manifest.toml`) into a single portable zip. `sp-emu unpack <bundle.zip> [dir]`
+extracts it; the unpacked instance re-runs with `sp-emu --load-config config.toml run
+a 0` and is humility-attachable (`humility -a archives/<component>.zip ...`) without
+the original archives. `pack` captures the `SP_EMU_*` knobs present in its own
+environment, so pack with the same environment you run with.
 
 ## Environment variables
 
 The ones you reach for most:
 
+- `SP_EMU_STATE_DIR`: directory for this instance's persistent state (the flash
+  images, their `.nv` companion files, the derived identity, and the stowed Hubris
+  archives). When unset, sp-emu uses a per-user default under `$XDG_STATE_HOME` or
+  `~/.local/state/sp-emu` and prints a warning, so a bare run never writes into the
+  working directory. Give each instance in a fleet its own.
 - `SP_EMU_FLASH`: path to the NVM (flash) image file. Defaults to `sp-flash.bin`
-  in the working directory.
+  under `SP_EMU_STATE_DIR`; set it to place the flash somewhere specific.
 - `SP_EMU_BOARD`: `gimlet` (default) or `sidecar`. Selects the SoC model and identity.
 - `SP_EMU_BRIDGE`: loopback address for the MGS UDP surface, for example
   `[::1]:33310`. The two switch ports are this one and the next.
@@ -174,8 +205,8 @@ The ones you reach for most:
 - `SP_EMU_ROT_FLASH`: instead of a service, run an in-process RoT core from this image.
   Unlike `SP_EMU_ROT_SERVICE`, this RoT drives the SP's debug port over an internal SWD
   link, so it can run the endoscope attestation measurement (see `demo/run-sp-measure.sh`).
-- `SP_EMU_ROT_NVM`: path to the RoT flash backing file (default `sp-rot-flash.bin`),
-  the RoT analog of `SP_EMU_FLASH`. A persisted file takes precedence over the image
+- `SP_EMU_ROT_NVM`: path to the RoT flash backing file (defaults to `sp-rot-flash.bin`
+  under `SP_EMU_STATE_DIR`), the RoT analog of `SP_EMU_FLASH`. A persisted file takes precedence over the image
   passed on the command line, so delete it to reseed (or set `SP_EMU_ROT_FRESH`); give
   each instance its own. A persisted file that would shadow the protected-flash
   overrides below warns rather than silently ignoring them.
@@ -191,22 +222,33 @@ The ones you reach for most:
   so there is no doubt about whether persistent state is in use.
 - `SP_EMU_HOST_UART`: socket for the host-to-SP comms UART (IPCC).
 - `SP_EMU_NO_DEBUG`: suppress the SWD debug listener (serve the MGS bridge only).
+- `SP_EMU_SPROT_COUPLE`: while the SP is blocked on an in-flight sprot request, pace
+  its SysTick by the RoT's elapsed ticks instead of the emulator's idle throttle, so
+  the SP's sprot timeout tracks the RoT's real work (both kernels tick at 1 ms). On by
+  default; set it to `0` to restore the old idle-throttle timing.
+- `SP_EMU_NO_ARCHIVE_WARN`: silence the warning printed when the instance has no Hubris
+  archive (flashed from a bare image); see "Instance archives and portable bundles".
 - `SP_EMU_I2C_BRIDGE` / `SP_EMU_I2C_DEVICE`: socket for the I2C sniff and delegate bridges.
-- `SP_EMU_IDENTITY`: path to the per-instance identity file (default
-  `sp-emu-identity`). Give each instance in a fleet its own, like `SP_EMU_FLASH`.
+- `SP_EMU_IDENTITY`: path to the per-instance identity file (defaults to
+  `sp-emu-identity` under `SP_EMU_STATE_DIR`). Give each instance in a fleet its own,
+  like `SP_EMU_FLASH`.
 - `SP_EMU_SEED`: same as the `--seed` flag below.
 
 There are also `SP_EMU_*DBG` switches (`SP_EMU_SPROTDBG`, `SP_EMU_ETHDBG`,
-`SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, `SP_EMU_ROMDBG`, and so on) that turn on
-per-subsystem tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock,
+`SP_EMU_SPIDBG`, `SP_EMU_FLASHDBG`, `SP_EMU_ROMDBG`, `SP_EMU_COUPLEDBG`, and so on)
+that turn on per-subsystem tracing. `SP_EMU_FLASHDBG` traces the FLASH controller: unlock,
 erase, program, and the option-byte bank swap; `SP_EMU_ROMDBG` traces boot-ROM
 API calls (each `skboot_authenticate` and its verdict).
 
-Running the real bootleby bootloader for genuine A/B image selection is a work in
-progress: `SP_EMU_ROT_BOOTLEBY=<image>` loads bootleby at the flash base and boots
-it (with `SP_EMU_ROT_CMPA` / `SP_EMU_ROT_CFPA` supplying the real device
-protected-flash pages its validation requires). It boots and verifies an image via
-the boot-ROM shim, but does not yet complete the full boot.
+`SP_EMU_ROT_BOOTLEBY=<image>` loads the real bootleby bootloader at the flash base
+and boots it for genuine A/B (and panic) image selection, with `SP_EMU_ROT_CMPA` /
+`SP_EMU_ROT_CFPA` supplying the real device protected-flash pages its validation
+requires and `SP_EMU_ROT_ROM=1` enabling the boot-ROM `skboot_authenticate` shim.
+bootleby verifies each slot's signature against the CMPA, selects and jumps, and the
+real `lpc55-rot-startup` then rebuilds the boot-state handoff, so `rot-boot-info`
+over MGS reports the actual active slot and real sha3-256 digests. Use self-signed
+(dice-self) RoT images: they are secure-boot-signed so bootleby verifies them, and
+take the PUF DICE path so they boot past the manufacturing USART step.
 
 ## Configuration
 

@@ -256,7 +256,10 @@ impl RotFlash {
         // selection; absent, slot B stays erased (invalid).
         if let Some(path) = cfg.rot_image_b.as_deref() {
             let img_b = crate::flash::load_image(path)?;
-            eprintln!("[rotflash] seeded slot B ({} bytes) from {path}", img_b.len());
+            eprintln!(
+                "[rotflash] seeded slot B ({} bytes) from {path}",
+                img_b.len()
+            );
             self.write_pages(IMAGE_B_BASE as usize, &img_b);
         }
         // Real device CMPA/CFPA pages if provided (SP_EMU_ROT_CMPA/CFPA, for running
@@ -564,7 +567,7 @@ impl RotFlash {
 
 /// Default backing-file path for the RoT flash, `$SP_EMU_ROT_NVM` or a default.
 pub fn nvm_path() -> String {
-    crate::config::get().rot_nvm_path.clone()
+    crate::config::instance_file("SP_EMU_ROT_NVM", &crate::config::get().rot_nvm_path)
 }
 
 pub fn load_image(path: &str) -> Result<Vec<u8>> {
