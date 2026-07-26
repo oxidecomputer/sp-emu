@@ -2,7 +2,7 @@
 //! over a config file) exactly once, resolve it, persist it, and store it. After
 //! `init`, no other module reads the environment; they call `config::get()`.
 //!
-//! This is the ingestion half of the design in the tracker (spemu-dxw): a single
+//! This is the ingestion half of the design: a single
 //! CLI wrapper sources and vets config; the rest of the program consumes a typed,
 //! immutable `Config`.
 //!
@@ -142,7 +142,7 @@ config! {
     // ---- behavior toggles (presence = on) ----
     // Emulate the LPC55 boot-ROM signature API (skboot_authenticate) so the RoT
     // pre-kernel's authenticate_image() runs for real. Off by default: keeps the
-    // fast direct-boot path unchanged (spemu-z89).
+    // fast direct-boot path unchanged.
     rot_rom: bool = "SP_EMU_ROT_ROM" => |v| v.is_some(),
     // Ignore any persisted RoT flash and re-seed from scratch this run (removes doubt
     // about whether persistent state is in use). Default off = backward compatible.
@@ -190,20 +190,20 @@ config! {
     rot_service: Option<String> = "SP_EMU_ROT_SERVICE" => |v| v.filter(|s| !s.is_empty()),
     rot_flash: Option<String> = "SP_EMU_ROT_FLASH" => |v| v,
     // Path to a real bootleby image: load it at flash base 0x0 and boot IT (secure
-    // aliases + boot-ROM API on), so bootleby does genuine A/B selection (spemu-kx3).
+    // aliases + boot-ROM API on), so bootleby does genuine A/B selection.
     rot_bootleby: Option<String> = "SP_EMU_ROT_BOOTLEBY" => |v| v,
     // Real device CMPA/CFPA pages (512 bytes each) to seed instead of the synthesized
-    // ones, so real bootleby's PFR validation passes (spemu-kx3).
+    // ones, so real bootleby's PFR validation passes.
     rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
     rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
     // A slot-B image (flash.b, 0x50000) to seed alongside slot A, so real bootleby
-    // can perform genuine A/B selection. Absent => slot B left erased/invalid (spemu-kzi).
+    // can perform genuine A/B selection. Absent => slot B left erased/invalid.
     rot_image_b: Option<String> = "SP_EMU_ROT_IMAGE_B" => |v| v,
     // Leave slot A (flash.a, 0x10000) erased instead of seeding the passed image, to
-    // drive bootleby's B-only and neither(panic) selection cases (spemu-kzi).
+    // drive bootleby's B-only and neither(panic) selection cases.
     rot_erase_a: bool = "SP_EMU_ROT_ERASE_A" => |v| v.is_some(),
     // Persistent CFPA boot preference for the synthesized CFPA: "b" prefers slot B,
-    // otherwise slot A. Ignored when SP_EMU_ROT_CFPA overrides the page (spemu-kzi).
+    // otherwise slot A. Ignored when SP_EMU_ROT_CFPA overrides the page.
     rot_boot_pref: Option<String> = "SP_EMU_ROT_BOOT_PREF" => |v| v,
     rot_dice: Option<String> = "SP_EMU_ROT_DICE" => |v| v,
     archive: Option<String> = "SP_EMU_ARCHIVE" => |v| v,
@@ -261,7 +261,7 @@ config! {
     // the coarse two-core scheduling (the SP runs a whole quantum before the RoT
     // runs), which otherwise truncates any >16-byte request. Default = the RoT SPI
     // RX FIFO depth (16); "0" disables it (restores the real overrun-and-drop
-    // behavior, e.g. to study the failure). See spemu-1c4.
+    // behavior, e.g. to study the failure).
     sprot_flowctl: u32 = "SP_EMU_SPROT_FLOWCTL" => |v| {
         v.and_then(|s| s.parse().ok()).unwrap_or(16)
     },
@@ -272,7 +272,7 @@ config! {
     // timeout counts down at the true RoT-relative rate (RoT-as-SP-peripheral).
     // Without it, a slow emulated RoT flash op trips the SP's 3-attempt sprot
     // retry (UpdateChunkDelivery(ExhaustedNumAttempts)). "0" disables (restores the
-    // old idle-throttle timing, e.g. to reproduce the failure). See spemu-1c4.
+    // old idle-throttle timing, e.g. to reproduce the failure).
     sprot_couple: bool = "SP_EMU_SPROT_COUPLE" => |v| v.map(|s| s != "0").unwrap_or(true),
     pumpstats_ms: u64 = "SP_EMU_PUMPSTATS_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(50),
     // trim before parsing, matching the historical read (a padded value parsed)
@@ -309,7 +309,7 @@ impl Config {
     /// nested tables) once the `SP_EMU_*` environment variables can be deprecated. The
     /// env-var-mirroring string map exists only to stay backward compatible with them;
     /// with the env layer gone, resolution can key off typed fields directly rather
-    /// than presence-based strings. Tracked in spemu-dxw.
+    /// than presence-based strings.
     fn to_toml(&self) -> String {
         let mut out = String::from(
             "# sp-emu configuration (mirrors $SP_EMU_*; the environment overrides it).\n\

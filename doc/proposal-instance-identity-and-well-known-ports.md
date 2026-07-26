@@ -5,12 +5,12 @@ Context: surfaced by the sp-test workshop
 
 ## Summary
 
-Give each emulated SP its own IPv6 address (two, in fact — one per management
+Give each emulated SP its own IPv6 address (two, in fact: one per management
 uplink) and expose the firmware's UDP sockets on their real, well-known port
 numbers. A developer, faux-mgs, humility, and sp-test then reach the emulated SP
-at exactly the addresses and ports they would use against real hardware —
-`<sp-addr>:11111` for MGS, `:11115` for hiffy, `:998` for udprpc, `:11113` for
-dump_agent, and so on — with no per-tool port arithmetic.
+at exactly the addresses and ports they would use against real hardware
+(`<sp-addr>:11111` for MGS, `:11115` for hiffy, `:998` for udprpc, `:11113` for
+dump_agent, and so on) with no per-tool port arithmetic.
 
 This is what unlocks humility's network transports (NetHiffy / NetUdpRpc) and
 `dump_agent` against sp-emu, without emulating a debug probe or SWD. It replaces
@@ -23,24 +23,24 @@ JSON fleet manifest, selected by `--index N` or `--name NAME`, that carries each
 SP's board, addresses, base MAC, serial, and VLANs.
 
 The workshop (a Docker/Podman container) is the driving consumer; voxel is the
-other. The two want opposite addressing models — the workshop wants well-known
+other. The two want opposite addressing models (the workshop wants well-known
 ports, voxel deliberately port-multiplexes a fleet onto one loopback to mirror
-`sp-sim` — so the new path is strictly additive and off by default, and voxel is
+`sp-sim`), so the new path is strictly additive and off by default, and voxel is
 undisturbed. See "Compatibility with voxel."
 
 ## Motivation
 
 The workshop drove sp-test against sp-emu over the `simulator = true` loopback
-MGS path — that works. What does not work is anything humility does over the
+MGS path; that works. What does not work is anything humility does over the
 network:
 
 - sp-emu's bridge (`src/bridge.rs`) relays only two SP sockets:
   `control_plane_agent` (11111) and the ereport snitch (57005). The firmware's
-  other sockets — `hiffy`, `udprpc`/`rpc`, `dump_agent`, `echo`, `broadcast`,
-  `inspector`, `transceivers` — are not reachable from the host, so any
+  other sockets (`hiffy`, `udprpc`/`rpc`, `dump_agent`, `echo`, `broadcast`,
+  `inspector`, `transceivers`) are not reachable from the host, so any
   humility-over-network operation gets ECONNREFUSED.
-- The debug transports sp-emu does offer — GDB-RSP (`humility -p ocdgdb`) and
-  OpenOCD Tcl (`humility -p ocd`), both in `src/gdb.rs` — are network stubs for
+- The debug transports sp-emu does offer, GDB-RSP (`humility -p ocdgdb`) and
+  OpenOCD Tcl (`humility -p ocd`), both in `src/gdb.rs`, are network stubs for
   humility probe backends that humility removed on master (commit `e85b5d8e`,
   "Remove gdb support"). Current humility rejects `ocdgdb`/`ocd` and reaches a
   live target only through probe-rs over USB. There is no network transport left
@@ -48,25 +48,25 @@ network:
 
 Humility's NetHiffy backend is the way out for the operations sp-test actually
 needs (Idol calls: fault injection, `Jefe` task restart, `Jefe.read_fault_counts`).
-It sends a hiffy RPC straight to an SP UDP socket — no probe, no gdb, no SWD. For
+It sends a hiffy RPC straight to an SP UDP socket: no probe, no gdb, no SWD. For
 it to reach the emulated SP, three things must line up:
 
-1. humility has the NetHiffy backend — yes, in the pre-removal window
+1. humility has the NetHiffy backend: yes, in the pre-removal window
    (v0.12.17, `cd161f63`).
-2. the firmware image exposes a `hiffy`/`udprpc` socket — board- and
+2. the firmware image exposes a `hiffy`/`udprpc` socket: board- and
    profile-dependent (see the socket table below; gated on hubris#2466).
-3. sp-emu bridges that socket — today it does not.
+3. sp-emu bridges that socket: today it does not.
 
 This proposal addresses (3), and does it in a way that also makes `dump_agent`
-(task dumps), `udprpc` (NetUdpRpc fallback), and the rest reachable — by giving
+(task dumps), `udprpc` (NetUdpRpc fallback), and the rest reachable, by giving
 the emulated SP the same address/port surface as real hardware.
 
-What network hiffy does *not* cover: non-Idol memory access — raw `readmem`/
+What network hiffy does *not* cover: non-Idol memory access, raw `readmem`/
 `writemem`, ringbuf dumps. Those still want a probe/ocd path or the already
 -working `humility hydrate` snapshot (`Bus::write_hydrate_dump`, `src/mem.rs`).
 So this shrinks the debug-transport gap; it does not eliminate the need for a
 read path. It also runs target code, so it perturbs the SP (an observer effect
-sp-test's own docs call out) — fine for functional tests, relevant for timing
+sp-test's own docs call out): fine for functional tests, relevant for timing
 ones.
 
 ## How it works today
@@ -91,14 +91,14 @@ let serial   = format!("BRM4422000{}", idx);
 
 VPD *is* emulated: `build_vpd_eeprom` writes a FRU0/`MAC0`
 (`MacAddressBlock` = base_mac[6] + count(128) + stride(1)) + `BARC` barcode into
-the AT24CSW080 model, and `net` derives its per-port MACs — and therefore its
-link-local IPv6 addresses — from that block. The identity is real; it is just
+the AT24CSW080 model, and `net` derives its per-port MACs (and therefore its
+link-local IPv6 addresses) from that block. The identity is real; it is just
 keyed off the port.
 
 So a developer runs a fleet today by varying the port (`demo/run-fleet.sh`,
 `demo/run-sp.sh` `SP_BASE`): sidecar0 at 33300, gimlet0 at 33310, gimlet1 at
 33320. The port picks the switch-view host ports, the ereport port, the gdb/ocd
-debug ports, and the VPD MAC/serial — all at once.
+debug ports, and the VPD MAC/serial, all at once.
 
 ## The problem this creates for well-known ports
 
@@ -109,7 +109,7 @@ collision the current scheme exists to prevent (`src/soc.rs` comment: "a shared
 MAC ... caused L2 collisions => intermittent 'no answer'"). Well-known ports and
 per-instance identity cannot both come from the port. One of them has to move.
 
-(Note: sidecars are already undifferentiated today — `build_vpd_eeprom` hardcodes
+(Note: sidecars are already undifferentiated today; `build_vpd_eeprom` hardcodes
 sidecar MAC/serial regardless of `idx`. It only doesn't bite because a4x2 runs a
 single sidecar. An explicit identity fixes that latent assumption too.)
 
@@ -118,7 +118,7 @@ single sidecar. An explicit identity fixes that latent assumption too.)
 ### 1. Per-instance distinction moves from port to IPv6 address
 
 Each emulated SP owns two host IPv6 addresses, one per management uplink
-(switch0/switch1) — faithful to hardware, where the SP has a distinct link-local
+(switch0/switch1), faithful to hardware, where the SP has a distinct link-local
 per uplink. On each address the bridge binds the firmware's real socket ports.
 Host port always equals SP socket port; instances never collide because they live
 on different addresses.
@@ -144,7 +144,7 @@ collisions):
 
 The bridge binds the sockets a given image actually declares (from the flashed
 archive's `[config.net.sockets.*]`), so there are no dead listeners and the
-capability signal stays honest — bridging a socket the firmware does not serve
+capability signal stays honest; bridging a socket the firmware does not serve
 would over-promise, exactly the trap the capability model exists to prevent.
 
 Implementation is small, because the relay is already parameterized by
@@ -152,7 +152,7 @@ Implementation is small, because the relay is already parameterized by
 
 - host -> SP (`poll_host`): each `BoundSock { sock, vid, sp_port }` already
   injects to `sp_ip:sp_port`; widening the socket set is mechanical.
-- SP -> host (`handle_udp_tx`): the only hardcoding is one line —
+- SP -> host (`handle_udp_tx`): the only hardcoding is one line:
   `if src_port != SP_PORT && src_port != EREPORT_PORT { return; }`. Open it to
   "any bound `sp_port` on this vid" and replies route back via the existing
   `find(s.vid == vid && s.sp_port == src_port)`.
@@ -201,7 +201,7 @@ topology that is implicit or env-scattered today:
 - External override: `--config fleet.json` (or `SP_EMU_CONFIG=...`) replaces the
   built-in.
 - The resolved entry drives the bridge addresses, the VPD `MAC0` block and
-  barcode, the VLANs, and (for sidecar) the ignition topology — i.e. it replaces
+  barcode, the VLANs, and (for sidecar) the ignition topology, i.e. it replaces
   `SP_EMU_BOARD`, the `SP_EMU_BRIDGE`-port->idx derivation, `SP_EMU_VID0/1`, and
   `SP_EMU_IGNITION`.
 
@@ -223,7 +223,7 @@ The workshop is the driving consumer, and the base requirement is a Docker/Podma
 container. Three models, in recommended order:
 
 1. Single container on the student's laptop (default). One `docker run` /
-   `podman run` with the whole toolchain — sp-test plus sp-emu — inside. Runs an
+   `podman run` with the whole toolchain (sp-test plus sp-emu) inside. Runs an
    instance of *both* a sidecar and a gimlet in the same container, which is the
    best demonstration of sp-test's capability-based testing: the same suite runs
    ignition/transceiver tests on the sidecar and skips them on the gimlet, sensor
@@ -233,10 +233,10 @@ container. Three models, in recommended order:
 2. A "butler" server (fallback + real-hardware act). Hosts many sp-emu instances
    (each its own container or zone) alongside real SPs, exposed as testbeds. It
    rescues a student whose laptop setup breaks, and it is where the same sp-test
-   is shown driving emulated and real hardware identically — the capability
+   is shown driving emulated and real hardware identically, the capability
    model's payoff.
 
-3. Per-student Nucleo board, build-from-source (opt-in). Highest friction —
+3. Per-student Nucleo board, build-from-source (opt-in). Highest friction:
    building hubris/humility/sp-test on a student laptop is exactly the setup
    yak-shave the container model exists to avoid. Offer it to the keen; do not
    gate the workshop on it.
@@ -250,7 +250,7 @@ namespace.
 The SP's own link-local addressing does not change. The SP derives its `fe80::`
 link-locals from its VPD MAC and speaks them to the bridge inside the frame model,
 exactly as today. "Each instance has its own IPv6 address" refers to the *host
-rendezvous* plane — the address the bridge binds and a tool dials — which is
+rendezvous* plane (the address the bridge binds and a tool dials), which is
 already a simulator abstraction (`--sp-sim-addr [::1]:...`), not the SP's real
 address. Keep the rendezvous address ULA/global, not link-local, to avoid the
 `%scope` zone-id that link-local binds require across OSes.
@@ -264,14 +264,14 @@ well-known ports work with no host-address juggling:
   wildcard `[::]:port` inside the namespace).
 - Fleet in one container (workshop option 1): the two SPs share one namespace, so
   they need distinct addresses inside it. Trivial here because it is all Linux
-  inside the container — the entrypoint adds loopback IPv6 aliases
+  inside the container: the entrypoint adds loopback IPv6 aliases
   (`ip -6 addr add ... dev lo`), one or two per instance, and each sp-emu binds
   the well-known ports on its own address. The manifest carries `address`.
 
 No macvlan/vnic/tap in any of this. The bridge is a userland UDP relay
 (`UdpSocket` only); it never creates an L2 interface. macvlan would enter only if
 the rendezvous were made the SP's real link-local on a dedicated per-instance
-interface — which is Linux/illumos-only and unnecessary, since tools reach the SP
+interface, which is Linux/illumos-only and unnecessary, since tools reach the SP
 via the sim rendezvous, not a real link-local.
 
 Cross-platform falls out of the container target: Docker Desktop, Podman machine,
@@ -304,12 +304,12 @@ location logic internal to its bridge and never seen by MGS." It is a drop-in fo
 - Per-SP identity is port-derived: sp-emu's VPD `idx = (base_port - 33300)/10`
   feeds the base MAC and serial.
 
-So voxel cannot move to well-known ports without giving each SP its own address —
+So voxel cannot move to well-known ports without giving each SP its own address:
 it deliberately multiplexes the fleet onto one loopback to mirror sp-sim, and
 well-known ports would collide there. It also does not need to: MGS reaches the
 SP fine over the port-multiplexed surface via `--sp-sim-addr`. Well-known ports
 matter only for the *other* sockets (hiffy, udprpc, dump_agent) that humility's
-network backends dial at fixed ports — which is the workshop's need, not voxel's.
+network backends dial at fixed ports, which is the workshop's need, not voxel's.
 
 Requirements for not disrupting voxel:
 

@@ -177,7 +177,7 @@ pub fn serve(
     // sprot SP->RoT artificial flow-control threshold (0 = disabled). See the
     // phase-1 lockstep break in the SP burst below and config::sprot_flowctl.
     let sprot_flowctl = crate::config::get().sprot_flowctl as usize;
-    // sprot SysTick coupling (spemu-1c4): while the SP is blocked on an sprot request
+    // sprot SysTick coupling: while the SP is blocked on an sprot request
     // the RoT has accepted, pace the SP's SysTick by the RoT's elapsed 1ms tick
     // events so the SP's sprot timeout doesn't out-run the slow emulated RoT.
     let sprot_couple = crate::config::get().sprot_couple;
@@ -255,7 +255,7 @@ pub fn serve(
     // Loop-lifetime so its DP/AP/CoreDebug state persists across transactions.
     let mut sp_swdp = crate::debugport::SwDp::new();
 
-    // sprot coupling state (spemu-1c4): the RoT's tick_events at the last iteration,
+    // sprot coupling state: the RoT's tick_events at the last iteration,
     // to compute per-iteration RoT elapsed-time delta. CREDIT_CAP bounds the SP's
     // owed-tick bucket so a stuck-true request_in_flight can't accumulate unbounded
     // credit (a few thousand ticks = a few seconds; not a wedge cap -- the
@@ -356,7 +356,7 @@ pub fn serve(
             // request would overrun the RoT's 16-deep RX FIFO and truncate the frame
             // (the cause of "sprot: timeout" on RoT/stage0 updates). These two breaks
             // add a deliberately non-physical flow-control signal to compensate for
-            // that coarse scheduling; they are not on the schematic. (spemu-1c4)
+            // that coarse scheduling; they are not on the schematic.
             if let Some(l) = crate::sprot::link() {
                 let l = l.borrow();
                 // Phase-2 (RoT->SP): the RoT is replying and its TX FIFO (miso) has
@@ -601,7 +601,7 @@ pub fn serve(
                     }
                 }
             }
-            // sprot SysTick coupling (spemu-1c4): while the SP is blocked on an sprot
+            // sprot SysTick coupling: while the SP is blocked on an sprot
             // request the RoT has accepted (request_in_flight), advance the SP's
             // SysTick by the RoT's elapsed 1ms tick events this iteration (1:1 -- both
             // kernels tick at 1ms) instead of the fabricated one-per-iteration idle

@@ -1,4 +1,4 @@
-//! Minimal LPC55S69 boot-ROM API emulation (spemu-z89, increment 1).
+//! Minimal LPC55S69 boot-ROM API emulation.
 //!
 //! On silicon the RoT pre-kernel (`lpc55-rot-startup::authenticate_image`) and
 //! bootleby reach the boot ROM's `skboot_authenticate` routine through a fixed

@@ -641,7 +641,7 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     cpu.wfi_throttle = true;
     // Boot-ROM API emulation (SP_EMU_ROT_ROM): install the synthesized ROM pointer
     // graph and trap `skboot_authenticate` so the RoT pre-kernel's
-    // authenticate_image() runs the real signature check (spemu-z89). Off by
+    // authenticate_image() runs the real signature check. Off by
     // default -- the direct-boot path above is unchanged.
     if config::get().rot_rom {
         cpu.rom_traps = true;
@@ -652,7 +652,7 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // boot IT instead of jumping to the image; bootleby does genuine A/B selection
     // via the boot-ROM skboot_authenticate shim. It links at the TrustZone secure
     // aliases (flash 0x1000_0000, SRAM 0x3000_0000), so fold those onto the modeled
-    // non-secure memory, and turn on the boot-ROM API it calls. (spemu-kx3)
+    // non-secure memory, and turn on the boot-ROM API it calls.
     if let Some(path) = config::get().rot_bootleby.clone() {
         let bl = flash::load_image(&path)?;
         bus.load_rot_bootleby(&bl);

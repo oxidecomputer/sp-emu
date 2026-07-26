@@ -3,7 +3,7 @@
 # Validates the emulated LPC55S69 RoT boot path against a running sp-emu (started
 # with SP_EMU_ROT_FLASH so the RoT is reachable over sprot). Tests that need
 # genuine bootleby selection are added as the serve-mode-bootleby enablers land;
-# see hwci/README.md and the spemu-6sw bead umbrella.
+# see hwci/README.md.
 
 [suite]
 id = "rot-boot"
