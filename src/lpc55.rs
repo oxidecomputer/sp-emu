@@ -61,7 +61,7 @@ pub fn install_peripherals(bus: &mut Bus) {
     // HASHCRYPT SHA-256 engine (0x400A_4000): real bootleby drives it to fold the
     // selected image's measurement into the DICE CDI (sha256::update_cdi). Added
     // before the catch-alls so it owns 0x400A_4xxx rather than reading back 0 from
-    // the RegFile -- which would spin bootleby forever on STATUS.DIGEST. (spemu-kx3)
+    // the RegFile, which would spin bootleby forever on STATUS.DIGEST.
     bus.add_device(
         0x400A_4000,
         0x1000,

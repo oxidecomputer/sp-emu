@@ -272,7 +272,7 @@ impl RotFlash {
         self.write_pages(CFPA_PING, &cfpa);
         self.write_pages(CFPA_PONG, &cfpa);
         // NMPA: a placeholder programmed page so a read does not fault; the real
-        // device UUID lives here (spemu-f27.3). CFPA scratch is left erased.
+        // device UUID lives here. CFPA scratch is left erased.
         self.write_pages(NMPA, &[0u8; PAGE]);
         Ok(())
     }
@@ -490,7 +490,7 @@ impl RotFlash {
         }
     }
 
-    /// The 512-byte CMPA page, for the boot-ROM signature verifier (spemu-z89).
+    /// The 512-byte CMPA page, for the boot-ROM signature verifier.
     pub fn cmpa_bytes(&self) -> [u8; PAGE] {
         self.mem[CMPA..CMPA + PAGE].try_into().unwrap()
     }

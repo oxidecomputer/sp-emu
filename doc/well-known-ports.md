@@ -8,7 +8,7 @@ unchanged.
 The **well-known-port mode** is an opt-in alternative: each emulated SP binds the
 firmware's real UDP socket ports on its own IPv6 address, so faux-mgs, humility,
 and sp-test reach it at exactly the addresses and ports they would use against
-real hardware -- `<addr>:11111` for MGS, `<addr>:57005` for ereports, and so on,
+real hardware, `<addr>:11111` for MGS, `<addr>:57005` for ereports, and so on,
 with no per-tool port arithmetic. This is what lets sp-test collect ereports from
 the emulated SP (the client dials the fixed port 57005; the offset-mode bridge
 never bound it).
@@ -25,7 +25,7 @@ SP_EMU_ADDR0=::1 \
 - `SP_EMU_ADDR0` is the switch0 (management uplink 0) host address. Default `::1`.
 - `SP_EMU_ADDR1` is the switch1 address. Omit for a single uplink. It must be a
   **different** address from `SP_EMU_ADDR0`, because both uplinks bind the same
-  real ports -- that is the whole point of per-instance addresses.
+  real ports; that is the whole point of per-instance addresses.
 - `SP_EMU_VID0` / `SP_EMU_VID1` and `SP_EMU_BOARD` set the VLAN ids / board as in
   the default mode.
 
@@ -54,12 +54,12 @@ privileged processes. If sp-emu cannot bind one, it prints
 [bridge] skip SP port 7 on [::1]:7 (vid 0x301): Permission denied (os error 13) (socket not bridged)
 ```
 
-and continues -- mgmt (11111) and ereport (57005) still work, only the low
+and continues: mgmt (11111) and ereport (57005) still work, only the low
 sockets are missing. `echo`/`broadcast`/`rpc` are rarely needed for sp-test, so
 this fallback is fine for a quick run. To bind them, pick **one** of the options
 below (in rough order of preference).
 
-### Option A -- grant the binary the capability (host, persistent)
+### Option A: grant the binary the capability (host, persistent)
 
 Give just the sp-emu binary permission to bind low ports, without running it as
 root:
@@ -72,7 +72,7 @@ getcap target/release/sp-emu            # verify: cap_net_bind_service=ep
 Re-run `setcap` after each rebuild (a new binary drops the capability). To remove
 it: `sudo setcap -r target/release/sp-emu`.
 
-### Option B -- lower the unprivileged-port floor (host or container, whole system)
+### Option B: lower the unprivileged-port floor (host or container, whole system)
 
 Allow *any* process to bind from port 0 up:
 
@@ -90,7 +90,7 @@ sudo sysctl --system
 
 Undo by restoring the default (`1024`).
 
-### Option C -- container capability (workshop / CI)
+### Option C: container capability (workshop / CI)
 
 When sp-emu runs in a container (the workshop's stage 1), grant the capability to
 the container rather than the host:
@@ -110,7 +110,7 @@ docker run --sysctl net.ipv4.ip_unprivileged_port_start=0 ...
 The workshop's stage-1 image does this for you (see the stage-1 container docs),
 so students never hit the privileged-port wall.
 
-### Option D -- run as root
+### Option D: run as root
 
 Works, but is the least preferred: prefer the capability (Option A/C) so the
 emulator runs unprivileged.

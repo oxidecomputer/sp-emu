@@ -1,4 +1,4 @@
-//! LPC55S69 HASHCRYPT SHA-256 engine (spemu-kx3).
+//! LPC55S69 HASHCRYPT SHA-256 engine.
 //!
 //! Real bootleby folds a measurement of the selected image into the DICE CDI with
 //! `sha256::update_cdi`, which drives this hardware SHA-256 unit directly (UM11126

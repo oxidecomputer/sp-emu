@@ -593,7 +593,7 @@ impl Cpu {
                 // real IRQ (e.g. eth-irq from an injected MGS packet).
                 if self.wfi_throttle && self.systick > 1 && !bus.any_pending_irq() {
                     if self.sp_tick_credit > 0 {
-                        // sprot coupling (spemu-1c4): the SP is blocked on an sprot
+                        // sprot coupling: the SP is blocked on an sprot
                         // request the RoT has accepted, and the serve loop credited
                         // it with the RoT's elapsed 1ms tick events. Convert one unit
                         // of RoT-elapsed time into one SP SysTick: arm the countdown
@@ -1644,7 +1644,7 @@ impl Cpu {
             // One 1ms tick elapsed. Count it whether or not the exception is
             // delivered below (a masked/handler-mode tick still marks elapsed time):
             // the serve loop diffs the RoT's `tick_events` to pace the SP's SysTick
-            // during a coupled sprot wait (spemu-1c4).
+            // during a coupled sprot wait.
             self.tick_events = self.tick_events.wrapping_add(1);
             if self.syst_csr & 2 != 0 && self.mode == Mode::Thread && !self.primask {
                 self.exception_entry(15, bus); // SysTick exception
@@ -2582,8 +2582,8 @@ mod tests {
 
     /// SysTick underflow bumps `tick_events` once per reload period, and it counts
     /// even when the exception is not delivered (here: handler mode). The serve loop
-    /// diffs the RoT's `tick_events` as its elapsed-time proxy for coupling
-    /// (spemu-1c4), so the count must not depend on delivery.
+    /// diffs the RoT's `tick_events` as its elapsed-time proxy for coupling, so
+    /// the count must not depend on delivery.
     #[test]
     fn tick_events_counts_underflows_even_undelivered() {
         let mut bus = ram_bus();
@@ -2606,8 +2606,7 @@ mod tests {
 
     /// When the SP is credited with RoT-elapsed ticks (a coupled sprot wait), an idle
     /// WFI converts one credit unit into an armed SysTick (`systick == 1`) WITHOUT
-    /// setting `idle_skip`, so the SP keeps running to deliver the tick and drain more
-    /// (spemu-1c4).
+    /// setting `idle_skip`, so the SP keeps running to deliver the tick and drain more.
     #[test]
     fn wfi_drains_sprot_tick_credit() {
         let mut bus = ram_bus();

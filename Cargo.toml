@@ -18,8 +18,8 @@ sha2 = { version = "0.10", features = ["compress"] }
 # upstream, not locally (see the lighter-weight-integration bead).
 lpc55_areas = { git = "https://github.com/oxidecomputer/lpc55_support", version = "0.2" }
 # Host-side LPC55 secure-boot verifier (cert chain -> RKTH, RSA/SHA-256), reused to
-# back the emulated boot-ROM skboot_authenticate instead of hand-rolling crypto
-# (spemu-z89). default-features=false leaves out its optional clap, matching hubtools.
+# back the emulated boot-ROM skboot_authenticate instead of hand-rolling crypto.
+# default-features=false leaves out its optional clap, matching hubtools.
 lpc55_sign = { git = "https://github.com/oxidecomputer/lpc55_support", version = "0.3", default-features = false }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 libc = "0.2"

@@ -24,16 +24,16 @@ The `-selfsigned` image (built with the `dice-self` feature) runs
 `gen_mfg_artifacts_self`: it reads a device seed from the **LPC55 PUF**
 (`Puf::generate_keycode` / `Puf::get_key`), derives the DICE identity, builds the
 chain, and writes `CertData`/`AliasData`. sp-emu stubs the PUF at `0x4003_B000`
-only enough that `puf_check` does not panic -- it does not model key generation --
+only enough that `puf_check` does not panic (it does not model key generation),
 so the startup produces no seed and the handoff regions stay empty.
 
-## Approach A -- deposit a pre-generated handoff (prototype, implemented)
+## Approach A: deposit a pre-generated handoff (prototype, implemented)
 
 Skip the on-image derivation; hand sp-emu a ready-made handoff.
 
 - A host tool (`lib/dice-handoff-gen`, run once in a hubris worktree) reuses the
   real `lib_dice` types to build a deterministic self-signed chain and emit two
-  blobs (`dice-certs.bin`, `dice-alias.bin`) -- header + hubpack, byte-identical
+  blobs (`dice-certs.bin`, `dice-alias.bin`): header + hubpack, byte-identical
   to what the attest task loads.
 - sp-emu's `publish_dice_handoff` (gated on `SP_EMU_ROT_DICE=<dir>`) writes the
   blobs into `CERTS_RANGE`/`ALIAS_RANGE` before the RoT boots, mirroring
@@ -47,12 +47,12 @@ Properties:
 - Downsides: fixed stand-in identity (bogus FWID, not bound to the measured
   image); the blobs are coupled to `lib_dice`'s cert-template layout and go stale
   if it changes; and the faked data must exactly satisfy the attest task's init
-  (deriving `Keypair::from(alias_seed)`, etc.) or the task faults -- an observed
+  (deriving `Keypair::from(alias_seed)`, etc.) or the task faults, an observed
   failure mode in the current prototype.
 
 Use as a fallback or when PUF modeling is not available.
 
-## Approach B -- model the PUF so the image generates its own handoff (IMPLEMENTED)
+## Approach B: model the PUF so the image generates its own handoff (IMPLEMENTED)
 
 The unmodified `-selfsigned` RoT image now derives its own DICE identity in sp-emu
 and `faux-ipcc get-certs` returns the full chain (alias -> device-id -> persistid).
@@ -60,11 +60,11 @@ Four pieces were needed:
 
 1. **DICE CDI** (`src/lpc55.rs`): seed the per-instance non-zero 256-bit CDI
    (`crate::identity`) in the SYSCON registers at offset 0x900. `lib_dice::Cdi::from_reg`
-   returns None -- skipping ALL DICE generation -- when these are zero, which the
+   returns None (skipping ALL DICE generation) when these are zero, which the
    boot ROM normally fills.
-2. **PUF model** (`src/puf.rs`) at `0x4003_B000`: the `lpc55-puf` command engine --
-   `CTRL`/`STAT` busy/avail handshake, `KEYINDEX`/`KEYSIZE`, the CODEOUTPUT/CODEINPUT/
-   KEYOUTPUT FIFOs -- returning the per-instance UDS seed from GETKEY. `gen_mfg_artifacts_self`
+2. **PUF model** (`src/puf.rs`) at `0x4003_B000`: the `lpc55-puf` command engine
+   (`CTRL`/`STAT` busy/avail handshake, `KEYINDEX`/`KEYSIZE`, the CODEOUTPUT/CODEINPUT/
+   KEYOUTPUT FIFOs), returning the per-instance UDS seed from GETKEY. `gen_mfg_artifacts_self`
    drives GENERATEKEY -> GETKEY, then blocks+locks index 1 itself (IDXBLK_L starts
    unblocked; the old stub pre-blocked it and made GETKEY fail). Note GETKEY is
    CTRL bit6.

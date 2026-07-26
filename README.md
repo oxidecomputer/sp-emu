@@ -16,8 +16,8 @@ answer the management gateway (MGS) over UDP.
   `power-state`, `rot-boot-info`, caboose reads, dumps, and the rest of the
   faux-mgs surface.
 - Lets `humility` attach to the running firmware over a real SWD debug port
-  exposed as a Glasgow Interface Explorer probe that models actual halt/run/step
-  -- so halt-and-run commands like `hiffy` work, alongside the live task table,
+  exposed as a Glasgow Interface Explorer probe that models actual halt/run/step,
+  so halt-and-run commands like `hiffy` work, alongside the live task table,
   per-task stack backtraces, `readmem`/`writemem`, and ringbufs.
 - Runs the SP and RoT together over an emulated sprot SPI link, so
   `drv-stm32h7-sprot-server` on the emulated SP talks to `drv-lpc55-sprot-server`
@@ -143,7 +143,7 @@ identity), and `--load-config <path>` / `--dump-config <path>` (see Configuratio
 - A finite `max_insns` (default 5,000,000) boots to steady state and then stops.
   Use this for a quick smoke boot, an instruction trace, or CI, where a bounded,
   deterministic run is what you want.
-- `max_insns` of `0` runs until the firmware traps or halts — i.e. indefinitely.
+- `max_insns` of `0` runs until the firmware traps or halts, i.e. indefinitely.
   Choose this when the SP must keep serving: answering MGS over the bridge, or a
   firmware-update test that must stay up across the reset that activates the new
   image (see below). This is the mode to reach for when you want a long-running
@@ -156,7 +156,7 @@ emulator just models the flash. The STM32H7 FLASH controller and the two banks
 are modeled with real unlock/erase/program semantics, the option-byte bank swap,
 and persistence, so an in-band MGS update programs the inactive bank, and the
 option-byte swap plus the SP reset that follows reboots into the newly written
-image — exactly as on silicon. Flash contents and the persisted swap survive
+image, exactly as on silicon. Flash contents and the persisted swap survive
 across runs (`$SP_EMU_FLASH` plus a small `.nv` state file beside it, which also
 records the Hubris archive the slot was flashed from).
 
@@ -215,8 +215,8 @@ The ones you reach for most:
 - `SP_EMU_ROT_MEASURE`: let the SP self-reset until measured (drop the pre-seeded SKIP token)
   rather than short-circuiting the RFD 568 handoff.
 - `SP_EMU_ROT_ROM`: emulate the LPC55 boot-ROM signature API (`skboot_authenticate`), so
-  the RoT pre-kernel's image authentication runs the real secure-boot check -- the cert
-  chain to the CMPA RKTH, via the host verifier (`lpc55_sign`) -- instead of being skipped.
+  the RoT pre-kernel's image authentication runs the real secure-boot check, the cert
+  chain to the CMPA RKTH via the host verifier (`lpc55_sign`), instead of being skipped.
   Off by default.
 - `SP_EMU_ROT_FRESH`: ignore any persisted RoT flash and re-seed it from scratch this run,
   so there is no doubt about whether persistent state is in use.
@@ -252,7 +252,7 @@ take the PUF DICE path so they boot past the manufacturing USART step.
 
 ## Configuration
 
-sp-emu takes its `SP_EMU_*` settings from the environment -- or, with
+sp-emu takes its `SP_EMU_*` settings from the environment; or, with
 `--load-config`, from a saved config file *instead of* the environment. The two are
 alternatives, never mixed, and command-line flags always win, so precedence is
 flag > (config file | environment) > default. Everything is read and vetted once at
@@ -264,23 +264,23 @@ startup; nothing consults the environment after that.
 - `--dump-config <path>`: write the effective configuration as TOML, so a run can be
   captured and replayed with `--load-config`.
 - `SP_EMU_CONFIGDBG`: print the full resolved configuration to stderr. It is an
-  environment variable, so it has no effect under `--load-config` -- use
+  environment variable, so it has no effect under `--load-config`; use
   `--dump-config` (a flag) to inspect a loaded configuration.
 
 ## Instance identity (`--seed`)
 
-Each instance has its own identity -- the SP UID, the RoT device UUID, and the
-RoT's DICE identity / self-signed certificate -- so a fleet of emulators is
+Each instance has its own identity (the SP UID, the RoT device UUID, and the
+RoT's DICE identity / self-signed certificate), so a fleet of emulators is
 discoverable like real hardware. All of it derives from one seed:
 
 - `--seed <source>` (or `$SP_EMU_SEED`): the seed source. It is one of
-  - `legacy` -- reproduces the previous fixed constants exactly (same UID, DICE
+  - `legacy`: reproduces the previous fixed constants exactly (same UID, DICE
     CDI, and PUF seed, hence the same self-signed cert), for compatibility;
   - a `0x`-prefixed hex `u64`, e.g. `--seed 0x1234` (malformed or over-64-bit
     hex is an error);
   - any other string, which is hashed.
 - With no `--seed`, the identity file is used if present, else a fresh random
-  seed is minted and persisted -- so each instance is unique yet stable across
+  seed is minted and persisted, so each instance is unique yet stable across
   runs.
 
 The SP's Ethernet MAC and serial come from its emulated VPD EEPROM

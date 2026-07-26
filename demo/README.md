@@ -57,7 +57,7 @@ Use the demos to run some actual commands:
 localhost:6666, so boot sp-emu with its MGS bridge on `[::1]:33300` for that
 (`SP_BASE=33300 ./run-sp.sh`). `./hiffy` and `./tasks --swd` use the new **SWD
 debug port**: a real halt/run/step debug core exposed as a Glasgow probe, so
-`hiffy` -- which injects and runs a program -- actually works, where it hangs on
+`hiffy` (which injects and runs a program) actually works, where it hangs on
 the fake-halt `-p ocd`/`-p ocdgdb` transports. The SWD port follows the bridge
 (`4444 + (SP_BASE - 33300)`); `sp-emu gdb` prints the exact ports on startup.
 

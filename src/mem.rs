@@ -281,7 +281,7 @@ impl Bus {
     }
 
     /// Load a bootleby image at the RoT flash base (0x0), so the core boots bootleby
-    /// rather than jumping straight to a slot image (spemu-kx3).
+    /// rather than jumping straight to a slot image.
     pub fn load_rot_bootleby(&mut self, bytes: &[u8]) {
         if let Some(f) = self.rot_flash.as_mut() {
             f.load_image_at(0, bytes);
