@@ -177,9 +177,14 @@ pub fn serve(
     // sprot SP->RoT artificial flow-control threshold (0 = disabled). See the
     // phase-1 lockstep break in the SP burst below and config::sprot_flowctl.
     let sprot_flowctl = crate::config::get().sprot_flowctl as usize;
+    // sprot SysTick coupling (spemu-1c4): while the SP is blocked on an sprot request
+    // the RoT has accepted, pace the SP's SysTick by the RoT's elapsed 1ms tick
+    // events so the SP's sprot timeout doesn't out-run the slow emulated RoT.
+    let sprot_couple = crate::config::get().sprot_couple;
+    let coupledbg = crate::config::get().coupledbg;
     eprintln!(
-        "[gdb] eth-service: quantum={} txbreak={} sprot_flowctl={}",
-        quantum, txbreak, sprot_flowctl
+        "[gdb] eth-service: quantum={} txbreak={} sprot_flowctl={} sprot_couple={}",
+        quantum, txbreak, sprot_flowctl, sprot_couple
     );
 
     // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the SWD debug listener
@@ -249,6 +254,15 @@ pub fn serve(
     // The SP's debug port, driven by the in-process RoT over the internal SWD link.
     // Loop-lifetime so its DP/AP/CoreDebug state persists across transactions.
     let mut sp_swdp = crate::debugport::SwDp::new();
+
+    // sprot coupling state (spemu-1c4): the RoT's tick_events at the last iteration,
+    // to compute per-iteration RoT elapsed-time delta. CREDIT_CAP bounds the SP's
+    // owed-tick bucket so a stuck-true request_in_flight can't accumulate unbounded
+    // credit (a few thousand ticks = a few seconds; not a wedge cap -- the
+    // request_in_flight gate handles wedges).
+    let mut prev_rot_ticks = rot.as_ref().map(|(rc, _)| rc.tick_events).unwrap_or(0);
+    let mut prev_req_dbg = false; // coupledbg: edge-detect request_in_flight for the trace
+    const CREDIT_CAP: u32 = 5000;
 
     loop {
         if let Some(swd_l) = &listeners {
@@ -587,6 +601,41 @@ pub fn serve(
                     }
                 }
             }
+            // sprot SysTick coupling (spemu-1c4): while the SP is blocked on an sprot
+            // request the RoT has accepted (request_in_flight), advance the SP's
+            // SysTick by the RoT's elapsed 1ms tick events this iteration (1:1 -- both
+            // kernels tick at 1ms) instead of the fabricated one-per-iteration idle
+            // tick, so the SP's SysTick-paced sprot timeout counts down at the true
+            // RoT-relative rate. Gate strictly on request_in_flight (NOT rot_busy,
+            // which a wedge latches true via ssa) and skip while the SP is debug-halted
+            // (its time is genuinely frozen then -- e.g. a RoT task-dump SWD read). A
+            // wedged RoT never sets request_in_flight, so the SP falls to the normal
+            // throttle and times out; no wedge-detector needed.
+            // saturating_sub: tick_events is monotonic (not reset on RoT reboot), so
+            // prev <= cur, but stay underflow-proof regardless. Cap the delta before
+            // the u32 cast so a pathological value saturates rather than truncating,
+            // then saturating_add + min(CREDIT_CAP) bound the bucket.
+            let d_rot = rc.tick_events.saturating_sub(prev_rot_ticks);
+            prev_rot_ticks = rc.tick_events;
+            if sprot_couple && req_in_flight && !cpu.halted {
+                let add = d_rot.min(CREDIT_CAP as u64) as u32;
+                cpu.sp_tick_credit = cpu.sp_tick_credit.saturating_add(add).min(CREDIT_CAP);
+                if coupledbg && (add > 0 || !prev_req_dbg) {
+                    eprintln!(
+                        "[couple] req_in_flight +{} credit={} sp_ticks={} rot_ticks={}",
+                        add, cpu.sp_tick_credit, cpu.tick_events, rc.tick_events
+                    );
+                }
+            } else {
+                if coupledbg && prev_req_dbg {
+                    eprintln!(
+                        "[couple] exchange end: credit was {} sp_ticks={} rot_ticks={}",
+                        cpu.sp_tick_credit, cpu.tick_events, rc.tick_events
+                    );
+                }
+                cpu.sp_tick_credit = 0;
+            }
+            prev_req_dbg = req_in_flight;
         } else if let Some(client) = rot_client.as_mut() {
             // Shared-RoT IPC path: no in-process RoT core. Act as the SP's link
             // peer — accumulate the request the SP clocks out, ship it to the

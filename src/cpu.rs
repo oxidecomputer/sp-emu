@@ -77,6 +77,8 @@ pub struct Cpu {
     systick: u32,           // SysTick down-counter (driven per instruction)
     pub wfi_throttle: bool, // enable WFI idle-throttle (set by the gdb serve loop, post-preboot)
     pub idle_skip: u32,     // instrs skipped to the next tick on an idle WFI (loop sleeps instead)
+    pub tick_events: u64,   // monotonic SysTick underflow events (one per ~1ms); RoT real-time proxy
+    pub sp_tick_credit: u32, // RoT-derived ticks the SP still owes itself while blocked on sprot (coupling)
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
     pub halted: bool,       // external debug halt (DHCSR C_HALT via the SWD debug port)
     pub debug_en: bool,     // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
@@ -194,6 +196,8 @@ impl Cpu {
             systick: 0,
             wfi_throttle: false,
             idle_skip: 0,
+            tick_events: 0,
+            sp_tick_credit: 0,
             record_disasm: false,
             halted: false,
             debug_en: false,
@@ -588,8 +592,30 @@ impl Cpu {
                 // there (full-speed boot). The core still wakes immediately on a
                 // real IRQ (e.g. eth-irq from an injected MGS packet).
                 if self.wfi_throttle && self.systick > 1 && !bus.any_pending_irq() {
-                    self.idle_skip = self.systick;
-                    self.systick = 1;
+                    if self.sp_tick_credit > 0 {
+                        // sprot coupling (spemu-1c4): the SP is blocked on an sprot
+                        // request the RoT has accepted, and the serve loop credited
+                        // it with the RoT's elapsed 1ms tick events. Convert one unit
+                        // of RoT-elapsed time into one SP SysTick: arm the countdown
+                        // to fire on the next `maybe_tick` (which reloads systick to
+                        // rvr afterward). Do NOT set idle_skip -- keep the SP running
+                        // so the tick delivers and the next WFI drains more, yielding
+                        // exactly `credit` ticks over this visit. This paces the SP's
+                        // SysTick-derived sprot timeout at the true RoT-relative rate.
+                        // Tradeoff: the SP does not yield to the RoT mid-drain, so it
+                        // runs its SysTick handler up to `credit` times of host CPU
+                        // before the loop steps the RoT again. Credit is bounded (the
+                        // serve loop caps it) and a normal exchange credits only a few
+                        // ticks, so in practice this burst is small.
+                        self.sp_tick_credit -= 1;
+                        self.systick = 1;
+                    } else {
+                        // No accepted request (or caught up to the RoT): the ordinary
+                        // idle throttle -- record the skip so the loop sleeps the host
+                        // instead of pegging a core, and collapse the countdown.
+                        self.idle_skip = self.systick;
+                        self.systick = 1;
+                    }
                 }
                 Ok(())
             }
@@ -1615,6 +1641,11 @@ impl Cpu {
         self.systick -= 1;
         if self.systick == 0 {
             self.systick = self.syst_rvr;
+            // One 1ms tick elapsed. Count it whether or not the exception is
+            // delivered below (a masked/handler-mode tick still marks elapsed time):
+            // the serve loop diffs the RoT's `tick_events` to pace the SP's SysTick
+            // during a coupled sprot wait (spemu-1c4).
+            self.tick_events = self.tick_events.wrapping_add(1);
             if self.syst_csr & 2 != 0 && self.mode == Mode::Thread && !self.primask {
                 self.exception_entry(15, bus); // SysTick exception
             }
@@ -2544,5 +2575,71 @@ mod tests {
             "no debugger: BKPT is a fault, not a halt"
         );
         assert!(!cpu.halted);
+    }
+
+    // Thumb `WFI` = 0xBF30.
+    const WFI: u16 = 0xBF30;
+
+    /// SysTick underflow bumps `tick_events` once per reload period, and it counts
+    /// even when the exception is not delivered (here: handler mode). The serve loop
+    /// diffs the RoT's `tick_events` as its elapsed-time proxy for coupling
+    /// (spemu-1c4), so the count must not depend on delivery.
+    #[test]
+    fn tick_events_counts_underflows_even_undelivered() {
+        let mut bus = ram_bus();
+        let mut cpu = Cpu::new();
+        cpu.cycles = 1; // non-multiple of 256: skip maybe_tick's periodic CSR/RVR refresh
+        cpu.syst_csr = 0b11; // ENABLE | TICKINT
+        cpu.syst_rvr = 4;
+        cpu.systick = 0;
+        cpu.mode = Mode::Handler; // not Thread -> the SysTick exception is NOT delivered
+        for _ in 0..4 {
+            cpu.maybe_tick(&mut bus);
+        }
+        assert_eq!(cpu.tick_events, 1, "one underflow per rvr decrements");
+        for _ in 0..4 {
+            cpu.maybe_tick(&mut bus);
+        }
+        assert_eq!(cpu.tick_events, 2);
+        assert_eq!(cpu.mode, Mode::Handler, "no exception was taken");
+    }
+
+    /// When the SP is credited with RoT-elapsed ticks (a coupled sprot wait), an idle
+    /// WFI converts one credit unit into an armed SysTick (`systick == 1`) WITHOUT
+    /// setting `idle_skip`, so the SP keeps running to deliver the tick and drain more
+    /// (spemu-1c4).
+    #[test]
+    fn wfi_drains_sprot_tick_credit() {
+        let mut bus = ram_bus();
+        bus.write16(RAM, WFI);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.wfi_throttle = true;
+        cpu.systick = 100;
+        cpu.sp_tick_credit = 3;
+        cpu.idle_skip = 0;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.sp_tick_credit, 2, "one credit consumed");
+        assert_eq!(cpu.systick, 1, "a tick is armed to fire on the next maybe_tick");
+        assert_eq!(cpu.idle_skip, 0, "credited path does not yield/sleep");
+    }
+
+    /// With no credit (no accepted sprot request), an idle WFI takes the ordinary
+    /// throttle path: record `idle_skip` so the run loop sleeps the host.
+    #[test]
+    fn wfi_without_credit_takes_idle_throttle() {
+        let mut bus = ram_bus();
+        bus.write16(RAM, WFI);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.wfi_throttle = true;
+        cpu.systick = 100;
+        cpu.sp_tick_credit = 0;
+        cpu.idle_skip = 0;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.idle_skip, 100, "throttle records the skipped instrs");
+        assert_eq!(cpu.systick, 1);
     }
 }

@@ -173,6 +173,7 @@ config! {
     svcdbg: bool = "SP_EMU_SVCDBG" => |v| v.is_some(),
     excdbg: bool = "SP_EMU_EXCDBG" => |v| v.is_some(),
     sprotdbg: bool = "SP_EMU_SPROTDBG" => |v| v.is_some(),
+    coupledbg: bool = "SP_EMU_COUPLEDBG" => |v| v.is_some(), // sprot SysTick-coupling credit trace
     romdbg: bool = "SP_EMU_ROMDBG" => |v| v.is_some(), // boot-ROM API calls (skboot)
     // print the full resolved config table to stderr
     configdbg: bool = "SP_EMU_CONFIGDBG" => |v| v.is_some(),
@@ -258,6 +259,15 @@ config! {
     sprot_flowctl: u32 = "SP_EMU_SPROT_FLOWCTL" => |v| {
         v.and_then(|s| s.parse().ok()).unwrap_or(16)
     },
+    // Couple the SP's SysTick to the RoT's while the SP is blocked on an sprot
+    // request the RoT has accepted (request_in_flight): advance SP ticks 1:1 with
+    // the RoT's elapsed tick events (both kernels tick at 1ms) instead of the
+    // fabricated one-per-iteration idle tick, so the SP's SysTick-paced sprot
+    // timeout counts down at the true RoT-relative rate (RoT-as-SP-peripheral).
+    // Without it, a slow emulated RoT flash op trips the SP's 3-attempt sprot
+    // retry (UpdateChunkDelivery(ExhaustedNumAttempts)). "0" disables (restores the
+    // old idle-throttle timing, e.g. to reproduce the failure). See spemu-1c4.
+    sprot_couple: bool = "SP_EMU_SPROT_COUPLE" => |v| v.map(|s| s != "0").unwrap_or(true),
     pumpstats_ms: u64 = "SP_EMU_PUMPSTATS_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(50),
     // trim before parsing, matching the historical read (a padded value parsed)
     ambient_c: f32 = "SP_EMU_AMBIENT_C" => |v| v.and_then(|s| s.trim().parse().ok()).unwrap_or(30.0),
