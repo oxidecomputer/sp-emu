@@ -88,6 +88,57 @@ pub fn archive_app_toml(path: &str) -> Option<String> {
     String::from_utf8(archive_entry(&raw, "app.toml").ok()?).ok()
 }
 
+/// Whether `path` is a Hubris build archive (a zip) rather than a raw image.
+pub fn is_archive(path: &str) -> bool {
+    std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            let mut magic = [0u8; 2];
+            f.read_exact(&mut magic).map(|_| magic)
+        })
+        .map(|m| &m == b"PK")
+        .unwrap_or(false)
+}
+
+/// The instance base directory for a flash NVM file: its parent (or `.`).
+pub fn instance_base(flash_path: &str) -> &std::path::Path {
+    std::path::Path::new(flash_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// True when both paths exist and hold identical bytes. Cheap size check first, so a
+/// byte comparison only runs when the sizes already match.
+fn files_identical(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => std::fs::read(a).ok() == std::fs::read(b).ok(),
+        _ => false,
+    }
+}
+
+/// Copy a Hubris archive into the instance's `<base>/archives/<name>.zip` (base = the
+/// directory of `flash_path`) and return its base-relative ref (e.g. `archives/sp.zip`)
+/// to store in the `.nv` companion file. Skips the copy when the destination holds
+/// this archive: either it IS the source (re-flash from an already-stowed archive)
+/// or a byte-identical copy (an unchanged instance re-run, e.g. the RoT re-stows on
+/// every serve). The instance is thus self-contained: the archive travels with the
+/// flash image, and `pack` is just a zip of the base directory.
+pub fn stow_archive(flash_path: &str, archive_src: &str, name: &str) -> Result<String> {
+    let base = instance_base(flash_path);
+    let dir = base.join("archives");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let rel = format!("archives/{name}.zip");
+    let dst = base.join(&rel);
+    let src = std::path::Path::new(archive_src);
+    let same_path = matches!((src.canonicalize(), dst.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    if !same_path && !files_identical(src, &dst) {
+        std::fs::copy(src, &dst)
+            .with_context(|| format!("copy {archive_src} -> {}", dst.display()))?;
+    }
+    Ok(rel)
+}
+
 /// Program an image into a slot: erase the bank, then write the image at its base.
 pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
     let off = slot_offset(slot)?;
@@ -132,11 +183,18 @@ pub fn slot_programmed(nvm: &[u8], slot: char) -> Result<bool> {
 // is deliberately human-inspectable and forward-extensible (Phase 2 adds RoT
 // lines): deleting the state file resets the NV registers to their defaults.
 
-/// Persisted non-volatile controller state (the STM32H7 option bytes we model).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Persisted non-volatile state: the STM32H7 option bytes we model, plus the Hubris
+/// build archive the flashed image came from. The archive ref is a path relative to
+/// the `.nv` file's directory (the instance base), recorded at flash time so a
+/// run-from-flash instance knows its archive for app.toml-derived config and for
+/// humility tooling (which matches the archive's image id).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NvState {
     /// `OPTSR_CUR.SWAP_BANK_OPT` — which physical bank boots at 0x0800_0000.
     pub swap_bank: bool,
+    /// The Hubris archive the SP was flashed from, base-relative (e.g.
+    /// `archives/sp.zip`). `None` when flashed from a bare image (no archive content).
+    pub archive: Option<String>,
 }
 
 pub fn nv_state_path(flash_path: &str) -> String {
@@ -158,18 +216,83 @@ pub fn load_nv(path: &str) -> NvState {
             continue;
         };
         let (k, v) = (k.trim(), v.trim());
-        if k == "swap_bank" {
-            nv.swap_bank = matches!(v, "1" | "true");
+        match k {
+            "swap_bank" => nv.swap_bank = matches!(v, "1" | "true"),
+            // Stored as a basic string; tolerate surrounding quotes. Empty = None.
+            "archive" => {
+                nv.archive = Some(v.trim_matches('"').to_string()).filter(|s| !s.is_empty())
+            }
+            _ => {}
         }
     }
     nv
 }
 
 pub fn save_nv(path: &str, nv: &NvState) -> Result<()> {
-    let body = format!(
+    let mut body = format!(
         "# sp-emu flash non-volatile registers (see src/flash.rs)\nswap_bank = {}\n",
         nv.swap_bank as u8
     );
+    if let Some(archive) = &nv.archive {
+        // The Hubris archive the SP was flashed from (base-relative); see NvState.
+        body.push_str(&format!("archive = \"{archive}\"\n"));
+    }
+    std::fs::write(path, body).with_context(|| format!("write {path}"))
+}
+
+/// RoT instance metadata file (`<rot-nvm>.nv`): which Hubris archive produced each
+/// RoT flash region, as base-relative refs (e.g. `archives/rot-a.zip`). Recorded at
+/// seed time so the instance is self-contained; `None` for a region seeded from a
+/// bare image or absent. Parallel to the SP `NvState`.
+///
+/// Note: the SP (`sp-flash.bin.nv` = `NvState`) and RoT (`sp-rot-flash.bin.nv` =
+/// `RotMeta`) `.nv` files share the extension but are distinct files with distinct
+/// schemas and loaders (`load_nv` vs `load_rot_meta`); loading one with the other's
+/// parser just yields defaults, never a crash.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RotMeta {
+    pub slot_a_archive: Option<String>, // $SP_EMU_ROT_FLASH  (image A @ 0x10000)
+    pub slot_b_archive: Option<String>, // $SP_EMU_ROT_IMAGE_B (image B @ 0x50000)
+    pub stage0_archive: Option<String>, // $SP_EMU_ROT_BOOTLEBY (stage0 @ 0x0)
+}
+
+pub fn load_rot_meta(path: &str) -> RotMeta {
+    let mut m = RotMeta::default();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return m;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = Some(v.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty());
+        match k.trim() {
+            "slot_a_archive" => m.slot_a_archive = v,
+            "slot_b_archive" => m.slot_b_archive = v,
+            "stage0_archive" => m.stage0_archive = v,
+            _ => {}
+        }
+    }
+    m
+}
+
+pub fn save_rot_meta(path: &str, m: &RotMeta) -> Result<()> {
+    let mut body = String::from(
+        "# sp-emu RoT instance metadata: Hubris archive per region (see src/flash.rs)\n",
+    );
+    for (k, v) in [
+        ("slot_a_archive", &m.slot_a_archive),
+        ("slot_b_archive", &m.slot_b_archive),
+        ("stage0_archive", &m.stage0_archive),
+    ] {
+        if let Some(val) = v {
+            body.push_str(&format!("{k} = \"{val}\"\n"));
+        }
+    }
     std::fs::write(path, body).with_context(|| format!("write {path}"))
 }
 
@@ -238,6 +361,9 @@ pub struct Flash {
     file: Option<std::fs::File>,
     path: String,
     nv_path: String,
+    /// The archive ref from `NvState`, retained so an option-byte (bank-swap) commit
+    /// re-emits it instead of wiping it.
+    archive: Option<String>,
 
     /// Effective bank swap (`OPTCR.SWAP_BANK`): drives the aperture; latched from
     /// `committed` only at reset, so the running image is never remapped mid-run.
@@ -289,6 +415,7 @@ impl Flash {
             file,
             path: path.to_string(),
             nv_path: nv_state_path(path),
+            archive: nv.archive,
             effective_swap: nv.swap_bank,
             committed_swap: nv.swap_bank,
             staged_swap: nv.swap_bank,
@@ -409,22 +536,35 @@ impl Flash {
                     v |= OPT_SWAP_BANK;
                 }
                 if self.dbg {
-                    eprintln!("[flashdbg] rd OPTCR={v:#010x} eff_swap={}", self.effective_swap);
+                    eprintln!(
+                        "[flashdbg] rd OPTCR={v:#010x} eff_swap={}",
+                        self.effective_swap
+                    );
                 }
                 v
             }
             REG_OPTSR_CUR => {
                 // OPT_BUSY reads 0 (instant). SWAP_BANK_OPT = committed value.
-                let v = if self.committed_swap { OPT_SWAP_BANK } else { 0 };
+                let v = if self.committed_swap {
+                    OPT_SWAP_BANK
+                } else {
+                    0
+                };
                 if self.dbg {
-                    eprintln!("[flashdbg] rd OPTSR_CUR={v:#010x} committed={}", self.committed_swap);
+                    eprintln!(
+                        "[flashdbg] rd OPTSR_CUR={v:#010x} committed={}",
+                        self.committed_swap
+                    );
                 }
                 v
             }
             REG_OPTSR_PRG => {
                 let v = if self.staged_swap { OPT_SWAP_BANK } else { 0 };
                 if self.dbg {
-                    eprintln!("[flashdbg] rd OPTSR_PRG={v:#010x} staged={}", self.staged_swap);
+                    eprintln!(
+                        "[flashdbg] rd OPTSR_PRG={v:#010x} staged={}",
+                        self.staged_swap
+                    );
                 }
                 v
             }
@@ -489,7 +629,10 @@ impl Flash {
                 self.staged_swap = val & OPT_SWAP_BANK != 0;
                 self.regs.insert(off, val);
                 if self.dbg {
-                    eprintln!("[flashdbg] wr OPTSR_PRG={val:#010x} -> staged={}", self.staged_swap);
+                    eprintln!(
+                        "[flashdbg] wr OPTSR_PRG={val:#010x} -> staged={}",
+                        self.staged_swap
+                    );
                 }
             }
             REG_OPTCR => {
@@ -510,15 +653,22 @@ impl Flash {
                 if val & OPTCR_OPTSTART != 0 && !self.opt_locked {
                     self.committed_swap = self.staged_swap;
                     if self.dbg {
-                        eprintln!("[flashdbg] OPTSTART commit -> committed={}", self.committed_swap);
+                        eprintln!(
+                            "[flashdbg] OPTSTART commit -> committed={}",
+                            self.committed_swap
+                        );
                     }
                     let nv = NvState {
                         swap_bank: self.committed_swap,
+                        archive: self.archive.clone(),
                     };
                     if let Err(e) = save_nv(&self.nv_path, &nv) {
                         // A failed persist means the committed swap is lost across
                         // the next run — surface it rather than silently dropping.
-                        eprintln!("[flash] persist option bytes to {} failed: {e}", self.nv_path);
+                        eprintln!(
+                            "[flash] persist option bytes to {} failed: {e}",
+                            self.nv_path
+                        );
                     }
                 }
             }
@@ -569,5 +719,100 @@ impl Flash {
         if let Some(f) = self.file.as_mut() {
             let _ = f.sync_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        // Include the pid so concurrent runs (CI matrix) don't share a temp dir.
+        let d =
+            std::env::temp_dir().join(format!("sp-emu-flashtest-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The `.nv` companion file round-trips swap_bank plus the archive ref, and a
+    /// bare-bin flash (archive = None) omits the archive line.
+    #[test]
+    fn nv_round_trips_swap_and_archive() {
+        let d = tmp("nv");
+        let ps = d.join("sp-flash.bin.nv");
+        let ps = ps.to_str().unwrap();
+        let nv = NvState {
+            swap_bank: true,
+            archive: Some("archives/sp.zip".into()),
+        };
+        save_nv(ps, &nv).unwrap();
+        assert_eq!(load_nv(ps), nv);
+        let bare = NvState {
+            swap_bank: false,
+            archive: None,
+        };
+        save_nv(ps, &bare).unwrap();
+        assert_eq!(load_nv(ps), bare);
+        assert!(!std::fs::read_to_string(ps).unwrap().contains("archive"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The RoT metadata file round-trips per-region archive refs.
+    #[test]
+    fn rot_meta_round_trips() {
+        let d = tmp("rotmeta");
+        let ps = d.join("sp-rot-flash.bin.nv");
+        let ps = ps.to_str().unwrap();
+        let m = RotMeta {
+            slot_a_archive: Some("archives/rot-a.zip".into()),
+            slot_b_archive: None,
+            stage0_archive: Some("archives/stage0.zip".into()),
+        };
+        save_rot_meta(ps, &m).unwrap();
+        assert_eq!(load_rot_meta(ps), m);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn is_archive_detects_zip_magic() {
+        let d = tmp("isarch");
+        let zip = d.join("a.zip");
+        std::fs::write(&zip, b"PK\x03\x04rest").unwrap();
+        let bin = d.join("a.bin");
+        std::fs::write(&bin, b"\x00\x40\x00\x24").unwrap();
+        assert!(is_archive(zip.to_str().unwrap()));
+        assert!(!is_archive(bin.to_str().unwrap()));
+        assert!(!is_archive(d.join("missing").to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// stow_archive copies the archive into `<base>/archives/<name>.zip`, returns the
+    /// base-relative ref, and is a no-op when the source already is the destination.
+    #[test]
+    fn stow_archive_copies_into_base_relative() {
+        let d = tmp("stow");
+        let flash = d.join("sp-flash.bin");
+        std::fs::write(&flash, b"nvm").unwrap();
+        let src = d.join("orig-base-a.zip");
+        std::fs::write(&src, b"PKarchive-bytes").unwrap();
+        let rel = stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        assert_eq!(rel, "archives/sp.zip");
+        let dst = d.join("archives/sp.zip");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
+        // Idempotent: stowing the already-stowed file (src == dst) must not error/truncate.
+        let rel2 = stow_archive(flash.to_str().unwrap(), dst.to_str().unwrap(), "sp").unwrap();
+        assert_eq!(rel2, "archives/sp.zip");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
+        // Re-run case: stowing the external src again while dst already holds identical
+        // bytes takes the skip path, with no error and dst unchanged.
+        let rel3 = stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        assert_eq!(rel3, "archives/sp.zip");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
+        // A changed source is re-copied.
+        std::fs::write(&src, b"PKarchive-bytes-v2").unwrap();
+        stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes-v2");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

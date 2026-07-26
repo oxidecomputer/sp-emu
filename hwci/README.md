@@ -41,7 +41,7 @@ SP_EMU_FLASH=./sp-flash.bin ./target/release/sp-emu flash a <gimlet SP archive>
 #    SP_EMU_ROT_FLASH is set and exposes the Glasgow SWD probe (:4444).
 SP_EMU_FLASH=./sp-flash.bin \
 SP_EMU_BRIDGE='[::1]:33300' \
-SP_EMU_ROT_FLASH=<oxide-rot-1 SELF-SIGNED image> \
+SP_EMU_ROT_FLASH=<oxide-rot-1 self-signed archive.zip> \
 SP_EMU_ROT_ROM=1 \
   ./target/release/sp-emu run a 0 &
 #  wait for: [sp-emu] online   (takes ~30s)
@@ -62,39 +62,39 @@ sp-test suite run suite-rot-boot \
 
 Two RoT-image requirements make the emulated RoT boot to its sprot server:
 
-- **Use the SELF-SIGNED image** (`build-oxide-rot-1-selfsigned-image-*`). It is
-  still Bart secure-boot-signed (so `skboot_authenticate` passes against the
+- **Use the SELF-SIGNED archive** (`build-oxide-rot-1-selfsigned-image-*.zip`). It
+  is still Bart secure-boot-signed (so `skboot_authenticate` passes against the
   default CMPA) but uses the `dice-self` identity path (PUF, no USART). The
   production `dice-mfg` image wedges in DICE startup polling the unmodeled
-  FLEXCOMM0 manufacturing USART (see `spemu-9oc`).
+  FLEXCOMM0 manufacturing USART. Pass the archive (not a bare image) so
+  `humility -a` can attach to the RoT and the instance is self-contained.
 - **`SP_EMU_ROT_ROM=1`** is required in serve mode: the RoT pre-kernel's
   `authenticate_image` reaches the boot-ROM `skboot_authenticate`; without the
   ROM shim it branches to an unmapped ROM pointer and faults.
 
 `SP_EMU_ROT_FLASH` gives a real emulated RoT so `rot_state` returns real data
-over the SP -> sprot -> RoT relay. To exercise genuine bootleby A/B selection
-(rather than the fabricated boot-state handoff), also set
-`SP_EMU_ROT_BOOTLEBY`/`SP_EMU_ROT_CMPA` (see the sp-emu README) once bootleby
-runs in serve mode.
+over the SP -> sprot -> RoT relay. For genuine bootleby A/B selection (rather than
+the fabricated boot-state handoff), also set `SP_EMU_ROT_BOOTLEBY` plus
+`SP_EMU_ROT_CMPA`/`SP_EMU_ROT_CFPA` (see the sp-emu README): bootleby now runs in
+the two-core serve mode and reports the actual selected slot over MGS.
 
 ## Status and roadmap
 
-Real bootleby boots the emulated RoT end-to-end in standalone `sp-emu rot` mode
-(genuine `skboot_authenticate` + CDI measurement via HASHCRYPT + `boot_into`),
-and all four A/B/panic selection outcomes are validated there via slot-seeding
-knobs (`SP_EMU_ROT_IMAGE_B`, `SP_EMU_ROT_ERASE_A`, `SP_EMU_ROT_BOOT_PREF`). The
-sp-test tests here wrap that as MGS-driven regressions:
+Real bootleby boots the emulated RoT end-to-end in both standalone `sp-emu rot`
+mode and the two-core serve mode (genuine `skboot_authenticate` + CDI measurement
+via HASHCRYPT + `boot_into`), and all four A/B/panic selection outcomes are
+validated via slot-seeding knobs (`SP_EMU_ROT_IMAGE_B`, `SP_EMU_ROT_ERASE_A`,
+`SP_EMU_ROT_BOOT_PREF`). The sp-test tests here wrap that as MGS-driven regressions:
 
-- `rot-boot-state` — read the RoT active slot + FWIDs over MGS. Passes today
+- `rot-boot-state`: read the RoT active slot + FWIDs over MGS. Passes today
   end-to-end against sp-emu (sp-test -> faux-mgs shim -> SP -> sprot -> RoT).
-- `rot-ab-selection` (planned) — assert the booted slot for A-only / B-only /
-  both+preference / neither(panic). Needs bootleby running in the two-core
-  serve mode.
-- `rot-transient-override` (planned) — set the transient RAM preference, reset,
+- `rot-ab-selection` (planned): assert the booted slot for A-only / B-only /
+  both+preference / neither(panic) over MGS, using serve-mode bootleby.
+- `rot-transient-override` (planned): set the transient RAM preference, reset,
   confirm it boots the transient slot once, then falls back to the persistent
-  slot. Needs serve-mode bootleby + RoT reset re-run.
-- `rot-fw-update` / `rot-stage0-update` (planned) — `builtin:update` against
+  slot. Needs the serve-mode RoT-reset re-run.
+- `rot-fw-update` / `rot-stage0-update` (planned): `builtin:update` against
   `--rot-archive` / `--rot-bootloader-archive`, then confirm the new slot boots
-  after reset.
-
-See the `spemu-6sw` bead umbrella for the tracked work.
+  after reset. The update itself completes via faux-mgs with generous retry/timeout
+  budgets; driving it through the sp-test harness needs its gateway retry budget
+  relaxed for the slow sim.

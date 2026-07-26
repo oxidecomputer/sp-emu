@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 mod bridge;
+mod bundle;
 mod config;
 mod cpu;
 mod dbg;
@@ -115,6 +116,45 @@ fn default_socket_ports(sidecar: bool) -> Vec<u16> {
     ports
 }
 
+/// The instance anchor: the SP flash NVM path (`$SP_EMU_FLASH`). Its directory is the
+/// single instance base. Every instance-relative thing (the stowed Hubris archives in
+/// `<base>/archives/`, and the base-relative refs in both the SP and RoT `.nv` files)
+/// resolves against it, so a two-core instance (SP + RoT) lives under one directory
+/// and `pack` bundles it as a single tree regardless of where the RoT NVM sits.
+fn instance_anchor() -> String {
+    config::get().flash_path.clone()
+}
+
+/// The Hubris SP archive for this run: explicit `$SP_EMU_ARCHIVE`, else the archive
+/// recorded in the flash `.nv` file (resolved against the instance base). `None` when
+/// neither is available (a bare-image instance; see the flash-time warning).
+fn sp_archive() -> Option<String> {
+    if let Some(a) = config::get().archive.clone() {
+        return Some(a);
+    }
+    let flash = config::get().flash_path.clone();
+    let rel = flash::load_nv(&flash::nv_state_path(&flash)).archive?;
+    Some(
+        flash::instance_base(&flash)
+            .join(rel)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Warn at serve start when no SP Hubris archive is available (neither
+/// `$SP_EMU_ARCHIVE` nor a flash `.nv` record): app.toml config falls back to
+/// board defaults and humility cannot attach. Silenced by `$SP_EMU_NO_ARCHIVE_WARN`.
+fn warn_if_no_sp_archive() {
+    if sp_archive().is_none() && !config::get().no_archive_warn {
+        eprintln!(
+            "[sp-emu] WARNING: no Hubris SP archive for this instance (flashed from a \
+             bare image?). SP Ethernet ports fall back to board defaults and humility \
+             tooling cannot attach. Flash a Hubris build archive (.zip)."
+        );
+    }
+}
+
 /// Build the well-known-port host bridge from `$SP_EMU_ADDR0/1` + vids.
 fn make_well_known_host() -> Box<dyn HostIo> {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -138,12 +178,10 @@ fn make_well_known_host() -> Box<dyn HostIo> {
         views.push((SocketAddr::new(addr1, 0), cfg.vid1.unwrap_or(def1)));
     }
 
-    // Prefer the socket set the flashed image actually declares (its app.toml in
-    // $SP_EMU_ARCHIVE); fall back to the board-keyed union when no archive path
-    // is given.
-    let ports = cfg
-        .archive
-        .clone()
+    // Prefer the socket set the flashed image actually declares (its app.toml):
+    // $SP_EMU_ARCHIVE if given, else the archive recorded in the flash `.nv` file
+    // (`sp_archive`); fall back to the board-keyed union when neither is available.
+    let ports = sp_archive()
         .and_then(|a| {
             let p = archive_socket_ports(&a);
             match &p {
@@ -152,7 +190,7 @@ fn make_well_known_host() -> Box<dyn HostIo> {
                     ports
                 ),
                 None => eprintln!(
-                    "[bridge] could not read sockets from $SP_EMU_ARCHIVE={a}; using board defaults"
+                    "[bridge] could not read sockets from archive {a}; using board defaults"
                 ),
             }
             p
@@ -168,7 +206,24 @@ fn make_well_known_host() -> Box<dyn HostIo> {
 }
 
 fn nvm_path() -> String {
-    config::get().flash_path.clone()
+    config::instance_file("SP_EMU_FLASH", &config::get().flash_path)
+}
+
+/// Log where this instance keeps its persistent state (flash images, identity, stowed
+/// archives), and warn when that is the built-in default because `$SP_EMU_STATE_DIR`
+/// was not set. Called for the commands that read or write instance state so a bare
+/// run does not silently write into an unexpected place. No warning when the user set
+/// `$SP_EMU_STATE_DIR` explicitly, even to the default path.
+fn announce_state_dir() {
+    let dir = config::state_dir();
+    if config::state_dir_is_default() {
+        eprintln!(
+            "[sp-emu] WARNING: SP_EMU_STATE_DIR not set; instance state (flash, \
+             identity, archives) is under {dir}. Set SP_EMU_STATE_DIR to choose it."
+        );
+    } else {
+        eprintln!("[sp-emu] instance state dir: {dir}");
+    }
 }
 
 /// Remove `--flag <value>` (or `--flag=<value>`) from `args` and return the value.
@@ -200,6 +255,16 @@ fn main() -> Result<()> {
     let load_config = extract_flag_value(&mut args, "--load-config");
     let dump_config = extract_flag_value(&mut args, "--dump-config");
     config::init(seed, load_config, dump_config)?;
+    // Ensure the instance state directory exists before anything writes into it
+    // (identity::init persists the seed there), and announce it for the commands that
+    // use instance state.
+    let _ = std::fs::create_dir_all(config::state_dir());
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("flash" | "erase" | "info" | "run" | "gdb" | "rot" | "rot-serve" | "pack")
+    ) {
+        announce_state_dir();
+    }
     identity::init(config::get().seed.as_deref())?;
     match args.first().map(|s| s.as_str()) {
         Some("flash") => cmd_flash(&args[1..]),
@@ -209,6 +274,8 @@ fn main() -> Result<()> {
         Some("gdb") => cmd_gdb(&args[1..]),
         Some("rot") => cmd_rot(&args[1..]),
         Some("rot-serve") => cmd_rot_serve(&args[1..]),
+        Some("pack") => cmd_pack(&args[1..]),
+        Some("unpack") => cmd_unpack(&args[1..]),
         Some("i2c-sniff") => {
             let addr = args.get(1).map(|s| s.as_str()).unwrap_or("[::1]:9100");
             i2c_bridge::serve(addr)
@@ -236,6 +303,8 @@ fn main() -> Result<()> {
             eprintln!(
                 "  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone"
             );
+            eprintln!("  sp-emu pack [bundle.zip]         bundle this instance (flash+archives) to a zip");
+            eprintln!("  sp-emu unpack <bundle.zip> [dir] extract an instance bundle for run + humility");
             eprintln!("  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here");
             eprintln!("  sp-emu i2c-device [addr] [spec]  act AS I2C devices for an emulator (SP_EMU_I2C_DEVICE);");
             eprintln!(
@@ -262,15 +331,42 @@ fn cmd_flash(args: &[String]) -> Result<()> {
         bail!("usage: sp-emu flash <a|b> <image.bin | build-archive.zip>");
     }
     let slot = slot_arg(&args[0])?;
+    let src = &args[1];
     // Accepts a raw .bin or a Hubris build archive (.zip with img/final.bin).
-    let image = flash::load_image(&args[1])?;
-    if flash::archive_flash_ron(&args[1]).is_some() {
-        eprintln!("[flash] read Hubris build archive {}", args[1]);
-    }
+    let image = flash::load_image(src)?;
     let base = flash::slot_base(slot)?;
     let reset_pc = u32::from_le_bytes(image[4..8].try_into().unwrap_or_default()) & !1;
     let path = nvm_path();
     flash::program_slot(&path, slot, &image)?;
+
+    // Record the source archive (or warn on a bare image) in the flash `.nv` file, so
+    // a run-from-flash instance keeps its app.toml-derived config and stays
+    // humility-attachable.
+    let nv_path = flash::nv_state_path(&path);
+    let mut nv = flash::load_nv(&nv_path);
+    if flash::is_archive(src) {
+        match flash::stow_archive(&path, src, "sp") {
+            Ok(rel) => {
+                eprintln!(
+                    "[flash] Hubris archive {src} -> {}",
+                    flash::instance_base(&path).join(&rel).display()
+                );
+                nv.archive = Some(rel);
+            }
+            Err(e) => eprintln!("[flash] could not stow archive {src}: {e}"),
+        }
+    } else {
+        nv.archive = None;
+        eprintln!(
+            "[flash] WARNING: flashed a bare image with no Hubris archive. Some \
+             emulation (SP Ethernet ports from app.toml) and all humility tooling \
+             (ringbuf/hiffy, which match the archive image id) rely on archive \
+             content; a flash image alone is inadequate. Flash a Hubris build \
+             archive (.zip) instead."
+        );
+    }
+    flash::save_nv(&nv_path, &nv)?;
+
     println!(
         "flashed {} bytes into slot {} (base {:#010x}, reset PC {:#010x}) of {}",
         image.len(),
@@ -316,6 +412,29 @@ fn cmd_info() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// pack [bundle.zip]: bundle this instance (flash images, their `.nv` files,
+/// identity, config, and the stowed Hubris archives) into a single portable zip.
+fn cmd_pack(args: &[String]) -> Result<()> {
+    let out = args.first().map(String::as_str).unwrap_or("sp-emu-instance.zip");
+    bundle::pack(out)
+}
+
+/// unpack <bundle.zip> [dir]: extract an instance bundle so it can be run and
+/// inspected with humility without the original archives.
+fn cmd_unpack(args: &[String]) -> Result<()> {
+    let bundle_path = args
+        .first()
+        .context("usage: sp-emu unpack <bundle.zip> [dest-dir]")?;
+    // Default dest: the bundle's basename without .zip.
+    let dest = args.get(1).cloned().unwrap_or_else(|| {
+        bundle_path
+            .strip_suffix(".zip")
+            .unwrap_or(bundle_path)
+            .to_string()
+    });
+    bundle::unpack(bundle_path, &dest)
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
@@ -387,6 +506,7 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
 /// then run the serve loop forever: the MGS bridge for faux-mgs/sp-test and the
 /// Glasgow SWD probe for humility. Shared by `run <slot> 0` and `gdb`.
 fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
+    warn_if_no_sp_archive();
     let path = nvm_path();
     let nvm = flash::load_nvm(&path)?;
     let swap_override = slot_given.then_some(slot == 'b');
@@ -424,6 +544,7 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     let rot = match (&rot_service, &rot_flash) {
         (None, Some(p)) => {
             eprintln!("[rot] SP_EMU_ROT_FLASH={p}");
+            record_rot_archives(p);
             let img = flash::load_image(p)?;
             Some(build_rot_core(&img)?)
         }
@@ -435,6 +556,58 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     });
     let mut host = make_host();
     gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
+}
+
+/// Stow the RoT's Hubris archives into the instance base (the SP flash's directory,
+/// `instance_anchor`) so the SP and RoT share one `archives/` and pack as a single
+/// tree, and record which archive produced each region in the RoT metadata file
+/// (`<rot-nvm>.nv`, refs relative to that base): slot A = `SP_EMU_ROT_FLASH`, slot B =
+/// `SP_EMU_ROT_IMAGE_B`, stage0 = `SP_EMU_ROT_BOOTLEBY`. Warns on a bare-bin RoT image
+/// (humility can't attach).
+fn record_rot_archives(slot_a: &str) {
+    let nvm = rot_flash::nvm_path();
+    let anchor = instance_anchor();
+    let cfg = config::get();
+    let stow = |src: &str, name: &str, region: &str| -> Option<String> {
+        if flash::is_archive(src) {
+            match flash::stow_archive(&anchor, src, name) {
+                Ok(rel) => {
+                    eprintln!(
+                        "[rot] Hubris archive {src} -> {}",
+                        flash::instance_base(&anchor).join(&rel).display()
+                    );
+                    Some(rel)
+                }
+                Err(e) => {
+                    eprintln!("[rot] could not stow archive {src}: {e}");
+                    None
+                }
+            }
+        } else {
+            if !cfg.no_archive_warn {
+                eprintln!(
+                    "[rot] WARNING: {region} loaded from a bare image (no Hubris \
+                     archive); humility cannot attach to it. Provide a Hubris build \
+                     archive (.zip)."
+                );
+            }
+            None
+        }
+    };
+    let meta = flash::RotMeta {
+        slot_a_archive: stow(slot_a, "rot-a", "RoT slot A"),
+        slot_b_archive: cfg
+            .rot_image_b
+            .as_deref()
+            .and_then(|b| stow(b, "rot-b", "RoT slot B")),
+        stage0_archive: cfg
+            .rot_bootleby
+            .as_deref()
+            .and_then(|s| stow(s, "stage0", "RoT stage0/bootleby")),
+    };
+    if let Err(e) = flash::save_rot_meta(&flash::nv_state_path(&nvm), &meta) {
+        eprintln!("[rot] could not write RoT metadata file: {e}");
+    }
 }
 
 /// Build the LPC55 RoT core (Cortex-M33 + LPC55 SoC) loaded with the oxide-rot-1

@@ -125,6 +125,11 @@ config! {
     flash_path: String = "SP_EMU_FLASH" => |v| v.unwrap_or_else(|| "sp-flash.bin".to_string()),
     rot_nvm_path: String = "SP_EMU_ROT_NVM" => |v| v.unwrap_or_else(|| "sp-rot-flash.bin".to_string()),
     identity_path: String = "SP_EMU_IDENTITY" => |v| v.unwrap_or_else(|| "sp-emu-identity".to_string()),
+    // Directory for this instance's persistent state (flash images, .nv companions,
+    // identity, stowed archives) when SP_EMU_FLASH/ROT_NVM/IDENTITY are not given
+    // explicitly. Unset means a per-user default under XDG_STATE_HOME or
+    // ~/.local/state, so a bare run does not write into the working directory.
+    state_dir: Option<String> = "SP_EMU_STATE_DIR" => |v| v,
 
     // ---- instance identity (the --seed flag wins over $SP_EMU_SEED) ----
     seed: Option<String> = "SP_EMU_SEED" => |v| seed_override.clone().or(v),
@@ -145,6 +150,7 @@ config! {
     rot_measure: bool = "SP_EMU_ROT_MEASURE" => |v| v.is_some(),
     well_known_ports: bool = "SP_EMU_WELL_KNOWN_PORTS" => |v| v.is_some(),
     no_debug: bool = "SP_EMU_NO_DEBUG" => |v| v.is_some(),
+    no_archive_warn: bool = "SP_EMU_NO_ARCHIVE_WARN" => |v| v.is_some(), // silence the "no Hubris archive" warning
     host_pty: bool = "SP_EMU_HOST_PTY" => |v| v.is_some(),
     swd_trigger: bool = "SP_EMU_SWD_TRIGGER" => |v| v.is_some(),
     trace: bool = "SP_EMU_TRACE" => |v| v.is_some(),
@@ -414,6 +420,55 @@ pub fn get() -> &'static Config {
     CONFIG.get_or_init(|| Config::from_env(None).expect("default config resolves"))
 }
 
+/// The effective configuration as a flat `SP_EMU_NAME = "value"` TOML table (only the
+/// explicitly-set knobs). Used by `pack` to embed a reproducible config in a bundle.
+pub fn to_toml() -> String {
+    get().to_toml()
+}
+
+/// The instance state directory. `$SP_EMU_STATE_DIR` if set, otherwise a per-user
+/// default under `$XDG_STATE_HOME` or `~/.local/state` (a temp dir if neither is
+/// available). Default instance files (flash, RoT flash, identity) and the stowed
+/// archives live under it, so a bare run does not litter the working directory.
+pub fn state_dir() -> String {
+    if let Some(d) = get().state_dir.clone() {
+        return d;
+    }
+    let base = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|h| format!("{h}/.local/state"))
+        });
+    match base {
+        Some(b) => format!("{b}/sp-emu"),
+        None => format!("{}/sp-emu", std::env::temp_dir().display()),
+    }
+}
+
+/// Whether `state_dir()` is the built-in default (no explicit `$SP_EMU_STATE_DIR`).
+pub fn state_dir_is_default() -> bool {
+    get().state_dir.is_none()
+}
+
+/// Whether an `SP_EMU_*` variable was explicitly set (environment or config file).
+pub fn is_set(name: &str) -> bool {
+    get().is_set(name)
+}
+
+/// Resolve an instance file path: the explicit knob value when it was set (or already
+/// absolute), otherwise `value` under the instance state directory (`state_dir`).
+pub fn instance_file(env_name: &str, value: &str) -> String {
+    if is_set(env_name) || std::path::Path::new(value).is_absolute() {
+        value.to_string()
+    } else {
+        format!("{}/{}", state_dir(), value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +498,23 @@ mod tests {
         assert_eq!(c.eth_quantum, 4096);
         assert!(c.eth_txbreak);
         assert_eq!(c.ambient_c, 30.0);
+        // No SP_EMU_STATE_DIR by default, so the built-in per-user default is used.
+        assert_eq!(c.state_dir, None);
+    }
+
+    /// `instance_file` passes absolute paths through and joins a relative default under
+    /// the instance state directory, so a bare run does not write into the cwd.
+    #[test]
+    fn instance_file_absolute_passes_through_relative_joins_state_dir() {
+        // Absolute value is used verbatim regardless of whether the knob was set.
+        assert_eq!(
+            instance_file("SP_EMU_UNSET_KNOB_XYZ", "/abs/sp-flash.bin"),
+            "/abs/sp-flash.bin"
+        );
+        // A relative default (knob not set) lands under the namespaced state dir.
+        let p = instance_file("SP_EMU_UNSET_KNOB_XYZ", "sp-flash.bin");
+        assert!(p.ends_with("/sp-flash.bin"), "got {p}");
+        assert!(p.contains("sp-emu"), "state dir should be namespaced: {p}");
     }
 
     #[test]
