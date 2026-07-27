@@ -2577,6 +2577,24 @@ mod tests {
         assert!(!cpu.halted);
     }
 
+    /// A CPU reset (`SYSRESETREQ` / `reset_for_reboot`) does not by itself halt the
+    /// core: it clears `halted` and any stale `bkpt_hit`. A halt-at-reset is applied
+    /// by the debug port's vector catch (`SwDp::honor_vector_catch`), not the CPU
+    /// reset, so a subsequent vector-catch halt reports DFSR.VCATCH, not a stale BKPT.
+    #[test]
+    fn reset_for_reboot_leaves_core_running() {
+        let mut cpu = Cpu::new();
+        cpu.halted = true; // previously debug-halted...
+        cpu.bkpt_hit = true; // ...at a BKPT
+        cpu.reset_for_reboot(0x2000_0800, 0x0800_0200);
+        assert!(
+            !cpu.halted,
+            "reset alone does not halt; the debug port owns any vector catch"
+        );
+        assert!(!cpu.bkpt_hit, "stale BKPT state cleared");
+        assert_eq!(cpu.pc, 0x0800_0200, "PC reloaded from the reset vector");
+    }
+
     // Thumb `WFI` = 0xBF30.
     const WFI: u16 = 0xBF30;
 

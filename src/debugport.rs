@@ -319,11 +319,35 @@ impl SwDp {
         let sp = bus.read32(VECTOR_TABLE);
         let pc = bus.read32(VECTOR_TABLE + 4) & !1;
         cpu.reset_for_reboot(sp, pc);
+        self.reset_sticky = true;
+        self.honor_vector_catch(cpu);
+    }
+
+    /// Apply an armed reset vector catch after a core reset from any source.
+    ///
+    /// On silicon `DEMCR.VC_CORERESET` halts the core at the reset vector for any
+    /// reset, not only a pin/SWD-driven one. `do_reset` uses this for the RoT's
+    /// pin/AIRCR resets; the two-core serve loop also calls it after the SP firmware
+    /// drives its own `SYSRESETREQ`, so an armed RoT catches that self-reset too.
+    /// Returns whether the catch fired: the core is now halted at the reset vector
+    /// (reported as DFSR.VCATCH). A no-op returning `false` when not armed, so the
+    /// core keeps running from its reset vector.
+    ///
+    /// When the catch fires it also marks the reset sticky, so `DHCSR.S_RESET_ST`
+    /// reports the reset on the next read, the same as `do_reset` and as silicon does
+    /// for a reset from any source. (`do_reset` marks it unconditionally, since a
+    /// RoT-driven reset resets the core whether or not the catch is armed; a firmware
+    /// self-reset only routes through here, so setting it on the caught path keeps the
+    /// two paths consistent.)
+    pub fn honor_vector_catch(&mut self, cpu: &mut Cpu) -> bool {
         if self.demcr & VC_CORERESET != 0 {
             cpu.halted = true;
             self.vcatch_halt = true;
+            self.reset_sticky = true;
+            true
+        } else {
+            false
         }
-        self.reset_sticky = true;
     }
 
     fn write_dhcsr(&mut self, cpu: &mut Cpu, val: u32) {
@@ -364,5 +388,66 @@ impl SwDp {
         } else {
             self.dcrdr = cpu.gdb_reg(regsel); // read reg into DCRDR
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A firmware SYSRESETREQ self-reset with the RoT's vector catch armed must halt
+    // the SP at the reset vector (0 instructions), and report DFSR.VCATCH rather than
+    // a stale BKPT. This mirrors the serve loop's self-reset apply path: reboot the
+    // core, then honor an armed DEMCR.VC_CORERESET.
+    #[test]
+    fn honor_vector_catch_halts_self_reset_and_reports_vcatch() {
+        let mut cpu = Cpu::new();
+        cpu.bkpt_hit = true; // stale state from an earlier BKPT halt
+        cpu.reset_for_reboot(0x2000_1000, 0x0800_0100);
+        assert!(
+            !cpu.halted,
+            "reset_for_reboot leaves the core running on its own"
+        );
+
+        let mut swdp = SwDp::new();
+        swdp.demcr = VC_CORERESET; // the RoT armed reset-and-halt
+        assert!(swdp.honor_vector_catch(&mut cpu), "armed catch fires");
+        assert!(cpu.halted, "core halted at the reset vector");
+        assert!(swdp.vcatch_halt);
+
+        let mut bus = Bus::new();
+        assert_eq!(
+            swdp.mem_read_word(&cpu, &mut bus, DFSR),
+            DFSR_VCATCH,
+            "vector-catch halt reports VCATCH, not a stale BKPT/HALTED"
+        );
+        // The reset is sticky (S_RESET_ST) on the first DHCSR read, matching do_reset
+        // and silicon, then read-clears.
+        assert_ne!(
+            swdp.mem_read_word(&cpu, &mut bus, DHCSR) & S_RESET_ST,
+            0,
+            "a caught self-reset reports S_RESET_ST once"
+        );
+        assert_eq!(
+            swdp.mem_read_word(&cpu, &mut bus, DHCSR) & S_RESET_ST,
+            0,
+            "S_RESET_ST read-clears"
+        );
+    }
+
+    // Without VC_CORERESET armed, a self-reset must leave the SP running (the
+    // early-boot case, before the RoT's swd task configures SP_RESET).
+    #[test]
+    fn honor_vector_catch_noop_when_not_armed() {
+        let mut cpu = Cpu::new();
+        cpu.reset_for_reboot(0x2000_1000, 0x0800_0100);
+        let mut swdp = SwDp::new(); // demcr == 0
+        assert!(
+            !swdp.honor_vector_catch(&mut cpu),
+            "unarmed catch is a no-op"
+        );
+        assert!(!cpu.halted, "core keeps running from the reset vector");
+        assert!(!swdp.vcatch_halt);
+        assert!(!swdp.reset_sticky, "an unarmed no-op does not mark a reset");
     }
 }

@@ -17,6 +17,65 @@ use crate::mem::Bus;
 use anyhow::Result;
 use std::net::TcpListener;
 
+/// Safety bound on prompt-halt servicing: iterations the serve loop will freeze the
+/// SP waiting for the RoT to halt it after a self-reset. Generous (the RoT only needs
+/// to take its SP_RESET IRQ and run its handler); a backstop so an armed-but-unhalting
+/// RoT can never wedge the SP, which then resumes free-running as it would today.
+const SP_RESET_HALT_ITERS: u32 = 1000;
+
+/// Instructions the SP may run this serve-loop iteration, in priority order: a
+/// debug-halted core is not stepped; a self-reset being serviced freezes the SP at
+/// its reset vector so the RoT halts it before it runs reset-vector work; a core
+/// running an injected program under debug (endoscope, after the RoT resumed it)
+/// sprints so it reaches its terminal BKPT within the RoT's halt-poll; a phase-2
+/// sprot reply uses a small burst so the SP never clocks past the RoT's refill;
+/// otherwise the full eth-service quantum.
+fn sp_burst_for(
+    halted: bool,
+    sp_reset_servicing: bool,
+    debug_en: bool,
+    replying: bool,
+    quantum: u32,
+) -> u32 {
+    // Freeze the SP (burst 0) when it is debug-halted (only the RoT may move it) or
+    // when a self-reset is being serviced (hold it at the reset vector until the RoT
+    // halts it). The remaining cases run it.
+    if halted || sp_reset_servicing {
+        0
+    } else if debug_en {
+        20_000_000
+    } else if replying {
+        48
+    } else {
+        quantum
+    }
+}
+
+/// Whether a genuine SP self-reset should enter prompt-halt servicing. Only once the
+/// RoT is watching (its swd task armed SP_RESET, `rot_armed`); not if the SP is
+/// already halted (a vector catch caught the reset). While the RoT is unarmed (early
+/// boot), the SP's measurement loop must keep free-running, so this stays false.
+fn enter_sp_reset_service(sp_reset_edge: bool, rot_armed: bool, sp_halted: bool) -> bool {
+    sp_reset_edge && rot_armed && !sp_halted
+}
+
+/// Advance prompt-halt servicing by one iteration. Cleared once the RoT takes control
+/// (halted the SP, or resumed it under debug for endoscope), or when the safety bound
+/// is exhausted (the RoT never halted: give up and free-run). Returns whether
+/// servicing is still active; decrements `iters` only on the still-waiting path.
+fn continue_sp_reset_service(
+    servicing: bool,
+    sp_halted: bool,
+    sp_debug_en: bool,
+    iters: &mut u32,
+) -> bool {
+    if !servicing || sp_halted || sp_debug_en {
+        return false;
+    }
+    *iters = iters.saturating_sub(1);
+    *iters != 0
+}
+
 /// Pre-boot to steady state, then serve the Glasgow SWD debug probe on
 /// 127.0.0.1:<swd_port> (`humility -p 20b7:9db1:tcp:127.0.0.1:<swd_port>`).
 ///
@@ -264,6 +323,12 @@ pub fn serve(
     let mut prev_req_dbg = false; // coupledbg: edge-detect request_in_flight for the trace
     const CREDIT_CAP: u32 = 5000;
 
+    // Prompt-halt servicing: while an armed RoT is halting the SP after a self-reset,
+    // freeze the SP (burst 0) and give the RoT the full budget so it halts the SP
+    // before it runs significant reset-vector work. Bounded by `sp_reset_halt_iters`.
+    let mut sp_reset_halt_pending = false;
+    let mut sp_reset_halt_iters: u32 = 0;
+
     loop {
         if let Some(swd_l) = &listeners {
             match swd_l.accept() {
@@ -314,15 +379,13 @@ pub fn serve(
         // halt-poll timeout. The RoT's timer only advances while the RoT itself
         // runs, so the SP finishing the flash measurement here costs little
         // RoT-time; without it the RoT times out (DidNotHalt) before the SP halts.
-        let sp_burst = if cpu.halted {
-            0
-        } else if cpu.debug_en {
-            20_000_000
-        } else if replying {
-            48
-        } else {
-            quantum
-        };
+        let sp_burst = sp_burst_for(
+            cpu.halted,
+            sp_reset_halt_pending,
+            cpu.debug_en,
+            replying,
+            quantum,
+        );
         for _ in 0..sp_burst {
             // Stop the burst the instant the SP halts (e.g. endoscope's terminal
             // BKPT), so the debug-run burst above doesn't spin on the BKPT.
@@ -393,6 +456,11 @@ pub fn serve(
             let sp = bus.read32(0x0800_0000);
             let pc = bus.read32(0x0800_0004) & !1;
             cpu.reset_for_reboot(sp, pc);
+            // On silicon DEMCR.VC_CORERESET catches a reset from any source, a
+            // firmware SYSRESETREQ included. If the RoT armed reset-and-halt, the SP
+            // halts at its reset vector here (0 instructions); otherwise it falls to
+            // the prompt-halt servicing window below.
+            sp_swdp.honor_vector_catch(&mut cpu);
             cpu.flush_decode_cache();
             bus.reset_pending = false;
             sp_reset_edge = true;
@@ -428,6 +496,14 @@ pub fn serve(
                 rb.pend_irq(4);
                 swd_triggered = true;
             }
+            // On a genuine self-reset, if the RoT is armed to service SP_RESET, freeze
+            // the SP (below) until the RoT halts it, so it does not run reset-vector
+            // work first. Gated on a real reset edge (not the synthetic trigger) and
+            // skipped when a vector catch already halted the SP.
+            if enter_sp_reset_service(sp_reset_edge, rb.irq_enabled(4), cpu.halted) {
+                sp_reset_halt_pending = true;
+                sp_reset_halt_iters = SP_RESET_HALT_ITERS;
+            }
             if rot_trace_from.is_some() {
                 rc.record_disasm = true; // populate last_disasm for the window trace
             }
@@ -458,7 +534,7 @@ pub fn serve(
             // Stay full-speed only during an actual exchange (clocking, or a request
             // being processed), not for the RoT's idle housekeeping, so the instance
             // sleeps when quiescent and keeps its scheduling priority.
-            rot_busy = ssa_or_cs || req_in_flight;
+            rot_busy = ssa_or_cs || req_in_flight || sp_reset_halt_pending;
             // Run the RoT many quanta back-to-back so it finishes a request's
             // handler in one go — IPC to update_server, up to 32 flash reads for a
             // CMPA page, building + CRCing the response — and asserts rot-irq before
@@ -471,7 +547,11 @@ pub fn serve(
             // back-to-back budget only while an exchange is happening; when idle, one
             // quantum per outer iteration keeps CPU near the baseline single-core
             // instance so the host scheduler doesn't decay this instance's priority.
-            let rot_budget = if ssa_or_cs || req_in_flight { 256 } else { 1 };
+            let rot_budget = if ssa_or_cs || req_in_flight || sp_reset_halt_pending {
+                256
+            } else {
+                1
+            };
             'rot_burst: for _ in 0..rot_budget {
                 let mut rot_idled = false;
                 for _ in 0..quantum {
@@ -636,6 +716,15 @@ pub fn serve(
                 cpu.sp_tick_credit = 0;
             }
             prev_req_dbg = req_in_flight;
+            // Clear prompt-halt servicing once the RoT has taken control of the SP
+            // (halted it over SWD, or resumed it under debug to run endoscope), or
+            // when the safety bound expires; then the SP resumes normal scheduling.
+            sp_reset_halt_pending = continue_sp_reset_service(
+                sp_reset_halt_pending,
+                cpu.halted,
+                cpu.debug_en,
+                &mut sp_reset_halt_iters,
+            );
         } else if let Some(client) = rot_client.as_mut() {
             // Shared-RoT IPC path: no in-process RoT core. Act as the SP's link
             // peer — accumulate the request the SP clocks out, ship it to the
@@ -768,5 +857,63 @@ pub fn serve(
                 std::thread::sleep(std::time::Duration::from_millis(idle_ms));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const Q: u32 = 340;
+
+    #[test]
+    fn sp_burst_priority_order() {
+        // Halted wins over everything: a halted core is not stepped.
+        assert_eq!(sp_burst_for(true, true, true, true, Q), 0);
+        // Servicing a self-reset freezes the SP even though it is not halted and not
+        // in a reply, and outranks the endoscope debug sprint.
+        assert_eq!(sp_burst_for(false, true, true, false, Q), 0);
+        // Endoscope: running an injected program under debug sprints to its BKPT.
+        assert_eq!(sp_burst_for(false, false, true, false, Q), 20_000_000);
+        // Phase-2 sprot reply: small burst so the SP never outruns the RoT refill.
+        assert_eq!(sp_burst_for(false, false, false, true, Q), 48);
+        // Otherwise the full eth-service quantum.
+        assert_eq!(sp_burst_for(false, false, false, false, Q), Q);
+    }
+
+    #[test]
+    fn enter_service_only_when_armed_edge_and_not_halted() {
+        // Genuine reset edge, RoT armed, SP still running: enter servicing.
+        assert!(enter_sp_reset_service(true, true, false));
+        // RoT not yet armed (early boot): the SP's measurement loop must free-run.
+        assert!(!enter_sp_reset_service(true, false, false));
+        // No reset this iteration.
+        assert!(!enter_sp_reset_service(false, true, false));
+        // A vector catch already halted the SP: no servicing needed.
+        assert!(!enter_sp_reset_service(true, true, true));
+    }
+
+    #[test]
+    fn service_stays_until_rot_takes_control() {
+        let mut iters = SP_RESET_HALT_ITERS;
+        // Still waiting (RoT has not halted or resumed the SP): stays active, and the
+        // safety countdown ticks down.
+        assert!(continue_sp_reset_service(true, false, false, &mut iters));
+        assert_eq!(iters, SP_RESET_HALT_ITERS - 1);
+        // The RoT halted the SP over SWD: servicing ends.
+        assert!(!continue_sp_reset_service(true, true, false, &mut iters));
+        // The RoT resumed the SP under debug (endoscope): servicing ends.
+        assert!(!continue_sp_reset_service(true, false, true, &mut iters));
+    }
+
+    #[test]
+    fn service_backstop_clears_when_bound_exhausted() {
+        // The RoT armed SP_RESET but never halts the SP: after the bound, give up so
+        // the SP resumes free-running rather than wedging.
+        let mut iters = 1;
+        assert!(!continue_sp_reset_service(true, false, false, &mut iters));
+        assert_eq!(iters, 0);
+        // And once inactive it stays inactive.
+        assert!(!continue_sp_reset_service(false, false, false, &mut iters));
     }
 }
