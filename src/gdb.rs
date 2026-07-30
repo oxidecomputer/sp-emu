@@ -76,6 +76,55 @@ fn continue_sp_reset_service(
     *iters != 0
 }
 
+// JTAG_DETECT (SP_TO_ROT_JTAG_DETECT_L): the RoT input an SP SWD probe asserts. PINT
+// slot 1 -> NVIC IRQ 5 (the sibling of SP_RESET's slot 0 -> IRQ 4). The slot bit is
+// written into the flat PINT RegFile at the same register SP_RESET uses; the level
+// (PIO0_20) is synthesized separately in LpcGpio from `SprotLink::jtag_detect`.
+const JTAG_DETECT_IRQ: u16 = 5;
+const JTAG_DETECT_PINT_REG: u32 = 0x4000_4020;
+const JTAG_DETECT_PINT_BIT: u32 = 1 << 1; // PINT slot 1
+/// Bound on the pre-glasgow RoT pump: iterations to step the RoT so its swd task can
+/// service a just-delivered JTAG_DETECT edge (invalidate the attestation log) before
+/// glasgow::serve freezes the RoT for the session. Generous; the handler is short.
+const JTAG_PUMP_ITERS: u32 = 200;
+
+/// Deliver a JTAG_DETECT falling edge to the RoT, if its firmware has armed the IRQ.
+/// Sets the PINT slot-1 detect bit (OR, so a coincident SP_RESET slot-0 bit survives)
+/// and pends IRQ 5. Returns whether it injected: `false` when the firmware has not
+/// enabled JTAG_DETECT (e.g. an older RoT image), so the whole feature stays inert.
+fn inject_jtag_detect(rb: &mut Bus) -> bool {
+    if !rb.irq_enabled(JTAG_DETECT_IRQ) {
+        return false;
+    }
+    let cur = rb.read32(JTAG_DETECT_PINT_REG);
+    rb.write32(JTAG_DETECT_PINT_REG, cur | JTAG_DETECT_PINT_BIT);
+    rb.pend_irq(JTAG_DETECT_IRQ);
+    true
+}
+
+/// Step the RoT until it goes idle again or a bounded cap, so a just-pended
+/// notification (JTAG_DETECT) is serviced before the caller freezes the RoT.
+fn pump_rot_briefly(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, quantum: u32) {
+    for _ in 0..JTAG_PUMP_ITERS {
+        let mut idled = false;
+        for _ in 0..quantum {
+            if rc.step(rb, host).is_err() {
+                return;
+            }
+            rc.maybe_tick(rb);
+            rc.maybe_interrupt(rb);
+            if rc.idle_skip > 0 {
+                rc.idle_skip = 0;
+                idled = true;
+                break;
+            }
+        }
+        if idled {
+            break;
+        }
+    }
+}
+
 /// Pre-boot to steady state, then serve the Glasgow SWD debug probe on
 /// 127.0.0.1:<swd_port> (`humility -p 20b7:9db1:tcp:127.0.0.1:<swd_port>`).
 ///
@@ -310,6 +359,8 @@ pub fn serve(
     // full SP self-reset (whose measurement gate depends on the SP image).
     let swd_trigger = crate::config::get().swd_trigger;
     let mut swd_triggered = false;
+    let jtag_trigger = crate::config::get().jtag_trigger;
+    let mut jtag_triggered = false;
     // The SP's debug port, driven by the in-process RoT over the internal SWD link.
     // Loop-lifetime so its DP/AP/CoreDebug state persists across transactions.
     let mut sp_swdp = crate::debugport::SwDp::new();
@@ -334,12 +385,29 @@ pub fn serve(
             match swd_l.accept() {
                 Ok((stream, peer)) => {
                     eprintln!("[gdb] SWD (Glasgow applet) client {peer}");
+                    // A debug probe attached to the SP: assert SP_TO_ROT_JTAG_DETECT_L
+                    // so the RoT invalidates its attestation log. The RoT is frozen for
+                    // the whole glasgow::serve call below, so deliver the edge and step
+                    // the RoT to service it here, before handing over the SP.
+                    if let Some(l) = crate::sprot::link() {
+                        l.borrow_mut().jtag_detect = true;
+                    }
+                    if let Some((rc, rb)) = rot.as_mut() {
+                        if inject_jtag_detect(rb) {
+                            pump_rot_briefly(rc, rb, host, quantum);
+                        }
+                    }
                     // Restore the running-halt state on disconnect so the main
                     // loop resumes the SP after a humility command detaches.
                     let r = crate::glasgow::serve(stream, &mut cpu, &mut bus, host);
                     cpu.halted = false;
                     cpu.debug_en = false;
                     cpu.bkpt_hit = false;
+                    // Probe detached: deassert JTAG_DETECT (PIO0_20 level back high). No
+                    // edge/IRQ on release; the firmware handler is falling-edge only.
+                    if let Some(l) = crate::sprot::link() {
+                        l.borrow_mut().jtag_detect = false;
+                    }
                     if let Err(e) = r {
                         eprintln!("[gdb] SWD connection ended: {e}");
                     }
@@ -503,6 +571,27 @@ pub fn serve(
             if enter_sp_reset_service(sp_reset_edge, rb.irq_enabled(4), cpu.halted) {
                 sp_reset_halt_pending = true;
                 sp_reset_halt_iters = SP_RESET_HALT_ITERS;
+                if coupledbg {
+                    eprintln!(
+                        "[reset] SP self-reset (real SYSRESETREQ), RoT armed: freezing the SP at its reset vector until the RoT halts it (backstop {SP_RESET_HALT_ITERS} iters)"
+                    );
+                }
+            } else if sp_reset_edge && coupledbg {
+                // A real self-reset that does not enter servicing: either a vector
+                // catch already halted the SP (0 reset-vector instructions), or the RoT
+                // has not armed SP_RESET yet (early boot), so the SP free-runs.
+                if cpu.halted {
+                    eprintln!("[reset] SP self-reset: vector-caught at the reset vector (0 reset-vector instrs)");
+                } else {
+                    eprintln!("[reset] SP self-reset: RoT not armed (SP_RESET IRQ disabled); SP free-runs (early boot)");
+                }
+            }
+            // SP_EMU_JTAG_TRIGGER: fire one synthetic JTAG_DETECT edge once the RoT has
+            // armed the IRQ, to exercise attestation-log invalidation without a real SWD
+            // probe. The RoT is stepped normally here (no glasgow freeze), so it services
+            // the pended IRQ on the following iterations; no pre-pump needed.
+            if jtag_trigger && !jtag_triggered && inject_jtag_detect(rb) {
+                jtag_triggered = true;
             }
             if rot_trace_from.is_some() {
                 rc.record_disasm = true; // populate last_disasm for the window trace
@@ -719,12 +808,26 @@ pub fn serve(
             // Clear prompt-halt servicing once the RoT has taken control of the SP
             // (halted it over SWD, or resumed it under debug to run endoscope), or
             // when the safety bound expires; then the SP resumes normal scheduling.
+            let was_servicing = sp_reset_halt_pending;
             sp_reset_halt_pending = continue_sp_reset_service(
                 sp_reset_halt_pending,
                 cpu.halted,
                 cpu.debug_en,
                 &mut sp_reset_halt_iters,
             );
+            if coupledbg && was_servicing && !sp_reset_halt_pending {
+                // The SP burst is 0 while servicing, so no reset-vector instructions
+                // ran between the reset edge and this point; report how the RoT took
+                // control and how many serve iterations it took.
+                let iters = SP_RESET_HALT_ITERS - sp_reset_halt_iters;
+                if cpu.halted {
+                    eprintln!("[reset] RoT halted the SP after {iters} serve iterations, SP ran 0 reset-vector instrs (prompt)");
+                } else if cpu.debug_en {
+                    eprintln!("[reset] RoT resumed the SP under debug after {iters} serve iterations (endoscope), SP ran 0 reset-vector instrs");
+                } else {
+                    eprintln!("[reset] backstop: RoT did not halt within {SP_RESET_HALT_ITERS} iterations; SP resumes free-running");
+                }
+            }
         } else if let Some(client) = rot_client.as_mut() {
             // Shared-RoT IPC path: no in-process RoT core. Act as the SP's link
             // peer — accumulate the request the SP clocks out, ship it to the
@@ -865,6 +968,34 @@ mod tests {
     use super::*;
 
     const Q: u32 = 340;
+
+    #[test]
+    fn inject_jtag_detect_gated_on_armed_and_preserves_sp_reset() {
+        let mut bus = Bus::new();
+        bus.log_unmapped = false;
+        bus.add_ram(0x4000_4000, 0x100); // stand in for the flat PINT RegFile
+        bus.write32(0x4000_4020, 0x1); // a SP_RESET (slot 0) edge already latched
+
+        // Firmware without JTAG_DETECT (IRQ 5 not enabled): a no-op that disturbs
+        // nothing, so an older RoT image is unaffected.
+        assert!(!inject_jtag_detect(&mut bus));
+        assert_eq!(bus.read32(0x4000_4020), 0x1);
+        assert_eq!(bus.next_irq(), None);
+
+        // Firmware arms JTAG_DETECT (NVIC ISER0 bit 5 = IRQ 5).
+        bus.write32(0xE000_E100, 1 << JTAG_DETECT_IRQ);
+        assert!(inject_jtag_detect(&mut bus));
+        assert_eq!(
+            bus.read32(0x4000_4020),
+            0x3,
+            "slot-1 bit set, coincident slot-0 (SP_RESET) preserved"
+        );
+        assert_eq!(
+            bus.next_irq(),
+            Some(JTAG_DETECT_IRQ),
+            "IRQ 5 pended + enabled"
+        );
+    }
 
     #[test]
     fn sp_burst_priority_order() {

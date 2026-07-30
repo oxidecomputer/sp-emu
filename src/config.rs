@@ -153,6 +153,9 @@ config! {
     no_archive_warn: bool = "SP_EMU_NO_ARCHIVE_WARN" => |v| v.is_some(), // silence the "no Hubris archive" warning
     host_pty: bool = "SP_EMU_HOST_PTY" => |v| v.is_some(),
     swd_trigger: bool = "SP_EMU_SWD_TRIGGER" => |v| v.is_some(),
+    // Fire one synthetic JTAG_DETECT edge after boot so the RoT invalidates its
+    // attestation log without a real SWD probe attaching (the SWD_TRIGGER analog).
+    jtag_trigger: bool = "SP_EMU_JTAG_TRIGGER" => |v| v.is_some(),
     trace: bool = "SP_EMU_TRACE" => |v| v.is_some(),
 
     // ---- per-subsystem diagnostic tracing (presence = on) ----

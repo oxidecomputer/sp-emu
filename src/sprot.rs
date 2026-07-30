@@ -64,6 +64,12 @@ pub struct SprotLink {
     // armed the SP halts at its reset vector -- the reset-into-debug-halt the RoT's
     // endoscope measurement depends on. Set by `LpcGpio`, taken by the serve loop.
     pub sp_reset_release: bool,
+    // True while an SWD debug probe (a humility/probe-rs client on the SP's SWD TCP
+    // port) is attached. Drives SP_TO_ROT_JTAG_DETECT_L (PIO0_20, active-low): the
+    // RoT firmware level-reads it to gate its own SWD activity, and edge-detects its
+    // assertion to invalidate the attestation log. Set/cleared by the serve loop on
+    // the probe's connect/disconnect; read by `LpcGpio` to synthesize the pin level.
+    pub jtag_detect: bool,
 }
 pub type Link = Rc<RefCell<SprotLink>>;
 
@@ -409,7 +415,20 @@ impl Mmio for LpcGpio {
     }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x2100 => self.p0, // PIN[0]
+            0x2100 => {
+                // PIN[0]: firmware output levels in `p0`, but bit 20 = PIO0_20 =
+                // SP_TO_ROT_JTAG_DETECT_L is an SP-driven input, so synthesize it from
+                // the shared link (like CS at 0x2104): active-low, so asserted (a probe
+                // attached) reads 0, deasserted reads 1. `p0` defaults all-high, so
+                // with no probe this reads 1 and the RoT's SWD path is unaffected.
+                let mut v = self.p0;
+                if self.link.borrow().jtag_detect {
+                    v &= !(1 << 20);
+                } else {
+                    v |= 1 << 20;
+                }
+                v
+            }
             0x2104 => {
                 // PIN[1]: bit 1 = CHIP_SELECT (P1_1), the SP's RoT chip-select,
                 // active-low. The RoT's wait_for_csn_deasserted spins until it reads
@@ -522,5 +541,28 @@ impl Mmio for SpExti {
             return;
         }
         self.regs.insert(off, val);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PIO0_20 = SP_TO_ROT_JTAG_DETECT_L is an SP-driven input, active-low, synthesized
+    // at GPIO read time from SprotLink::jtag_detect: high (deasserted) with no probe,
+    // low (asserted) while one is attached, without disturbing other port-0 pins.
+    #[test]
+    fn jtag_detect_level_synthesized_on_pio0_20() {
+        let link = Rc::new(RefCell::new(SprotLink::default()));
+        let mut g = LpcGpio::new(link.clone());
+
+        // No probe: PIO0_20 reads high (p0 defaults all-high), SWD path unaffected.
+        assert_ne!(g.read(0x2100) & (1 << 20), 0, "PIO0_20 high when no probe");
+
+        // Probe attached: PIO0_20 reads low; a nearby pin (P0_18) is untouched.
+        link.borrow_mut().jtag_detect = true;
+        let v = g.read(0x2100);
+        assert_eq!(v & (1 << 20), 0, "PIO0_20 low when a probe is attached");
+        assert_ne!(v & (1 << 18), 0, "other port-0 pins are unchanged");
     }
 }
