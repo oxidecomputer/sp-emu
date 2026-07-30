@@ -1,7 +1,8 @@
 # Faithful two-core co-scheduler and shared timebase (design)
 
-Status: design, not yet implemented. Captures the model and an incremental delivery
-plan for making the SP and RoT cores schedule as they do on hardware.
+Status: design. Increment 1 (endoscope coupling) is implemented; the phase state
+machine and self-caused-reset flag are not yet. Captures the model and an incremental
+delivery plan for making the SP and RoT cores schedule as they do on hardware.
 
 ## Problem
 
@@ -82,6 +83,14 @@ Keep it on the table only if a genuine both-cores-compute workload appears. The
 per-core-divisor coupling above gives the fidelity that matters without touching the
 global stepping ratio.
 
+The endoscope increment is the closest thing to a both-cores-compute case (the SP hashes
+flash while the RoT actively polls the halt), and it was resolved without proportional
+stepping: freeze the polling core's SysTick so its own execution does not advance its
+clock, and let the blocked-on-working credit drive it at the working core's rate. The
+freeze is what distinguishes an actively polling waiter from one asleep in WFI, whose
+clock already does not advance while it waits. This keeps the divisor coupling sufficient
+and leaves the global stepping ratio untouched.
+
 ### TIM5
 
 TIM5's 1 microsecond per instruction is a deliberate boot-delay compression (the
@@ -119,11 +128,16 @@ and verifiable.
 
 ## Incremental delivery (later rounds)
 
-1. Foundation plus endoscope coupling. `Cpu::tick_divisor()` plus the instruction-based
-   endoscope coupling: cap the SP burst during `debug_en` so the RoT interleaves, credit
-   the RoT `d(cpu.cycles) / SP_divisor` ms, gated by `SP_EMU_ENDOSCOPE_COUPLE`.
-   Self-contained, low-to-medium risk; delivers the pending fidelity. Does not require the
-   state machine.
+1. Foundation plus endoscope coupling (landed). `Cpu::tick_divisor()` plus the
+   instruction-based endoscope coupling: cap the SP burst during `debug_en` so the RoT
+   interleaves, freeze the RoT's SysTick (`Cpu::tick_frozen`) so its polling does not
+   advance its own clock, and credit the RoT `d(cpu.cycles) / SP_divisor` ms with a
+   fractional-remainder accumulator. The measurement runs pre-kernel, so `tick_divisor()`
+   is `None` and the divisor comes from `SP_EMU_SP_CLOCK_KHZ` (default 400000). Gated by
+   `SP_EMU_ENDOSCOPE_COUPLE` (default on); off restores the one-shot sprint. Does not
+   require the state machine. Result: the measurement completes in one attempt with a
+   bounded halt time proportional to the SP's endoscope instructions (about 330 ms for a
+   133M-instruction hash) instead of timing out and retrying.
 2. Phase state machine unification. Introduce the phase enum and `co_scheduler`; move
    `sp_burst_for`, `rot_budget`, both couplings, and prompt-halt behind it,
    behavior-preserving. Cover both the in-process-RoT and shared-client paths.
@@ -131,8 +145,8 @@ and verifiable.
 3. The self-caused-reset flag (small), naturally part of the state machine.
 4. Deferred: proportional cross-core stepping, only if a both-cores-compute case arises.
 
-Already landed and unchanged: the SP_RESET prompt-halt, the sprot SysTick coupling, and
-JTAG_DETECT.
+Already landed and unchanged: the SP_RESET prompt-halt, the sprot SysTick coupling,
+JTAG_DETECT, and now the endoscope coupling (increment 1 above).
 
 ## Verification (for the implementing rounds)
 
@@ -155,6 +169,8 @@ oxide-rot-1-selfsigned RoT, `SP_EMU_ROT_FLASH` plus `SP_EMU_ROT_ROM=1` plus
 - The exact phase set and the signal-to-phase mapping, especially the shared-RoT-client
   path, which has no in-process RoT core to couple against.
 - Whether the emulator should model `SYST_RVR` being cleared by `SYSRESETREQ` (real
-  hardware does; today it is retained, which conveniently keeps the SP divisor valid
-  during endoscope). If it should be cleared, the endoscope divisor needs another source.
+  hardware does; today it is retained). Increment 1 no longer depends on this: the
+  endoscope divisor falls back to `SP_EMU_SP_CLOCK_KHZ` when `tick_divisor()` is `None`,
+  so clearing `SYST_RVR` would not break endoscope coupling. The question remains only for
+  other pre-kernel timing that might want the real reload.
 - Whether `CREDIT_CAP` (5000) and the endoscope burst chunk need per-phase tuning.
