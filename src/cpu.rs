@@ -79,6 +79,11 @@ pub struct Cpu {
     pub idle_skip: u32,     // instrs skipped to the next tick on an idle WFI (loop sleeps instead)
     pub tick_events: u64,   // monotonic SysTick underflow events (one per ~1ms); RoT real-time proxy
     pub sp_tick_credit: u32, // RoT-derived ticks the SP still owes itself while blocked on sprot (coupling)
+    // Clock freeze: while set, this core's SysTick does not advance from its own
+    // running -- only a credit-armed tick (sp_tick_credit drained in WFI) fires. Used to
+    // pace the RoT's endoscope halt-poll by the SP's progress: without it the RoT's
+    // active polling advances its own clock and races past the poll deadline.
+    pub tick_frozen: bool,
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
     pub halted: bool,       // external debug halt (DHCSR C_HALT via the SWD debug port)
     pub debug_en: bool,     // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
@@ -198,6 +203,7 @@ impl Cpu {
             idle_skip: 0,
             tick_events: 0,
             sp_tick_credit: 0,
+            tick_frozen: false,
             record_disasm: false,
             halted: false,
             debug_en: false,
@@ -609,6 +615,12 @@ impl Cpu {
                         // ticks, so in practice this burst is small.
                         self.sp_tick_credit -= 1;
                         self.systick = 1;
+                    } else if self.tick_frozen {
+                        // Frozen with no credit yet (the coupled core is waiting on the
+                        // other's progress): idle without advancing the clock. Signal
+                        // idle to the run loop but leave `systick` alone, so no tick
+                        // fires -- the clock only moves when credit arrives.
+                        self.idle_skip = 1;
                     } else {
                         // No accepted request (or caught up to the RoT): the ordinary
                         // idle throttle -- record the skip so the loop sleeps the host
@@ -1617,6 +1629,16 @@ impl Cpu {
         self.q = x & (1 << 27) != 0;
     }
 
+    /// Instructions per 1 ms SysTick for this core (`SYST_RVR + 1` = clock_khz), or
+    /// `None` when no plausible ms-rate SysTick is configured (reload below the floor).
+    /// The reload is a kernel-startup value, so this is `None` for pre-kernel code (the
+    /// SP running the injected endoscope at its reset vector); such callers supply a
+    /// clock rate another way.
+    pub fn tick_divisor(&self) -> Option<u32> {
+        const MIN_TICK_RELOAD: u32 = 1000; // a real ms-rate reload is at least ~1 MHz
+        (self.syst_rvr >= MIN_TICK_RELOAD).then(|| self.syst_rvr + 1)
+    }
+
     /// Drive the SysTick timer one instruction. When it underflows and the
     /// timer interrupt is enabled, take the SysTick exception (vector 15), but
     /// only from thread mode with interrupts unmasked (the kernel runs SysTick
@@ -1635,6 +1657,14 @@ impl Cpu {
         if self.syst_csr & 1 == 0 {
             return;
         } // counter disabled
+        if self.tick_frozen && self.systick != 1 {
+            // Clock frozen: normal running does not advance the counter, so it never
+            // underflows on its own. Only a credit-armed tick (`systick == 1`, set by
+            // the WFI credit-drain below) falls through to fire, so the clock advances
+            // purely at the coupled rate (e.g. the RoT's endoscope poll, paced by the
+            // SP's progress) instead of racing on the core's own execution.
+            return;
+        }
         if self.systick == 0 {
             self.systick = self.syst_rvr;
         }
@@ -2593,6 +2623,53 @@ mod tests {
         );
         assert!(!cpu.bkpt_hit, "stale BKPT state cleared");
         assert_eq!(cpu.pc, 0x0800_0200, "PC reloaded from the reset vector");
+    }
+
+    /// `tick_divisor` reports the core's instructions/ms (SYST_RVR + 1) only when a
+    /// plausible ms-rate SysTick is configured, so instruction-to-ms conversions never
+    /// divide by a bogus value on a core that has not set its reload.
+    #[test]
+    fn tick_divisor_reports_configured_reload_else_none() {
+        let mut cpu = Cpu::new();
+        assert_eq!(
+            cpu.tick_divisor(),
+            None,
+            "default reload is not a real ms SysTick"
+        );
+        cpu.syst_rvr = 479_999; // 480 MHz core: 480_000 instructions per ms
+        assert_eq!(cpu.tick_divisor(), Some(480_000));
+        cpu.syst_rvr = 999; // below the minimum plausible reload
+        assert_eq!(cpu.tick_divisor(), None);
+    }
+
+    /// A frozen clock does not advance on the core's own running (so its SysTick does
+    /// not underflow), but a credit-armed tick (`systick == 1`) still fires -- this is
+    /// what lets the RoT's endoscope poll advance only at the SP-coupled rate.
+    #[test]
+    fn tick_frozen_gates_own_running_but_allows_credit() {
+        let mut bus = ram_bus();
+        let mut cpu = Cpu::new();
+        cpu.cycles = 1; // non-multiple of 256: skip maybe_tick's periodic CSR/RVR refresh
+        cpu.syst_csr = 0b01; // ENABLE, no TICKINT
+        cpu.syst_rvr = 96_000;
+        cpu.systick = 50;
+        cpu.tick_frozen = true;
+        // Own running: many ticks, but the counter is frozen -> no underflow, no event.
+        for _ in 0..200 {
+            cpu.maybe_tick(&mut bus);
+        }
+        assert_eq!(
+            cpu.systick, 50,
+            "frozen counter does not decrement on own running"
+        );
+        assert_eq!(
+            cpu.tick_events, 0,
+            "no tick fired from own running while frozen"
+        );
+        // A credit arm (systick == 1) fires exactly one tick even while frozen.
+        cpu.systick = 1;
+        cpu.maybe_tick(&mut bus);
+        assert_eq!(cpu.tick_events, 1, "a credit-armed tick fires while frozen");
     }
 
     // Thumb `WFI` = 0xBF30.

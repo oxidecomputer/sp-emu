@@ -277,6 +277,18 @@ config! {
     // retry (UpdateChunkDelivery(ExhaustedNumAttempts)). "0" disables (restores the
     // old idle-throttle timing, e.g. to reproduce the failure).
     sprot_couple: bool = "SP_EMU_SPROT_COUPLE" => |v| v.map(|s| s != "0").unwrap_or(true),
+    // Dual of sprot_couple for the RoT's endoscope measurement: while the SP runs
+    // endoscope (SysTick off, pre-kernel) and the RoT polls the DHCSR halt on its 500ms
+    // kernel-timer budget, freeze the RoT's own SysTick and advance it only by the SP's
+    // elapsed endoscope time (SP cycle delta / SP clock divisor), so the RoT records a
+    // realistic halt time instead of ~0 and does not race past its deadline. "0" restores
+    // the old one-shot sprint.
+    endoscope_couple: bool = "SP_EMU_ENDOSCOPE_COUPLE" => |v| v.map(|s| s != "0").unwrap_or(true),
+    // SP core clock in kHz = instructions per ms, the endoscope-coupling divisor. The
+    // measurement runs pre-kernel, so the SP has not set its SysTick reload; this stands
+    // in for the SP clock. At ~400 MHz a ~133M-instruction endoscope maps to ~330 ms,
+    // under the RoT's 500 ms poll budget. Only affects endoscope coupling.
+    sp_clock_khz: u32 = "SP_EMU_SP_CLOCK_KHZ" => |v| v.and_then(|s| s.parse().ok()).filter(|&k| k > 0).unwrap_or(400_000),
     pumpstats_ms: u64 = "SP_EMU_PUMPSTATS_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(50),
     // trim before parsing, matching the historical read (a padded value parsed)
     ambient_c: f32 = "SP_EMU_AMBIENT_C" => |v| v.and_then(|s| s.trim().parse().ok()).unwrap_or(30.0),

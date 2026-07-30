@@ -23,11 +23,19 @@ use std::net::TcpListener;
 /// RoT can never wedge the SP, which then resumes free-running as it would today.
 const SP_RESET_HALT_ITERS: u32 = 1000;
 
+/// SP burst while it runs endoscope under debug, when endoscope coupling is on: a
+/// bounded chunk so the SP does not finish the hash in one iteration, letting the RoT
+/// interleave and poll while its clock is advanced by the SP's progress.
+const ENDOSCOPE_BURST: u32 = 65_536;
+/// Coupling off: sprint through endoscope in one iteration so the SP halts before the
+/// RoT (whose timer is frozen meanwhile) can time out.
+const ENDOSCOPE_SPRINT: u32 = 20_000_000;
+
 /// Instructions the SP may run this serve-loop iteration, in priority order: a
 /// debug-halted core is not stepped; a self-reset being serviced freezes the SP at
 /// its reset vector so the RoT halts it before it runs reset-vector work; a core
-/// running an injected program under debug (endoscope, after the RoT resumed it)
-/// sprints so it reaches its terminal BKPT within the RoT's halt-poll; a phase-2
+/// running an injected program under debug (endoscope, after the RoT resumed it) runs
+/// `endoscope_burst` (a bounded chunk when coupling, else a one-shot sprint); a phase-2
 /// sprot reply uses a small burst so the SP never clocks past the RoT's refill;
 /// otherwise the full eth-service quantum.
 fn sp_burst_for(
@@ -36,6 +44,7 @@ fn sp_burst_for(
     debug_en: bool,
     replying: bool,
     quantum: u32,
+    endoscope_burst: u32,
 ) -> u32 {
     // Freeze the SP (burst 0) when it is debug-halted (only the RoT may move it) or
     // when a self-reset is being serviced (hold it at the reset vector until the RoT
@@ -43,12 +52,25 @@ fn sp_burst_for(
     if halted || sp_reset_servicing {
         0
     } else if debug_en {
-        20_000_000
+        endoscope_burst
     } else if replying {
         48
     } else {
         quantum
     }
+}
+
+/// Convert an endoscope cycle delta into whole milliseconds of RoT credit, carrying the
+/// sub-millisecond remainder so long runs accumulate exactly. `acc` is the running
+/// fractional accumulator (leftover SP cycles from prior iterations), `d_cycles` the SP
+/// instructions retired since the last iteration, `divisor` the SP clock in instructions
+/// per ms (must be nonzero; callers use `tick_divisor` or the config SP clock, both
+/// positive), and `cap` the per-iteration credit ceiling. Returns the whole-ms credit to
+/// add this iteration and the new accumulator.
+fn endoscope_credit(acc: u64, d_cycles: u64, divisor: u64, cap: u32) -> (u32, u64) {
+    let total = acc + d_cycles;
+    let ms = (total / divisor).min(cap as u64) as u32;
+    (ms, total % divisor)
 }
 
 /// Whether a genuine SP self-reset should enter prompt-halt servicing. Only once the
@@ -289,6 +311,8 @@ pub fn serve(
     // the RoT has accepted, pace the SP's SysTick by the RoT's elapsed 1ms tick
     // events so the SP's sprot timeout doesn't out-run the slow emulated RoT.
     let sprot_couple = crate::config::get().sprot_couple;
+    let endoscope_couple = crate::config::get().endoscope_couple;
+    let sp_clock_khz = crate::config::get().sp_clock_khz; // endoscope divisor (pre-kernel SP clock)
     let coupledbg = crate::config::get().coupledbg;
     eprintln!(
         "[gdb] eth-service: quantum={} txbreak={} sprot_flowctl={} sprot_couple={}",
@@ -373,6 +397,12 @@ pub fn serve(
     let mut prev_rot_ticks = rot.as_ref().map(|(rc, _)| rc.tick_events).unwrap_or(0);
     let mut prev_req_dbg = false; // coupledbg: edge-detect request_in_flight for the trace
     const CREDIT_CAP: u32 = 5000;
+    // Endoscope coupling state: the SP's cycle count last iteration and a
+    // fractional-remainder accumulator, to convert the SP's elapsed endoscope
+    // instructions into RoT-credit ms (SP cycles / SP clock divisor).
+    let mut prev_sp_cycles = cpu.cycles;
+    let mut endoscope_acc: u64 = 0;
+    let mut prev_endo_couple = false; // coupledbg: edge-detect the coupling window
 
     // Prompt-halt servicing: while an armed RoT is halting the SP after a self-reset,
     // freeze the SP (burst 0) and give the RoT the full budget so it halts the SP
@@ -441,18 +471,24 @@ pub fn serve(
         // burst (not just `cpu.step`) also avoids ticking systick / taking
         // interrupts on a halted core.
         //
-        // When the RoT is running an injected program under debug (C_DEBUGEN set,
-        // not halted -- i.e. endoscope after the RoT resumed it), let the SP sprint
-        // in a large burst so it reaches its terminal BKPT within the RoT's 500ms
-        // halt-poll timeout. The RoT's timer only advances while the RoT itself
-        // runs, so the SP finishing the flash measurement here costs little
-        // RoT-time; without it the RoT times out (DidNotHalt) before the SP halts.
+        // When the RoT is running an injected program under debug (C_DEBUGEN set, not
+        // halted -- i.e. endoscope after the RoT resumed it), the SP runs endoscope. With
+        // coupling on, use a bounded chunk so the RoT interleaves; the RoT block below
+        // freezes the RoT's clock and advances it by the SP's endoscope progress, so the
+        // RoT records a realistic halt time. Otherwise sprint in one shot so the SP halts
+        // before the RoT (whose timer is frozen meanwhile) times out (DidNotHalt).
+        let endoscope_burst = if endoscope_couple {
+            ENDOSCOPE_BURST
+        } else {
+            ENDOSCOPE_SPRINT
+        };
         let sp_burst = sp_burst_for(
             cpu.halted,
             sp_reset_halt_pending,
             cpu.debug_en,
             replying,
             quantum,
+            endoscope_burst,
         );
         for _ in 0..sp_burst {
             // Stop the burst the instant the SP halts (e.g. endoscope's terminal
@@ -623,7 +659,9 @@ pub fn serve(
             // Stay full-speed only during an actual exchange (clocking, or a request
             // being processed), not for the RoT's idle housekeeping, so the instance
             // sleeps when quiescent and keeps its scheduling priority.
-            rot_busy = ssa_or_cs || req_in_flight || sp_reset_halt_pending;
+            // Also stay awake while the SP runs endoscope under debug (cpu.debug_en): the
+            // RoT is polling the halt and must be stepped (credit-paced) to see it.
+            rot_busy = ssa_or_cs || req_in_flight || sp_reset_halt_pending || cpu.debug_en;
             // Run the RoT many quanta back-to-back so it finishes a request's
             // handler in one go — IPC to update_server, up to 32 flash reads for a
             // CMPA page, building + CRCing the response — and asserts rot-irq before
@@ -641,6 +679,37 @@ pub fn serve(
             } else {
                 1
             };
+            // Endoscope coupling: while the SP runs endoscope under debug (debug_en, not
+            // halted), freeze the RoT's own SysTick and advance it only by the SP's
+            // elapsed endoscope time -- SP cycle delta / SP clock divisor (pre-kernel, so
+            // tick_divisor is None and we use the config SP clock). With its clock frozen
+            // the RoT's sleep_for poll no longer races on its own execution, so it sleeps
+            // between polls and its poll-timer tracks the SP's progress, recording a
+            // realistic halt time instead of ~0 and not timing out. Applied before the
+            // burst so the RoT drains the credit this iteration.
+            let now_endo = endoscope_couple && cpu.debug_en && !cpu.halted;
+            rc.tick_frozen = now_endo;
+            let d_sp_cyc = cpu.cycles.saturating_sub(prev_sp_cycles);
+            prev_sp_cycles = cpu.cycles;
+            if now_endo {
+                let divisor = cpu.tick_divisor().unwrap_or(sp_clock_khz) as u64;
+                let (ms, new_acc) = endoscope_credit(endoscope_acc, d_sp_cyc, divisor, CREDIT_CAP);
+                endoscope_acc = new_acc;
+                rc.sp_tick_credit = rc.sp_tick_credit.saturating_add(ms).min(CREDIT_CAP);
+                if coupledbg && (ms > 0 || !prev_endo_couple) {
+                    eprintln!(
+                        "[couple] endoscope +{}ms rot_credit={} divisor={} rot_ticks={}",
+                        ms, rc.sp_tick_credit, divisor, rc.tick_events
+                    );
+                }
+            } else {
+                if coupledbg && prev_endo_couple {
+                    eprintln!("[couple] endoscope end: rot_ticks={}", rc.tick_events);
+                }
+                rc.sp_tick_credit = 0;
+                endoscope_acc = 0;
+            }
+            prev_endo_couple = now_endo;
             'rot_burst: for _ in 0..rot_budget {
                 let mut rot_idled = false;
                 for _ in 0..quantum {
@@ -999,17 +1068,46 @@ mod tests {
 
     #[test]
     fn sp_burst_priority_order() {
+        const EB: u32 = ENDOSCOPE_BURST;
         // Halted wins over everything: a halted core is not stepped.
-        assert_eq!(sp_burst_for(true, true, true, true, Q), 0);
+        assert_eq!(sp_burst_for(true, true, true, true, Q, EB), 0);
         // Servicing a self-reset freezes the SP even though it is not halted and not
-        // in a reply, and outranks the endoscope debug sprint.
-        assert_eq!(sp_burst_for(false, true, true, false, Q), 0);
-        // Endoscope: running an injected program under debug sprints to its BKPT.
-        assert_eq!(sp_burst_for(false, false, true, false, Q), 20_000_000);
+        // in a reply, and outranks the endoscope debug run.
+        assert_eq!(sp_burst_for(false, true, true, false, Q, EB), 0);
+        // Endoscope: running an injected program under debug uses the endoscope burst.
+        assert_eq!(sp_burst_for(false, false, true, false, Q, EB), EB);
+        assert_eq!(
+            sp_burst_for(false, false, true, false, Q, ENDOSCOPE_SPRINT),
+            ENDOSCOPE_SPRINT
+        );
         // Phase-2 sprot reply: small burst so the SP never outruns the RoT refill.
-        assert_eq!(sp_burst_for(false, false, false, true, Q), 48);
+        assert_eq!(sp_burst_for(false, false, false, true, Q, EB), 48);
         // Otherwise the full eth-service quantum.
-        assert_eq!(sp_burst_for(false, false, false, false, Q), Q);
+        assert_eq!(sp_burst_for(false, false, false, false, Q, EB), Q);
+    }
+
+    #[test]
+    fn endoscope_credit_carries_the_fractional_remainder() {
+        const CAP: u32 = 5000;
+        // A sub-ms delta yields no whole ms and accumulates the remainder.
+        assert_eq!(endoscope_credit(0, 400, 1000, CAP), (0, 400));
+        // The carried remainder plus a new delta crosses 1 ms, keeping the leftover.
+        assert_eq!(endoscope_credit(400, 900, 1000, CAP), (1, 300));
+        // Several whole ms at once, exact remainder.
+        assert_eq!(endoscope_credit(0, 3200, 1000, CAP), (3, 200));
+        // Accumulating many sub-ms deltas eventually credits the same total as one big
+        // delta: 250 deltas of 400 cycles at 1000/ms == 100_000 cycles == 100 ms.
+        let mut acc = 0u64;
+        let mut total_ms = 0u32;
+        for _ in 0..250 {
+            let (ms, next) = endoscope_credit(acc, 400, 1000, CAP);
+            total_ms += ms;
+            acc = next;
+        }
+        assert_eq!(total_ms, 100, "fractional accumulation loses no time");
+        assert_eq!(acc, 0);
+        // The cap clamps a single-iteration burst; the remainder is still exact.
+        assert_eq!(endoscope_credit(0, 10_000_000, 1000, CAP), (CAP, 0));
     }
 
     #[test]
