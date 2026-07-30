@@ -107,6 +107,10 @@ pub struct Bus {
 const SCB_ICSR: u32 = 0xE000_ED04;
 pub const SCB_VTOR: u32 = 0xE000_ED08;
 const SCB_AIRCR: u32 = 0xE000_ED0C;
+// SysTick registers in the SCS (ARMv7-M B3.3): control/status, reload, current value.
+pub const SYST_CSR: u32 = 0xE000_E010;
+pub const SYST_RVR: u32 = 0xE000_E014;
+pub const SYST_CVR: u32 = 0xE000_E018;
 
 // LPC55 TrustZone address aliases (UM11126 §2.4.1, "Memory map"). The CODE (flash)
 // and SRAM regions are each visible at a non-secure base and a secure alias equal to
@@ -308,6 +312,29 @@ impl Bus {
     pub fn any_pending_irq(&mut self) -> bool {
         self.collect_irqs();
         self.next_irq().is_some() || self.pend_pendsv
+    }
+
+    /// Reset the exception sources, as a system reset (SYSRESETREQ or the external
+    /// reset pin) does on silicon: disable and unpend every NVIC IRQ, drop a pending
+    /// PendSV, and return SysTick (`SYST_CSR`/`RVR`/`CVR`) to its disabled reset
+    /// state. Paired with `Cpu::reset_for_reboot` at every reboot site.
+    ///
+    /// Without it, the enable bits the firmware set before the reset stay live across
+    /// a warm reset and an interrupt (notably the kernel SysTick) fires during early
+    /// boot; with `VTOR` still 0 that exception vectors through the flash table into
+    /// the SP firmware, which breaks the RoT's endoscope measurement: the injected
+    /// image runs before it configures its own vectors, so a stray SysTick leaves the
+    /// endoscope for the SP firmware and the measurement never completes. Firmware
+    /// re-enables what it needs during startup.
+    pub fn reset_exception_sources(&mut self) {
+        self.nvic_en = [0; 8];
+        self.nvic_pend = [0; 8];
+        self.pend_pendsv = false;
+        // SysTick lives in the SCS (refreshed into `Cpu::syst_csr`); clear the
+        // authoritative registers so the periodic refresh does not re-enable it.
+        self.write32(SYST_CSR, 0); // ENABLE | TICKINT | CLKSOURCE
+        self.write32(SYST_RVR, 0); // reload
+        self.write32(SYST_CVR, 0); // current value
     }
 
     // ---- Ethernet MAC/DMA -------------------------------------------------
@@ -1173,6 +1200,35 @@ mod tests {
         assert_eq!(bus.read32(psc), 63);
         bus.write32(TIM5_EGR, 1);
         assert_eq!(bus.read32(TIM5_EGR), 0, "EGR is write-only");
+    }
+
+    /// A system reset clears the exception sources: an NVIC IRQ the firmware enabled
+    /// and pended, and SysTick, are all returned to their reset state so nothing fires
+    /// during the post-reset boot. Without this a stale interrupt (notably the kernel
+    /// SysTick) vectors through the flash table with VTOR still 0 and derails the RoT's
+    /// endoscope measurement after a warm reset.
+    #[test]
+    fn reset_exception_sources_clears_nvic_and_systick() {
+        let mut bus = bus_with_catchall();
+        // The SysTick registers live in the SCS device (absent from a bare test Bus).
+        bus.add_device(0xE000_E000, 0x1000, Box::new(crate::soc::Scs::new()));
+
+        bus.write32(0xE000_E100, 1 << 15); // NVIC ISER: enable IRQ 15
+        bus.pend_irq(15);
+        bus.write32(SYST_CSR, 0b011); // ENABLE | TICKINT
+        bus.write32(SYST_RVR, 479_999);
+        assert!(bus.any_pending_irq(), "IRQ 15 enabled+pending before reset");
+        assert_ne!(bus.read32(SYST_CSR) & 1, 0, "SysTick enabled before reset");
+
+        bus.reset_exception_sources();
+
+        assert!(
+            !bus.any_pending_irq(),
+            "reset drops the enabled+pending IRQ"
+        );
+        assert!(!bus.irq_enabled(15), "reset disables the IRQ");
+        assert_eq!(bus.read32(SYST_CSR) & 0b111, 0, "SYST_CSR cleared on reset");
+        assert_eq!(bus.read32(SYST_RVR), 0, "SYST_RVR cleared on reset");
     }
 
     #[test]

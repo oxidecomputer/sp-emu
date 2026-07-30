@@ -375,6 +375,14 @@ impl Cpu {
         self.v = false;
         self.q = false;
         self.systick = 0;
+        // A system reset returns SysTick to its disabled reset state (SYST_CSR and
+        // SYST_RVR = 0). Without this the enable/TICKINT the firmware set before the
+        // reset survive, so SysTick keeps firing during early boot; with VTOR still 0
+        // that exception vectors through the flash table (see exception_entry) into
+        // the SP firmware, which derails the RoT's endoscope measurement after a warm
+        // reset (the injected image runs before it configures its own SysTick).
+        self.syst_csr = 0;
+        self.syst_rvr = 0;
         self.halted = false;
         // A reset clears any "last halt was a BKPT" state, so a subsequent
         // vector-catch halt reports DFSR.VCATCH rather than a stale DFSR.BKPT.
@@ -1651,8 +1659,8 @@ impl Cpu {
         // a sub-256-instruction lag in noticing a CSR/RVR change is immaterial
         // (the SysTick period is millions of instructions).
         if self.cycles & 0xFF == 0 {
-            self.syst_csr = bus.read32(0xE000_E010);
-            self.syst_rvr = bus.read32(0xE000_E014).max(1);
+            self.syst_csr = bus.read32(crate::mem::SYST_CSR);
+            self.syst_rvr = bus.read32(crate::mem::SYST_RVR).max(1);
         }
         if self.syst_csr & 1 == 0 {
             return;
@@ -2616,6 +2624,9 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.halted = true; // previously debug-halted...
         cpu.bkpt_hit = true; // ...at a BKPT
+        cpu.syst_csr = 0b011; // firmware had SysTick enabled (ENABLE | TICKINT)...
+        cpu.syst_rvr = 479_999; // ...and reloaded, before the reset
+        cpu.systick = 12_345;
         cpu.reset_for_reboot(0x2000_0800, 0x0800_0200);
         assert!(
             !cpu.halted,
@@ -2623,6 +2634,11 @@ mod tests {
         );
         assert!(!cpu.bkpt_hit, "stale BKPT state cleared");
         assert_eq!(cpu.pc, 0x0800_0200, "PC reloaded from the reset vector");
+        // A system reset returns SysTick to its disabled reset state, so a leftover
+        // enable can't fire (and vector through the flash table) during early boot.
+        assert_eq!(cpu.syst_csr, 0, "SysTick disabled on reset");
+        assert_eq!(cpu.syst_rvr, 0, "SysTick reload cleared on reset");
+        assert_eq!(cpu.systick, 0, "SysTick counter cleared on reset");
     }
 
     /// `tick_divisor` reports the core's instructions/ms (SYST_RVR + 1) only when a

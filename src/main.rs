@@ -1016,6 +1016,7 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
             let sp = bus.read32(flash::FLASH_BASE);
             let pc = bus.read32(flash::FLASH_BASE + 4) & !1;
             cpu.reset_for_reboot(sp, pc);
+            bus.reset_exception_sources(); // a system reset clears the NVIC
             cpu.flush_decode_cache();
             // Keep the RFD 568 measurement handoff consistent across the reset:
             // by default sp-emu stands in for the humility debugger and re-deposits

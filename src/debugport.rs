@@ -319,6 +319,7 @@ impl SwDp {
         let sp = bus.read32(VECTOR_TABLE);
         let pc = bus.read32(VECTOR_TABLE + 4) & !1;
         cpu.reset_for_reboot(sp, pc);
+        bus.reset_exception_sources(); // a system reset clears the NVIC
         self.reset_sticky = true;
         self.honor_vector_catch(cpu);
     }

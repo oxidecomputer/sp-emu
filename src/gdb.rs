@@ -597,6 +597,7 @@ pub fn serve(
             let sp = bus.read32(0x0800_0000);
             let pc = bus.read32(0x0800_0004) & !1;
             cpu.reset_for_reboot(sp, pc);
+            bus.reset_exception_sources();
             // On silicon DEMCR.VC_CORERESET catches a reset from any source, a
             // firmware SYSRESETREQ included. If the RoT armed reset-and-halt, the SP
             // halts at its reset vector here (0 instructions); otherwise it falls to
