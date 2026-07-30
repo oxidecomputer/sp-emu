@@ -1,11 +1,18 @@
 # sp-emu loopback testbed for RoT boot-path tests.
 #
-# Boot sp-emu with its bridge on [::1]:33300 so MGS discovery lands there, an
-# in-process RoT (SP_EMU_ROT_FLASH=<rot image>) reachable over sprot, and the SWD
-# debug port on tcp 127.0.0.1:4444 (swd = 4444 + (bridge - 33300)):
+# Boot sp-emu with its bridge on [::1]:33300 so MGS discovery lands there and an
+# in-process RoT (SP_EMU_ROT_FLASH=<rot image>) reachable over sprot:
 #
 #   SP_EMU_BRIDGE='[::1]:33300' SP_EMU_ROT_FLASH=<rot image> \
 #     sp-emu run a 0
+#
+# Everything is offset from the bridge port (off = bridge - 33300), so several
+# instances coexist in one zone. For bridge 33300 (off 0):
+#   MGS/faux-mgs   [::1]:33300 (switch0), :33301 (switch1)   = bridge + 0/+1
+#   ereport        [::1]:44400 (switch0), :44401 (switch1)   = 44400 + off
+#   SP SWD probe   127.0.0.1:4444                            = 4444 + off
+#   RoT SWD probe  127.0.0.1:4544                            = 4544 + off
+# See hwci/README.md for the full combined-setup (probes + Ethernet + IPCC) recipe.
 #
 # `discover` will overwrite the name/board fields below with what it reads.
 
@@ -26,6 +33,10 @@ usb_probe = "20b7:9db1:tcp:127.0.0.1:4444"
 [testbed.rot]
 name = "oxide-rot-1"
 board = "oxide-rot-1"
+# The RoT's own Glasgow SWD debug port (a second listener, distinct from the SP's),
+# so humility can read the RoT (ringbuf/hiffy/tasks) on the same run and
+# testbed:probe:rot tests run instead of skipping. Present in two-core `run` mode.
+usb_probe = "20b7:9db1:tcp:127.0.0.1:4544"
 
 [testbed.stage0]
 name = "oxide-rot-1"

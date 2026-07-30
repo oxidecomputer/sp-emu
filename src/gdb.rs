@@ -321,26 +321,41 @@ pub fn serve(
 
     // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the SWD debug listener
     // entirely — MGS only needs the bridge UDP. Otherwise bind it.
+    // Per-instance SWD ports so every sp-emu in a shared switch zone is debuggable
+    // simultaneously: offset by the bridge port (33300->0, 33310->10, ...). The SP
+    // probe is 4444 + off; the RoT probe (below) is 4544 + off. Pair with the
+    // matching selector.
+    let swd_off: u16 = crate::config::get()
+        .bridge
+        .as_deref()
+        .and_then(|b| b.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .map(|p| p.wrapping_sub(33300))
+        .unwrap_or(0);
     let listeners = if crate::config::get().no_debug {
         eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG) — serving the bridge only");
         None
     } else {
-        // Per-instance port so every sp-emu in a shared switch zone is debuggable
-        // simultaneously: offset the SWD port by the bridge port (33300->0,
-        // 33310->10, ...), so swd = 4444 + off. Pair with the matching selector.
-        let off: u16 = crate::config::get()
-            .bridge
-            .as_deref()
-            .and_then(|b| b.rsplit(':').next())
-            .and_then(|p| p.parse::<u16>().ok())
-            .map(|p| p.wrapping_sub(33300))
-            .unwrap_or(0);
-        let swd_port = 4444u16.wrapping_add(off);
+        let swd_port = 4444u16.wrapping_add(swd_off);
         let swd_l = TcpListener::bind(("127.0.0.1", swd_port))?;
         swd_l.set_nonblocking(true)?;
         eprintln!("[gdb] ready (swd :{swd_port}). attach with:");
-        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (Glasgow SWD debug port: halt/run/hiffy; stock humility)");
+        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (SP Glasgow SWD debug port: halt/run/hiffy; stock humility)");
         Some(swd_l)
+    };
+    // Second Glasgow SWD probe bound to the in-process RoT core, so humility can
+    // attach to the RoT (ringbuf/hiffy/tasks/halt) on the SAME run as the SP probe.
+    // The RoT probe is the RoT's own debug port; attaching halts the RoT (there is
+    // no SP-side JTAG_DETECT analog to assert). Only when an in-process RoT exists.
+    let rot_listener = if crate::config::get().no_debug || rot.is_none() {
+        None
+    } else {
+        let rot_swd_port = 4544u16.wrapping_add(swd_off);
+        let l = TcpListener::bind(("127.0.0.1", rot_swd_port))?;
+        l.set_nonblocking(true)?;
+        eprintln!("[gdb] ready (rot swd :{rot_swd_port}). attach with:");
+        eprintln!("[gdb]   humility -a <rot-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{rot_swd_port} <cmd>   (RoT Glasgow SWD debug port)");
+        Some(l)
     };
 
     // Pump-cadence diagnostics (SP_EMU_PUMPSTATS): distinguishes the SP being
@@ -440,6 +455,28 @@ pub fn serve(
                     }
                     if let Err(e) = r {
                         eprintln!("[gdb] SWD connection ended: {e}");
+                    }
+                    continue;
+                }
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e.into()),
+                Err(_) => {}
+            }
+        }
+        if let Some(rot_swd_l) = &rot_listener {
+            match rot_swd_l.accept() {
+                Ok((stream, peer)) => {
+                    eprintln!("[gdb] RoT SWD (Glasgow applet) client {peer}");
+                    // The RoT's own debug port: halt it, serve humility (ringbuf/hiffy/
+                    // tasks/readmem), then resume. No JTAG_DETECT here -- that models an
+                    // SP probe seen by the RoT; this is the RoT debugging itself.
+                    if let Some((rc, rb)) = rot.as_mut() {
+                        let r = crate::glasgow::serve(stream, rc, rb, host);
+                        rc.halted = false;
+                        rc.debug_en = false;
+                        rc.bkpt_hit = false;
+                        if let Err(e) = r {
+                            eprintln!("[gdb] RoT SWD connection ended: {e}");
+                        }
                     }
                     continue;
                 }

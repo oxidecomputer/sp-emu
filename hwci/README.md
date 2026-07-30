@@ -38,11 +38,14 @@ SP_EMU_FLASH=./sp-flash.bin ./target/release/sp-emu flash a <gimlet SP archive>
 
 # 3. Run it forever: SP on slot A, RoT reachable over sprot, MGS on [::1]:33300.
 #    `run <slot> 0` is the serve-forever mode; it wires the in-process RoT when
-#    SP_EMU_ROT_FLASH is set and exposes the Glasgow SWD probe (:4444).
+#    SP_EMU_ROT_FLASH is set and exposes a Glasgow SWD probe for BOTH cores:
+#    the SP on :4444 and the RoT on :4544. Add SP_EMU_HOST_PTY=1 for the IPCC /
+#    host-console channel (a pty for faux-ipcc). See "Ports and interfaces" below.
 SP_EMU_FLASH=./sp-flash.bin \
 SP_EMU_BRIDGE='[::1]:33300' \
 SP_EMU_ROT_FLASH=<oxide-rot-1 self-signed archive.zip> \
 SP_EMU_ROT_ROM=1 \
+SP_EMU_HOST_PTY=1 \
   ./target/release/sp-emu run a 0 &
 #  wait for: [sp-emu] online   (takes ~30s)
 
@@ -77,6 +80,41 @@ over the SP -> sprot -> RoT relay. For genuine bootleby A/B selection (rather th
 the fabricated boot-state handoff), also set `SP_EMU_ROT_BOOTLEBY` plus
 `SP_EMU_ROT_CMPA`/`SP_EMU_ROT_CFPA` (see the sp-emu README): bootleby now runs in
 the two-core serve mode and reports the actual selected slot over MGS.
+
+## Ports and interfaces (combined SP + RoT setup)
+
+A single `run <slot> 0` instance exposes all of the interfaces below at once, so
+one instance covers the MGS, humility-probe, and IPCC surfaces a test may need.
+Everything is offset from the bridge port so several instances coexist in a zone:
+`off = <bridge port> - 33300`. The table is for `SP_EMU_BRIDGE='[::1]:33300'`
+(`off = 0`); startup logs the actual values (`[bridge] ...`, `[gdb] ready ...`,
+`[bridge] host-uart ... pty ready`).
+
+| Interface | Address (off 0) | Formula | Notes |
+|---|---|---|---|
+| MGS / faux-mgs (switch0) | `[::1]:33300` | `bridge + 0` | `faux-mgs --sp-sim-addr` target; discovery_addr in the testbed |
+| MGS / faux-mgs (switch1) | `[::1]:33301` | `bridge + 1` | second switch view |
+| ereport (switch0 / switch1) | `[::1]:44400` / `:44401` | `44400 + off` | `faux-mgs ereports` |
+| SP SWD probe | `127.0.0.1:4444` | `4444 + off` | `humility -a <sp.zip> -p 20b7:9db1:tcp:127.0.0.1:4444` |
+| RoT SWD probe | `127.0.0.1:4544` | `4544 + off` | `humility -a <rot.zip> -p 20b7:9db1:tcp:127.0.0.1:4544` |
+| IPCC / host console (UART7) | pty or unix socket | n/a | see below |
+
+Notes for planning a run that uses everything:
+
+- **Both debug probes are live on the same run.** The SP probe drives the SP debug
+  port; attaching to it asserts SP_TO_ROT_JTAG_DETECT_L, so the RoT invalidates its
+  attestation log (as on hardware). The RoT probe is the RoT's own debug port;
+  attaching halts the RoT with no such side effect. In the testbed these give
+  `testbed:probe:sp` and `testbed:probe:rot`; a humility session on either freezes
+  the whole instance for its duration, so don't hold one open while faux-mgs runs.
+- **Ethernet.** MGS and ereport are UDP on loopback. faux-mgs on loopback needs
+  `--sp-sim-addr <MGS addr>` (the `--interface`/`--discovery-addr` form fails with
+  "no interface name found for index 0"); the sp-test shim rewrites that for you.
+- **IPCC / host console.** The host-sp-comms link (UART7) is off by default. Set
+  `SP_EMU_HOST_PTY=1` to expose it as a pty for serial tools
+  (`faux-ipcc --port <pty> ...`; the pty path is logged at startup), or
+  `SP_EMU_HOST_UART=<unix socket>` for a voxel/propolis IPCC COM port. This is the
+  channel `faux-ipcc get-certs` and the host console use.
 
 ## Status and roadmap
 
