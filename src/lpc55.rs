@@ -8,14 +8,10 @@ use crate::mem::Bus;
 /// LPC55 boot ROM + stage0/bootleby and loads the hubris image directly here.
 pub const IMAGE_A_BASE: u32 = crate::rot_flash::IMAGE_A_BASE;
 
-// Flash regions from chips/lpc55/memory.toml, used to synthesize caboose reads
-// for the slots sp-emu doesn't populate (see `synthetic_stage0` / `byte_at`).
-const IMAGE_B_BASE: u32 = 0x0005_0000; // hubris slot B
-const IMAGE_B_END: u32 = 0x0009_0000;
-const STAGE0_BASE: u32 = 0x0000_0000; // bootleby (slot 0)
-const STAGE0_END: u32 = 0x0000_2000;
-const STAGE0NEXT_BASE: u32 = 0x0000_2000; // stage0 update staging (slot 1)
-const STAGE0NEXT_END: u32 = 0x0000_4000;
+// Bootloader regions from chips/lpc55/memory.toml, seeded with a synthetic
+// caboose image when no real bootleby is loaded (see `synthetic_stage0`).
+pub const STAGE0_BASE: u32 = 0x0000_0000; // bootleby (slot 0)
+pub const STAGE0NEXT_BASE: u32 = 0x0000_2000; // stage0 update staging (slot 1)
 
 // sys/abi ImageHeader + caboose magics, matched by lpc55-update-server's
 // `caboose_slice`: it reads the ImageHeader at region+0x130, then locates the
@@ -31,7 +27,7 @@ const HEADER_OFFSET: usize = 0x130;
 /// pegging the emulated RoT. The keys are placeholders (read-only inventory
 /// doesn't validate them). Serving it for both stage0 and stage0next mirrors a
 /// device whose bootloader banks hold the same image.
-fn synthetic_stage0() -> Vec<u8> {
+pub fn synthetic_stage0() -> Vec<u8> {
     let mut tlvc = Vec::new();
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"BORD", b"oxide-rot-1"));
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"NAME", b"bootleby"));

@@ -274,6 +274,13 @@ impl RotFlash {
         // NMPA: a placeholder programmed page so a read does not fault; the real
         // device UUID lives here. CFPA scratch is left erased.
         self.write_pages(NMPA, &[0u8; PAGE]);
+        // stage0 / stage0next: a synthetic bootleby image carrying just a caboose.
+        // Without it every MGS `component/stage0/caboose` read returns NoCaboose and
+        // the control plane's inventory retries it every poll. A real bootleby
+        // (SP_EMU_ROT_BOOTLEBY) is loaded at 0x0 later and overwrites slot 0.
+        let stage0 = crate::lpc55::synthetic_stage0();
+        self.write_pages(crate::lpc55::STAGE0_BASE as usize, &stage0);
+        self.write_pages(crate::lpc55::STAGE0NEXT_BASE as usize, &stage0);
         Ok(())
     }
 
