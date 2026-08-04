@@ -186,6 +186,14 @@ a 0` and is humility-attachable (`humility -a archives/<component>.zip ...`) wit
 the original archives. `pack` captures the `SP_EMU_*` knobs present in its own
 environment, so pack with the same environment you run with.
 
+## Running a testbed (SP + RoT + bootleby, SWD, IPCC)
+
+`demo/run-testbed.sh` brings up the two-core instance with the MGS bridge, a SWD
+probe per core over TCP, and the IPCC pty, and prints every endpoint. See
+[demo/README.md](demo/README.md) for the walkthrough, the faux-mgs
+considerations (loopback needs `--sp-sim-addr`), and where persistent state
+lives.
+
 ## Environment variables
 
 The ones you reach for most:
@@ -232,6 +240,10 @@ The ones you reach for most:
 - `SP_EMU_IDENTITY`: path to the per-instance identity file (defaults to
   `sp-emu-identity` under `SP_EMU_STATE_DIR`). Give each instance in a fleet its own,
   like `SP_EMU_FLASH`.
+- `SP_EMU_VPD_SERIAL` / `SP_EMU_VPD_PART` / `SP_EMU_VPD_REV`: VPD/FRUID barcode the
+  SP reports as serial / model / revision. The defaults are Oxide-style and read as
+  real hardware in inventory; override them so an emulated SP is not mistaken for a
+  shipped one. Serial and part are capped at 11 characters by the barcode format.
 - `SP_EMU_SEED`: same as the `--seed` flag below.
 
 There are also `SP_EMU_*DBG` switches (`SP_EMU_SPROTDBG`, `SP_EMU_ETHDBG`,
@@ -240,10 +252,13 @@ that turn on per-subsystem tracing. `SP_EMU_FLASHDBG` traces the FLASH controlle
 erase, program, and the option-byte bank swap; `SP_EMU_ROMDBG` traces boot-ROM
 API calls (each `skboot_authenticate` and its verdict).
 
-`SP_EMU_ROT_BOOTLEBY=<image>` loads the real bootleby bootloader at the flash base
-and boots it for genuine A/B (and panic) image selection, with `SP_EMU_ROT_CMPA` /
-`SP_EMU_ROT_CFPA` supplying the real device protected-flash pages its validation
-requires and `SP_EMU_ROT_ROM=1` enabling the boot-ROM `skboot_authenticate` shim.
+sp-emu boots the RoT through real bootleby by default, for genuine A/B (and
+panic) image selection and to honor the CFPA's persistent boot preference: it
+looks for `bootleby-oxide-rot-1.zip` next to the RoT archive, then under
+`$HUBRIS`. `SP_EMU_ROT_BOOTLEBY=<image>` names one explicitly and
+`SP_EMU_ROT_NO_BOOTLEBY=1` opts out. `SP_EMU_ROT_CMPA` / `SP_EMU_ROT_CFPA` /
+`SP_EMU_ROT_NMPA` replace the seeded protected-flash pages, and
+`SP_EMU_ROT_ROM=1` enables the boot-ROM `skboot_authenticate` shim.
 bootleby verifies each slot's signature against the CMPA, selects and jumps, and the
 real `lpc55-rot-startup` then rebuilds the boot-state handoff, so `rot-boot-info`
 over MGS reports the actual active slot and real sha3-256 digests. Use self-signed
