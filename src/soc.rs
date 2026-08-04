@@ -1434,6 +1434,30 @@ impl Mmio for Rng {
     }
 }
 
+/// Force a VPD/FRUID barcode field to the printable 7-bit ASCII the 0XV2 format
+/// stores, and bound its length. Drop any byte outside `0x20..=0x7E` and the
+/// `:` field delimiter, then truncate to `max` bytes (one byte per character
+/// now that the field is ASCII). Warn on either change: a non-ASCII byte, a
+/// stray `:`, or a silent truncation yields a barcode that parses wrong rather
+/// than one that obviously fails.
+fn vpd_ascii_field(what: &str, value: &str, max: usize) -> String {
+    let mut clean: String = value
+        .chars()
+        .filter(|&c| (' '..='~').contains(&c) && c != ':')
+        .collect();
+    if clean.chars().count() != value.chars().count() {
+        eprintln!(
+            "[vpd] {what} {value:?} has characters outside printable 7-bit ASCII \
+             (or a ':'); using {clean:?}"
+        );
+    }
+    if clean.len() > max {
+        eprintln!("[vpd] {what} {clean:?} exceeds {max} bytes; truncating");
+        clean.truncate(max); // clean is ASCII, so max is a char boundary
+    }
+    clean
+}
+
 fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     let mut img = vec![0xFFu8; 1024];
     let sidecar = crate::config::get().board.is_sidecar();
@@ -1458,13 +1482,47 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     mac0.extend_from_slice(&[0x0e, 0x1d, 0xb7, 0xfe, 0x45, mac_last]); // base_mac
     mac0.extend_from_slice(&128u16.to_le_bytes()); // count
     mac0.push(1); // stride
-                  // BARC: 0XV2 barcode "version:part(<=11):rev:serial(<=11)".
-    let serial = if sidecar {
-        "BRM42220001".to_string()
-    } else {
-        format!("BRM4422000{}", idx)
-    };
-    let barc = format!("0XV2:913-0000019:002:{}", serial);
+
+    // BARC: 0XV2 barcode "version:part:rev:serial". The defaults are Oxide-style,
+    // which reads as real hardware in inventory; SP_EMU_VPD_SERIAL / _PART / _REV
+    // override them so an emulated SP can be told apart from a shipped one. Each
+    // field is forced to printable 7-bit ASCII and bounded to the format's 11
+    // bytes (see vpd_ascii_field), since a non-ASCII byte or a stray ':' would
+    // otherwise produce a barcode nothing can parse.
+    let cfg = crate::config::get();
+    let serial = cfg.vpd_serial.clone().unwrap_or_else(|| {
+        if sidecar {
+            "BRM42220001".to_string()
+        } else {
+            format!("BRM4422000{}", idx)
+        }
+    });
+    // The part number must name the board actually modeled. gimlet-c is
+    // 913-0000019 (omicron `GIMLET_SLED_MODEL`). sp-emu models sidecar-c (the
+    // board-rev straps below encode 0b010), but no sidecar part number is
+    // recorded in the sources sp-emu can see, so rather than report a gimlet
+    // part number for a sidecar, say so and use an obvious placeholder until
+    // SP_EMU_VPD_PART supplies the real one.
+    let part = cfg.vpd_part.clone().unwrap_or_else(|| {
+        if sidecar {
+            eprintln!(
+                "[vpd] no sidecar part number known; reporting a placeholder. \
+                 Set SP_EMU_VPD_PART to the real one."
+            );
+            "SIDECAR-C".to_string()
+        } else {
+            "913-0000019".to_string()
+        }
+    });
+    // Board revision: both modeled boards are rev C.
+    let rev = cfg.vpd_rev.clone().unwrap_or_else(|| "002".to_string());
+    let serial = vpd_ascii_field("serial", &serial, 11);
+    let part = vpd_ascii_field("part", &part, 11);
+    let rev = vpd_ascii_field("rev", &rev, 11);
+    if crate::dbg::vpd() {
+        eprintln!("[vpd] BARC part={part} rev={rev} serial={serial}");
+    }
+    let barc = format!("0XV2:{part}:{rev}:{serial}");
     let mut fru0 = tlvc_chunk(b"MAC0", &mac0);
     fru0.extend_from_slice(&tlvc_chunk(b"BARC", barc.as_bytes()));
     let root = tlvc_chunk(b"FRU0", &fru0);
@@ -2026,5 +2084,31 @@ impl Mmio for Scs {
             0xD88 => eprintln!("[scs] CPACR = {:#010x} (FPU enable)", val),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vpd_field_forces_printable_ascii_and_bounds_length() {
+        // Clean ASCII within the bound passes through unchanged.
+        assert_eq!(vpd_ascii_field("serial", "BRM44220001", 11), "BRM44220001");
+        // Over-length truncates to the byte bound (bytes == chars once ASCII).
+        assert_eq!(
+            vpd_ascii_field("serial", "BRM4422000123", 11),
+            "BRM44220001"
+        );
+        // Non-ASCII characters are dropped, not counted as their several UTF-8
+        // bytes: an en-dash between the digits leaves the ASCII remainder.
+        assert_eq!(
+            vpd_ascii_field("part", "913\u{2013}0000019", 11),
+            "9130000019"
+        );
+        // The ':' field delimiter is not allowed inside a field.
+        assert_eq!(vpd_ascii_field("rev", "0:0:2", 11), "002");
+        // Control characters go too.
+        assert_eq!(vpd_ascii_field("serial", "AB\nCD", 11), "ABCD");
     }
 }

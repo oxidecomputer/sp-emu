@@ -57,6 +57,14 @@ const TAG_DICE_CDI: &[u8] = b"sp-emu/lpc55-dice-cdi";
 const TAG_PUF_UDS: &[u8] = b"sp-emu/lpc55-puf-uds";
 const TAG_MAC: &[u8] = b"sp-emu/vpd-mac-base";
 
+// RFC 4122 version and variant fields (section 4.1.1/4.1.3), used to shape the
+// derived RoT UUID as the version 3 UUID the factory programs: byte 6's high
+// nibble is the version, byte 8's top two bits are the variant.
+const UUID_VERSION_MASK: u8 = 0x0f; // clears byte 6's version nibble
+const UUID_VERSION_3: u8 = 0x30; // name-based (v3)
+const UUID_VARIANT_MASK: u8 = 0x3f; // clears byte 8's variant bits
+const UUID_VARIANT_RFC4122: u8 = 0x80;
+
 /// The reserved seed source that reproduces the previous fixed constants.
 const LEGACY_SOURCE: &str = "legacy";
 
@@ -133,6 +141,14 @@ impl Identity {
         };
         derive(&master, TAG_SP_UID, &mut id.sp_uid);
         derive(&master, TAG_ROT_UUID, &mut id.rot_uuid);
+        // Shape the derived bytes as an RFC 4122 version 3 (name-based) UUID,
+        // the class NXP programs at the factory: a real oxide-rot-1 reads back
+        // e.g. aece12b7-31d8-305c-8bab-5ebc24ac98f0. The derivation is sp-emu's
+        // own (seed-based, not NXP's namespace), but anything that parses the
+        // version and variant sees a UUID of the same class rather than 16
+        // bytes that decode as no valid version at all.
+        id.rot_uuid[6] = (id.rot_uuid[6] & UUID_VERSION_MASK) | UUID_VERSION_3;
+        id.rot_uuid[8] = (id.rot_uuid[8] & UUID_VARIANT_MASK) | UUID_VARIANT_RFC4122;
         derive(&master, TAG_DICE_CDI, &mut id.dice_cdi);
         derive(&master, TAG_PUF_UDS, &mut id.puf_uds);
         derive(&master, TAG_MAC, &mut id.mac);
@@ -345,6 +361,17 @@ mod tests {
         assert_ne!(&id.dice_cdi[..], &id.puf_uds[..]);
         assert_ne!(&id.rot_uuid[..], &id.sp_uid[..]);
         assert!(id.dice_cdi.iter().any(|&b| b != 0));
+    }
+
+    /// The RoT UUID must parse as the same class of UUID the factory programs
+    /// (RFC 4122 version 3), not as arbitrary bytes.
+    #[test]
+    fn rot_uuid_is_rfc4122_v3() {
+        for seed in ["a", "b", "0123456789abcdef"] {
+            let id = id(seed);
+            assert_eq!(id.rot_uuid[6] >> 4, 3, "version nibble");
+            assert_eq!(id.rot_uuid[8] >> 6, 0b10, "RFC 4122 variant");
+        }
     }
 
     #[test]

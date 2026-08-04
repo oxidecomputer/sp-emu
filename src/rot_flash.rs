@@ -50,6 +50,38 @@ const CFPA_PING: usize = 0x9_E000;
 const CFPA_PONG: usize = 0x9_E200;
 const CMPA: usize = 0x9_E400;
 const NMPA: usize = 0x9_EC00;
+/// NMPA spans ten 512-byte pages, 0x9_EC00..0x9_FFFF. Only pages 0, 1, 8 and 9
+/// are programmed on a real part; the rest read as erased (and so fault).
+const NMPA_PAGES: usize = 10;
+/// 128-bit device UUID, at 0x9_FC70 per UM11126 (NMPA page 8 + 0x70).
+const NMPA_UUID: usize = 0x9_FC70;
+
+// Protected-flash pages captured from a real oxide-rot-1 (LPC55S69), with the
+// device UUID zeroed and the lot/wafer trace codes replaced: the UUID is filled
+// in per instance from `identity::rot_uuid()`, and nothing reads the trace codes.
+// Pages 0 and 1 are boot-ROM patch code; 8 and 9 are the manufacturing data.
+const NMPA_P0: &[u8] = include_bytes!("../data/lpc55-pfr/nmpa-0.bin");
+const NMPA_P1: &[u8] = include_bytes!("../data/lpc55-pfr/nmpa-1.bin");
+const NMPA_P8: &[u8] = include_bytes!("../data/lpc55-pfr/nmpa-8.bin");
+const NMPA_P9: &[u8] = include_bytes!("../data/lpc55-pfr/nmpa-9.bin");
+// include_bytes! takes whatever length the file happens to be, and write_pages
+// would silently lay down a short or long region. A re-capture at the wrong size
+// should fail the build, not corrupt the protected flash.
+const _: () = assert!(NMPA_P0.len() == PAGE);
+const _: () = assert!(NMPA_P1.len() == PAGE);
+const _: () = assert!(NMPA_P8.len() == PAGE);
+const _: () = assert!(NMPA_P9.len() == PAGE);
+// The bundled page 8 must ship with its UUID field zeroed: the runtime value is
+// written over it, and a re-capture that skipped the scrub would otherwise
+// publish a real device's UUID.
+const _: () = {
+    let uuid_off = NMPA_UUID - (NMPA + 8 * PAGE);
+    let mut i = 0;
+    while i < 16 {
+        assert!(NMPA_P8[uuid_off + i] == 0, "bundled NMPA page 8 has a UUID");
+        i += 1;
+    }
+};
 
 // Command-engine register offsets (from base 0x4003_4000).
 const REG_CMD: u32 = 0x00;
@@ -270,10 +302,34 @@ impl RotFlash {
         let pref_b = cfg.rot_boot_pref.as_deref() == Some("b");
         let cfpa = load_page_override(&cfg.rot_cfpa)?.unwrap_or_else(|| seed_cfpa(pref_b));
         self.write_pages(CFPA_PING, &cfpa);
-        self.write_pages(CFPA_PONG, &cfpa);
-        // NMPA: a placeholder programmed page so a read does not fault; the real
-        // device UUID lives here. CFPA scratch is left erased.
-        self.write_pages(NMPA, &[0u8; PAGE]);
+        // Pong zeroed, not a copy: on a factory-fresh part the versions tie and
+        // bootleby's read_cfpa takes the first page, so ping is unambiguously
+        // active. A copy would make "which page won" untestable.
+        self.write_pages(CFPA_PONG, &[0u8; PAGE]);
+        // NMPA at its real addresses: pages 0/1 (ROM patch code) and 8/9
+        // (manufacturing data) are programmed, the rest stay erased exactly as on
+        // a real part, where reading them faults. SP_EMU_ROT_NMPA replaces the
+        // whole region with a captured one.
+        if let Some(path) = cfg.rot_nmpa.as_deref() {
+            let blob = crate::flash::load_image(path)?;
+            let n = blob.len().min(NMPA_PAGES * PAGE);
+            eprintln!("[rotflash] NMPA from {path} ({n} bytes)");
+            self.write_pages(NMPA, &blob[..n]);
+        } else {
+            for (i, page) in [(0, NMPA_P0), (1, NMPA_P1), (8, NMPA_P8), (9, NMPA_P9)] {
+                self.write_pages(NMPA + i * PAGE, page);
+            }
+        }
+        // The per-instance device UUID, so two emulated RoTs are distinguishable
+        // where real parts are. Only for the bundled pages, whose UUID field is
+        // zeroed: a caller who supplies a capture is reproducing a specific part,
+        // and silently substituting its UUID would defeat the point.
+        if cfg.rot_nmpa.is_none() {
+            let uuid = crate::identity::rot_uuid();
+            self.mem[NMPA_UUID..NMPA_UUID + uuid.len()].copy_from_slice(&uuid);
+            self.set_erased(NMPA_UUID / PAGE, false);
+        }
+        // CFPA scratch is left erased.
         // stage0 / stage0next: a synthetic bootleby image carrying just a caboose.
         // Without it every MGS `component/stage0/caboose` read returns NoCaboose and
         // the control plane's inventory retries it every poll. A real bootleby
@@ -610,6 +666,35 @@ mod tests {
     fn cleanup(f: &RotFlash) {
         let _ = std::fs::remove_file(&f.path);
         let _ = std::fs::remove_file(bitset_path(&f.path));
+    }
+
+    /// NMPA is seeded at the addresses a real part uses: the programmed pages
+    /// carry their captured content, the gap between them stays erased (where a
+    /// read faults), and the device UUID lands at the UM11126 address.
+    #[test]
+    fn nmpa_seeded_at_real_addresses_with_a_device_uuid() {
+        let f = fresh();
+        assert_eq!(&f.mem[NMPA..NMPA + PAGE], NMPA_P0, "page 0 (ROM patch)");
+        assert_eq!(
+            &f.mem[NMPA + PAGE..NMPA + 2 * PAGE],
+            NMPA_P1,
+            "page 1 (ROM patch)"
+        );
+        // Pages 2..7 are unprogrammed on the sampled part; a read of those faults.
+        for page in 2..8 {
+            let off = NMPA + page * PAGE;
+            assert!(f.is_erased(off / PAGE), "NMPA page {page} must stay erased");
+        }
+        assert_eq!(
+            f.mem[NMPA_UUID..NMPA_UUID + 16],
+            crate::identity::rot_uuid(),
+            "device UUID at 0x9_FC70 (UM11126)"
+        );
+        assert!(
+            !f.is_erased(NMPA_UUID / PAGE),
+            "UUID page reads as programmed"
+        );
+        cleanup(&f);
     }
 
     /// Drive the update-server page-write sequence and verify erase, NOR

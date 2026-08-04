@@ -188,6 +188,14 @@ config! {
     configdbg: bool = "SP_EMU_CONFIGDBG" => |v| v.is_some(),
 
     // ---- optional selectors / overrides (None when unset) ----
+    // VPD/FRUID identity in the emulated AT24CSW080 (the BARC barcode chunk MGS
+    // reports as serial/model/revision). Defaults synthesize an Oxide-style
+    // serial; override them so an emulated SP is not mistaken for real hardware
+    // in inventory. Serial and part are capped at 11 characters by the 0XV2
+    // barcode format.
+    vpd_serial: Option<String> = "SP_EMU_VPD_SERIAL" => |v| v.filter(|s| !s.is_empty()),
+    vpd_part: Option<String> = "SP_EMU_VPD_PART" => |v| v.filter(|s| !s.is_empty()),
+    vpd_rev: Option<String> = "SP_EMU_VPD_REV" => |v| v.filter(|s| !s.is_empty()),
     host_uart: Option<String> = "SP_EMU_HOST_UART" => |v| v,
     // addr; empty treated as unset
     rot_service: Option<String> = "SP_EMU_ROT_SERVICE" => |v| v.filter(|s| !s.is_empty()),
@@ -199,6 +207,12 @@ config! {
     // ones, so real bootleby's PFR validation passes.
     rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
     rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
+    // A captured NMPA region (up to ten 512-byte pages) laid down at 0x9_EC00,
+    // replacing the bundled one. Its own device UUID is kept, unlike the bundled
+    // pages, whose zeroed UUID field is filled in per instance.
+    rot_nmpa: Option<String> = "SP_EMU_ROT_NMPA" => |v| v,
+    // Opt out of booting through real bootleby (see config::rot_bootleby_path).
+    rot_no_bootleby: bool = "SP_EMU_ROT_NO_BOOTLEBY" => |v| v.is_some(),
     // A slot-B image (flash.b, 0x50000) to seed alongside slot A, so real bootleby
     // can perform genuine A/B selection. Absent => slot B left erased/invalid.
     rot_image_b: Option<String> = "SP_EMU_ROT_IMAGE_B" => |v| v,
@@ -462,6 +476,59 @@ pub fn state_dir() -> String {
         Some(b) => format!("{b}/sp-emu"),
         None => format!("{}/sp-emu", std::env::temp_dir().display()),
     }
+}
+
+/// The bootleby image to boot the RoT through, or None to jump straight to the
+/// Hubris image.
+///
+/// Real bootleby is the default: it is what performs A/B slot selection and
+/// honors the CFPA's persistent boot preference, so without it those behaviors
+/// are not modeled at all. sp-emu does not ship the image (it is a signed binary
+/// that lives in the hubris tree), so find it next to the RoT archive or in a
+/// hubris checkout. `$SP_EMU_ROT_BOOTLEBY` names one explicitly;
+/// `$SP_EMU_ROT_NO_BOOTLEBY` opts out.
+pub fn rot_bootleby_path() -> &'static Option<String> {
+    static RESOLVED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(resolve_rot_bootleby)
+}
+
+/// The search behind `rot_bootleby_path`, run once. Callers must agree on the
+/// answer even if the filesystem changes mid-run, and the "not found" warning is
+/// worth printing once rather than once per caller.
+fn resolve_rot_bootleby() -> Option<String> {
+    let cfg = get();
+    if cfg.rot_no_bootleby {
+        return None;
+    }
+    if let Some(p) = cfg.rot_bootleby.clone() {
+        return Some(p);
+    }
+    const NAME: &str = "bootleby-oxide-rot-1.zip";
+    let mut candidates: Vec<String> = Vec::new();
+    // Alongside the RoT archive: a curated image directory holds the matching set.
+    if let Some(dir) = cfg
+        .rot_flash
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).parent())
+        .and_then(|d| d.to_str())
+    {
+        candidates.push(format!("{dir}/{NAME}"));
+    }
+    // A hubris checkout, where bootleby is checked in.
+    if let Ok(h) = std::env::var("HUBRIS") {
+        candidates.push(format!("{h}/app/oxide-rot-1/{NAME}"));
+    }
+    let found = candidates
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+    if found.is_none() {
+        eprintln!(
+            "[rot] no {NAME} found next to the RoT archive or under $HUBRIS; \
+             booting the image directly (no bootleby A/B selection). Set \
+             SP_EMU_ROT_BOOTLEBY, or SP_EMU_ROT_NO_BOOTLEBY=1 to silence this."
+        );
+    }
+    found
 }
 
 /// Whether `state_dir()` is the built-in default (no explicit `$SP_EMU_STATE_DIR`).

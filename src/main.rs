@@ -603,8 +603,7 @@ fn record_rot_archives(slot_a: &str) {
             .rot_image_b
             .as_deref()
             .and_then(|b| stow(b, "rot-b", "RoT slot B")),
-        stage0_archive: cfg
-            .rot_bootleby
+        stage0_archive: config::rot_bootleby_path()
             .as_deref()
             .and_then(|s| stow(s, "stage0", "RoT stage0/bootleby")),
     };
@@ -653,7 +652,7 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // via the boot-ROM skboot_authenticate shim. It links at the TrustZone secure
     // aliases (flash 0x1000_0000, SRAM 0x3000_0000), so fold those onto the modeled
     // non-secure memory, and turn on the boot-ROM API it calls.
-    if let Some(path) = config::get().rot_bootleby.clone() {
+    if let Some(path) = config::rot_bootleby_path().clone() {
         let bl = flash::load_image(&path)?;
         bus.load_rot_bootleby(&bl);
         bus.secure_alias = true;
