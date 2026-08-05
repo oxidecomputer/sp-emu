@@ -245,6 +245,12 @@ fn extract_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` short-circuits before any config or identity work, so it prints
+    // one clean line and exits. Format matches sp-test's for easy parsing.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print_version();
+        return Ok(());
+    }
     // Ingest all configuration once (env, an optional --load-config file, and the
     // --seed flag). After this, subsystems read config::get(), never the environment.
     // These flags are pulled out of `args` before subcommand dispatch so they may
@@ -328,6 +334,7 @@ fn main() -> Result<()> {
             );
             eprintln!();
             eprintln!("global flags (any position):");
+            eprintln!("  -V, --version                    print version, git revision, and build profile");
             eprintln!("  --seed <hex|string>              per-instance identity seed (or $SP_EMU_SEED)");
             eprintln!("  --load-config <path>             read a TOML config file as the base layer");
             eprintln!("  --dump-config <path>             write the effective configuration to a TOML file");
@@ -341,6 +348,23 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Print `sp-emu version=X git=Y build=Z`, matching sp-test's parseable format.
+/// The git revision (short hash, `-dirty` when the tree is modified) comes from
+/// the build script; the profile is debug vs release.
+fn print_version() {
+    println!(
+        "{} version={} git={} build={}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("SP_EMU_GIT_HASH"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    );
 }
 
 fn slot_arg(s: &str) -> Result<char> {
