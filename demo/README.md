@@ -120,20 +120,20 @@ debug-open `DCFG_CC_SOCU`, unsealed), and its CFPA is a factory-fresh version 0.
 sp-emu needs a Hubris SP archive, a self-signed `oxide-rot-1` archive, and
 bootleby. All three are published by the hubris release process, not built here:
 
-- **SP images** — the `all-sp-v*` GitHub release of the hubris repo, published
+- **SP images**: the `all-sp-v*` GitHub release of the hubris repo, published
   per board by its Release workflow as `dist-<runner>-hubris-<board>` artifacts,
   each holding `build-<board>-image-default.zip` (`dev` / `lab` / plain variants).
-- **RoT Hubris images** — a separate `oxide-rot-1-v*` release on its own cadence,
+- **RoT Hubris images**: a separate `oxide-rot-1-v*` release on its own cadence,
   as release assets: `build-oxide-rot-1-selfsigned-image-{a,b}.zip` (use the
   self-signed one) and the production-signed `build-oxide-rot-1-image-{a,b}.zip`.
-- **bootleby** — checked into the hubris tree at
+- **bootleby**: checked into the hubris tree at
   `app/oxide-rot-1/bootleby-oxide-rot-1.zip`, so a hubris checkout already has
   it (`app/{lpc55xpresso,rot-carrier}/` hold the other boards' builds).
-- **Non-release boards** (grapefruit, gimletlet, nucleo) — built by the CI
+- **Non-release boards** (grapefruit, gimletlet, nucleo): built by the CI
   workflow as `dist-ubuntu-latest-<board>`; the release commit has no CI run, so
   take the run at the release's merge-base on master.
 
-Any Hubris build archive works — a local `hubris` `cargo xtask dist` tree is fine
+Any Hubris build archive works. A local `hubris` `cargo xtask dist` tree is fine
 for development. The releases matter when you want a known, reproducible set.
 
 sp-test automates fetching all of the above with
@@ -153,7 +153,7 @@ encodes GitHub artifact naming that changes, and a second copy would drift.
   ereport, ...) so tools need no port arithmetic. Only one instance can hold them
   at a time; run a fleet with the default offset mode (`SP_EMU_BRIDGE`) instead.
 - **Attaching a SWD probe asserts JTAG_DETECT**, which invalidates the RoT's
-  attestation log — the same thing a real probe does on real hardware. sp-emu
+  attestation log, the same thing a real probe does on real hardware. sp-emu
   asserts it on probe *connect*, not on SWD traffic, so a passively attached,
   idle probe still counts as connected.
 
@@ -178,7 +178,7 @@ distinct one. `SP_EMU_VPDDBG=1` prints the barcode the SP is built with.
 The default part number follows the board being modeled: gimlet-c is
 `913-0000019`. sp-emu's sidecar model is sidecar-c, but no sidecar part number is
 recorded in the sources sp-emu can see, so it reports a placeholder and says so
-on startup — set `SP_EMU_VPD_PART` to the real one when you know it.
+on startup. Set `SP_EMU_VPD_PART` to the real one when you know it.
 
 ### Boot time is host-dependent
 
@@ -194,7 +194,7 @@ Everything durable lives under `$STATE_DIR` (`SP_EMU_STATE_DIR`): the SP flash
 image and its `.nv` sidecar, the RoT flash image plus its `.erased` page bitset,
 the derived per-instance identity, and stowed Hubris archives. A persisted RoT
 flash takes precedence over the image on the command line, so protected-flash
-overrides (CMPA/CFPA) apply only when the flash is seeded fresh — `FRESH=1`
+overrides (CMPA/CFPA) apply only when the flash is seeded fresh. `FRESH=1`
 (or `SP_EMU_ROT_FRESH`) reseeds, and `rm -rf "$STATE_DIR"` is a factory reset.
 
 This matters beyond convenience: CFPA carries the boot preference and the key

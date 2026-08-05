@@ -122,7 +122,7 @@ fi
 # the SP unreachable. Say so here instead of letting every faux-mgs call hang.
 if grep -qE 'skip SP port 11111.*Address already in use|well-known-port mode: 0 socket' "$log"; then
     kill "$pid" 2>/dev/null || true
-    die "no MGS socket bound on 11111 — another instance probably holds it (check 'pgrep -a sp-emu')"
+    die "no MGS socket bound on 11111; another instance probably holds it (check 'pgrep -a sp-emu')"
 fi
 
 cat <<EOF
@@ -142,5 +142,5 @@ reply. Its gateway-messages revision must also match the SP image's, or
 discovery fails with a version mismatch.
 
 Attaching a SWD probe asserts JTAG_DETECT on the RoT, which invalidates the
-attestation log — expected, and true of a real probe on real hardware.
+attestation log. That is expected, and true of a real probe on real hardware.
 EOF
