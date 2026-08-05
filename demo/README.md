@@ -202,6 +202,12 @@ revocation state, so anything exercising RoT key rotation or invalidation
 depends on those files surviving across sessions, and on knowing when they are
 being reseeded instead.
 
+The baseline is deliberate. A freshly seeded instance starts at CFPA version 0,
+the factory-fresh state, not at the high counter a field part carries. A restart
+keeps whatever value the firmware has advanced it to. So a rollback or
+revocation test starts from a known floor, and only `FRESH=1` or removing
+`$STATE_DIR` returns it there.
+
 ## Notes and caveats
 
 - This is the actual production gimlet firmware image, unmodified, not a

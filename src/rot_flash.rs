@@ -17,8 +17,13 @@
 //!     the RoT FWID, taken over the blank-check-programmed pages, is correct.
 //!   * The protected flash region assembled from named field templates (real
 //!     captured values): CMPA (kept verbatim, including the Bart keyset RKTH),
-//!     CFPA ping/pong (a fresh device: version 0, boot preference Slot A, with the
-//!     self-hash recomputed from the fields), and an NMPA page.
+//!     CFPA ping (a fresh device: version 0, boot preference Slot A, with the
+//!     self-hash recomputed from the fields) over a zeroed pong, so ping wins the
+//!     version tie, and the captured NMPA pages at their real addresses.
+//!
+//!     Version 0 is the freshly seeded baseline; a restart loads the persisted
+//!     flash and keeps the advanced counter. See demo/README.md for how that
+//!     baseline supports rollback and key-revocation testing.
 //!   * The active CFPA's persistent boot-preference bit. This is only one input
 //!     bootleby uses; running the real bootleby (signature checks on both slots,
 //!     the transient RAM boot preference, scratch-CFPA promotion) is future work.
