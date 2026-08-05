@@ -1,0 +1,49 @@
+# sp-emu instance configuration (example).
+#
+# Load it with:   sp-emu --load-config sp-emu.toml
+# Capture one from a working run with:   sp-emu --dump-config out.toml
+#
+# A config file REPLACES the SP_EMU_* environment (the two are never mixed), so a
+# saved file reproduces a run regardless of the shell. A subcommand or positional
+# argument on the command line still wins over the file.
+#
+# Keys mirror the SP_EMU_* environment variables. Values may be TOML strings,
+# integers, or booleans: a boolean flag is on when true, and deleting its line (or
+# setting it false) leaves it off. Omitted keys take their built-in default.
+
+# ---- what to run (so no subcommand or positional arguments are needed) ----
+SP_EMU_MODE    = "run"   # serve forever: the mode sp-test / faux-mgs / humility use
+SP_EMU_SLOT    = "a"     # boot bank; omit to honor the persisted swap bank
+SP_EMU_RUN_MAX = 0       # 0 = serve forever; nonzero = bounded instruction batch
+
+# ---- board and persistent state ----
+SP_EMU_BOARD = "gimlet"   # or "sidecar"
+# Each instance needs its OWN state directory. The flash images, .nv companions,
+# identity, and stowed archives all live here, and files under it (SP_EMU_FLASH
+# and the rest) default to this directory, so setting it is enough. To run
+# several instances at once on one host, give each a distinct path.
+SP_EMU_STATE_DIR = "/tmp/sp-emu/instance-0"
+# Flash the SP image once before the first run:
+#   sp-emu --load-config sp-emu.toml   # then: sp-emu flash a <gimlet SP archive>
+
+# ---- MGS bridge (faux-mgs / sp-test); the other ports derive from this one ----
+# Also per-instance: the bridge port, and everything offset from it (ereport, both
+# SWD probes), must differ between concurrent instances. Step the port by 10 per
+# instance to keep the derived ports from overlapping: 33300, 33310, 33320.
+SP_EMU_BRIDGE = "[::1]:33300"
+
+# ---- in-process RoT (LPC55S69) over sprot ----
+SP_EMU_ROT_FLASH = "/path/to/build-oxide-rot-1-selfsigned-image-a.zip"
+SP_EMU_ROT_ROM   = true   # boot-ROM skboot_authenticate shim (required in serve mode)
+# Real bootleby is booted by default when found beside the RoT archive or under
+# $HUBRIS; name one explicitly, or opt out:
+# SP_EMU_ROT_BOOTLEBY    = "/path/to/bootleby-oxide-rot-1.zip"
+# SP_EMU_ROT_NO_BOOTLEBY = true
+
+# ---- IPCC / host console ----
+SP_EMU_HOST_PTY = true    # expose the host-SP UART as a pty for faux-ipcc
+
+# ---- per-instance identity and VPD (give each instance in a fleet its own) ----
+# SP_EMU_SEED       = "0123456789abcdef"  # derives UID / UUID / DICE / PUF / MAC
+# SP_EMU_VPD_SERIAL = "EMU00000001"       # so an emulated SP is not mistaken for real hardware
+# SP_EMU_VPD_PART   = "EMULATED-SP"

@@ -277,10 +277,23 @@ startup; nothing consults the environment after that.
   keyed by the variable names) and ignore the environment, so a saved run reproduces
   exactly regardless of your shell. Flags still override.
 - `--dump-config <path>`: write the effective configuration as TOML, so a run can be
-  captured and replayed with `--load-config`.
+  captured and replayed with `--load-config`. Values may be TOML strings, integers,
+  or booleans (a flag is on when `true`, off when `false` or omitted).
 - `SP_EMU_CONFIGDBG`: print the full resolved configuration to stderr. It is an
   environment variable, so it has no effect under `--load-config`; use
   `--dump-config` (a flag) to inspect a loaded configuration.
+
+A config file can also name the operation, so one file describes a whole instance
+and `sp-emu --load-config sp-emu.toml` runs it with no subcommand or positional
+arguments (a command line still wins):
+
+- `SP_EMU_MODE`: the subcommand when the command line names none (`run` or `gdb`).
+- `SP_EMU_SLOT`: the boot bank (`a`/`b`) for `run`/`gdb`.
+- `SP_EMU_RUN_MAX`: the `run` instruction budget (0 serves forever).
+
+See [`sp-emu.example.toml`](sp-emu.example.toml) for a documented starting point and
+[doc/sp-emu-config-file.md](doc/sp-emu-config-file.md) for the design and the planned
+move to a structured schema.
 
 ## Instance identity (`--seed`)
 

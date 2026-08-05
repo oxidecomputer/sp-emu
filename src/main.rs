@@ -259,35 +259,51 @@ fn main() -> Result<()> {
     // (identity::init persists the seed there), and announce it for the commands that
     // use instance state.
     let _ = std::fs::create_dir_all(config::state_dir());
+    // The subcommand: from the command line, or (when none is given) from the config
+    // file / environment via SP_EMU_MODE, so `sp-emu --load-config sp-emu.toml` runs a
+    // fully-described instance with no positional arguments. A command line always wins.
+    // Only the serve modes make sense from a config file, so reject anything else there
+    // rather than falling through to usage and exiting as if an instance had started.
+    let cmd: Option<&str> = match args.first() {
+        Some(c) => Some(c.as_str()),
+        None => match config::get().mode.as_deref() {
+            None => None,
+            Some(m @ ("run" | "gdb")) => Some(m),
+            Some(other) => bail!(
+                "SP_EMU_MODE = {other:?} is not a runnable mode (expected \"run\" or \"gdb\")"
+            ),
+        },
+    };
+    let sub_args: &[String] = args.get(1..).unwrap_or(&[]);
     if matches!(
-        args.first().map(|s| s.as_str()),
+        cmd,
         Some("flash" | "erase" | "info" | "run" | "gdb" | "rot" | "rot-serve" | "pack")
     ) {
         announce_state_dir();
     }
     identity::init(config::get().seed.as_deref())?;
-    match args.first().map(|s| s.as_str()) {
-        Some("flash") => cmd_flash(&args[1..]),
-        Some("erase") => cmd_erase(&args[1..]),
+    match cmd {
+        Some("flash") => cmd_flash(sub_args),
+        Some("erase") => cmd_erase(sub_args),
         Some("info") => cmd_info(),
-        Some("run") => cmd_run(&args[1..]),
-        Some("gdb") => cmd_gdb(&args[1..]),
-        Some("rot") => cmd_rot(&args[1..]),
-        Some("rot-serve") => cmd_rot_serve(&args[1..]),
-        Some("pack") => cmd_pack(&args[1..]),
-        Some("unpack") => cmd_unpack(&args[1..]),
+        Some("run") => cmd_run(sub_args),
+        Some("gdb") => cmd_gdb(sub_args),
+        Some("rot") => cmd_rot(sub_args),
+        Some("rot-serve") => cmd_rot_serve(sub_args),
+        Some("pack") => cmd_pack(sub_args),
+        Some("unpack") => cmd_unpack(sub_args),
         Some("i2c-sniff") => {
-            let addr = args.get(1).map(|s| s.as_str()).unwrap_or("[::1]:9100");
+            let addr = sub_args.first().map(|s| s.as_str()).unwrap_or("[::1]:9100");
             i2c_bridge::serve(addr)
         }
         Some("i2c-device") => {
-            let addr = args.get(1).map(|s| s.as_str()).unwrap_or("[::1]:9100");
-            i2c_bridge::serve_device(addr, args.get(2..).unwrap_or(&[]))
+            let addr = sub_args.first().map(|s| s.as_str()).unwrap_or("[::1]:9100");
+            i2c_bridge::serve_device(addr, sub_args.get(1..).unwrap_or(&[]))
         }
         // Legacy: `sp-emu <image.bin> [max]` boots a flat image without a slot.
         Some(p) if std::path::Path::new(p).exists() => {
-            let max = args
-                .get(1)
+            let max = sub_args
+                .first()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5_000_000);
             let image = std::fs::read(p).with_context(|| format!("read {p}"))?;
@@ -315,6 +331,13 @@ fn main() -> Result<()> {
             eprintln!("  --seed <hex|string>              per-instance identity seed (or $SP_EMU_SEED)");
             eprintln!("  --load-config <path>             read a TOML config file as the base layer");
             eprintln!("  --dump-config <path>             write the effective configuration to a TOML file");
+            eprintln!();
+            eprintln!(
+                "A config file may set SP_EMU_MODE / SP_EMU_SLOT / SP_EMU_RUN_MAX, so"
+            );
+            eprintln!(
+                "`sp-emu --load-config sp-emu.toml` runs a fully-described instance."
+            );
             Ok(())
         }
     }
@@ -445,12 +468,28 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let mut slot = 'a';
     let mut slot_given = false;
     let mut max = 5_000_000u64;
+    let mut max_given = false;
     for a in args {
         if let Ok(c) = slot_arg(a) {
             slot = c;
             slot_given = true;
         } else if let Ok(n) = a.parse::<u64>() {
             max = n;
+            max_given = true;
+        }
+    }
+    // Fall back to the config file / environment for anything not on the command line,
+    // so a run can be described entirely by sp-emu.toml (SP_EMU_SLOT / SP_EMU_RUN_MAX).
+    let cfg = config::get();
+    if !slot_given {
+        if let Some(s) = cfg.boot_slot.as_deref() {
+            slot = slot_arg(s)?;
+            slot_given = true;
+        }
+    }
+    if !max_given {
+        if let Some(m) = cfg.run_max {
+            max = m;
         }
     }
     if max == 0 {
@@ -496,6 +535,13 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
             slot_given = true;
         } else if let Ok(n) = a.parse::<u64>() {
             preboot = n;
+        }
+    }
+    // Fall back to SP_EMU_SLOT (config file / environment) when no a|b positional given.
+    if !slot_given {
+        if let Some(s) = config::get().boot_slot.as_deref() {
+            slot = slot_arg(s)?;
+            slot_given = true;
         }
     }
     serve_forever(slot, slot_given, preboot)

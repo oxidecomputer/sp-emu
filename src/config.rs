@@ -134,6 +134,21 @@ config! {
     // ---- instance identity (the --seed flag wins over $SP_EMU_SEED) ----
     seed: Option<String> = "SP_EMU_SEED" => |v| seed_override.clone().or(v),
 
+    // ---- operation: what to run when no subcommand / positional is on the CLI ----
+    // These let one config file describe a whole instance, so `sp-emu --load-config
+    // sp-emu.toml` runs it with no subcommand or positional arguments. A subcommand
+    // or positional given on the command line still wins over them.
+    //
+    // `mode` is the subcommand to run when the command line names none: "run" (the
+    // serve-forever mode sp-test uses) or its "gdb" alias. Unset prints usage, as before.
+    mode: Option<String> = "SP_EMU_MODE" => |v| v.filter(|s| !s.is_empty()),
+    // Boot slot for `run`/`gdb` when no a|b positional is given; unset honors the
+    // persisted swap bank.
+    boot_slot: Option<String> = "SP_EMU_SLOT" => |v| v.filter(|s| !s.is_empty()),
+    // Instruction budget for `run` when no numeric positional is given: 0 serves
+    // forever (the instance mode), nonzero is a bounded batch. Unset uses the default.
+    run_max: Option<u64> = "SP_EMU_RUN_MAX" => |v| v.and_then(|s| s.parse().ok()),
+
     // ---- SoC selection: `sidecar` iff exactly "sidecar", else gimlet (lenient) ----
     board: Board = "SP_EMU_BOARD" => |v| {
         if v.as_deref() == Some("sidecar") { Board::Sidecar } else { Board::Gimlet }
@@ -607,6 +622,33 @@ mod tests {
         // absent flag falls back to the environment.
         let c = from_map(&[("SP_EMU_SEED", "from-env")], None);
         assert_eq!(c.seed.as_deref(), Some("from-env"));
+    }
+
+    /// The operation knobs let a config file describe a whole instance: unset by
+    /// default (so the command line drives), and parsed when present.
+    #[test]
+    fn operation_knobs_resolve() {
+        let c = from_map(&[], None);
+        assert_eq!(c.mode, None);
+        assert_eq!(c.boot_slot, None);
+        assert_eq!(c.run_max, None);
+
+        let c = from_map(
+            &[
+                ("SP_EMU_MODE", "run"),
+                ("SP_EMU_SLOT", "b"),
+                ("SP_EMU_RUN_MAX", "0"),
+            ],
+            None,
+        );
+        assert_eq!(c.mode.as_deref(), Some("run"));
+        assert_eq!(c.boot_slot.as_deref(), Some("b"));
+        assert_eq!(c.run_max, Some(0));
+
+        // Empty strings are treated as unset; a non-numeric budget is ignored.
+        let c = from_map(&[("SP_EMU_MODE", ""), ("SP_EMU_RUN_MAX", "forever")], None);
+        assert_eq!(c.mode, None);
+        assert_eq!(c.run_max, None);
     }
 
     #[test]
