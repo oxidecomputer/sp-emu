@@ -1,419 +1,74 @@
-//! Central configuration: ingest every `SP_EMU_*` input (the environment, layered
-//! over a config file) exactly once, resolve it, persist it, and store it. After
-//! `init`, no other module reads the environment; they call `config::get()`.
+//! Central configuration: ingest every `SP_EMU_*` input (the environment, or a
+//! config file) exactly once, resolve it into a validated [`Config`], and store
+//! it. After `init`, no other module reads the environment; they call
+//! `config::get()`.
 //!
-//! This is the ingestion half of the design: a single
-//! CLI wrapper sources and vets config; the rest of the program consumes a typed,
-//! immutable `Config`.
-//!
-//! Every knob is declared once in the `config!` table below -- its field, type,
-//! environment variable, default, and parser all live on a single line. The macro
-//! generates the struct, the resolver, and the renderer from that one list, so they
-//! can't drift. Adding a knob is one row; reading it is `config::get().<field>`. A
-//! guard test (`env_reads_confined_to_config_module`) enforces that no other module
-//! reads the environment directly.
+//! This module is the emulator-side adapter over the `sp-emu-config` crate, which
+//! owns the config format. The crate turns the raw inputs into the validated,
+//! method-accessed `Config` (parse, don't validate). This module keeps what is
+//! inherently the emulator's: the process-wide resolved config, the `SP_EMU_*`
+//! environment glue that feeds the crate, the ambient reads (`state_dir`,
+//! `rot_bootleby_path`) that a library must not do, and the flat
+//! `SP_EMU_NAME = "value"` dump the bundle format still consumes.
 //!
 //! Sources and precedence: flag > (config file | environment) > default. The
 //! environment and a config file are two *alternative* sources, never stacked:
 //! `--load-config <path>` reads all `SP_EMU_*` settings from a flat
 //! `SP_EMU_NAME = "value"` TOML table and ignores the environment, so a saved
 //! configuration reproduces exactly; without it, the environment is read as usual.
-//! `--dump-config <path>` writes the effective configuration back for re-loading, so a
-//! run round-trips. See the `TODO` on `to_toml` for the eventual strongly-typed schema.
+//! `--dump-config <path>` writes the effective (only-set) configuration back for
+//! re-loading. The full resolved table is echoed to stderr only under
+//! `$SP_EMU_CONFIGDBG`.
 //!
-//! Backward compatibility: this is a mechanical move of the existing reads. Every
-//! variable keeps its name, default, and *leniency* -- a value (or typo) that
-//! silently worked before still resolves the same way, so no existing environment
-//! or flag usage changes.
+//! Backward compatibility: every `SP_EMU_*` variable keeps its name, default, and
+//! leniency. The env/file path stays lenient (a typo or malformed value coerces to
+//! a default, as before); the strict validation the crate applies is reserved for
+//! the typed config file.
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use std::sync::OnceLock;
 
-/// Which board the emulated SoC models.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Board {
-    Gimlet,
-    Sidecar,
-}
-
-impl Board {
-    pub fn is_sidecar(self) -> bool {
-        self == Board::Sidecar
-    }
-}
-
-/// Emit a read-only getter for one config knob. Config is read only through
-/// these accessors (never raw fields), so the resolved value cannot be mutated
-/// into an invalid state after `init`. The return type follows the field type:
-/// `String` lends a `&str`, `Option<String>` an `Option<&str>`, and everything
-/// else (all `Copy`: bools, numbers, `Board`, `Option<Copy>`) returns by value.
-/// The kind marker in the `config!` row selects the borrowing forms; unmarked
-/// rows take the `Copy` default.
-///
-/// A non-`Copy` knob (`String`, `Option<String>`) needs a `[str]`/`[ostr]`
-/// marker on its row. Without one it takes the `Copy`-default arm, which fails
-/// to compile with `cannot move out of ... behind a shared reference`: the fix
-/// is to mark the row, not to change the getter.
-macro_rules! config_getter {
-    ([str] $doc:expr, $field:ident : $ty:ty) => {
-        #[doc = $doc]
-        pub fn $field(&self) -> &str {
-            &self.$field
-        }
-    };
-    ([ostr] $doc:expr, $field:ident : $ty:ty) => {
-        #[doc = $doc]
-        pub fn $field(&self) -> Option<&str> {
-            self.$field.as_deref()
-        }
-    };
-    ($doc:expr, $field:ident : $ty:ty) => {
-        #[doc = $doc]
-        pub fn $field(&self) -> $ty {
-            self.$field
-        }
-    };
-}
-
-/// Declare the whole configuration as one table. Each row is
-///
-/// ```text
-/// field: Type = "SP_EMU_VAR" => |raw| <expr resolving `raw: Option<String>` to Type>,
-/// ```
-///
-/// `raw` is the resolved input value (`None` when the variable is set in neither the
-/// environment nor the config file). The seed row may also read `seed_override` (the
-/// `--seed` CLI flag), which is in scope in the resolver. From this list the macro
-/// generates the `Config` struct, `resolve` (the single reader, parameterized over a
-/// `get` closure so tests can inject a source), and `render` (one line per knob with
-/// a set/default marker). A function would need the field list repeated in each of
-/// those three places; the macro keeps it in exactly one.
-macro_rules! config {
-    (
-        seed = $seed:ident,
-        $(
-            $([$kind:ident])? $field:ident : $ty:ty = $env:literal => |$raw:ident| $resolve:expr
-        ),* $(,)?
-    ) => {
-        /// The resolved, vetted configuration for this process. Read-only after
-        /// `init`; every field is resolved before any subsystem is built. Fields are
-        /// private and read only through the per-knob getters (see `config_getter!`),
-        /// so config is never accessed as raw data outside this module.
-        #[derive(Clone, Debug)]
-        pub struct Config {
-            $( $field: $ty, )*
-            /// The raw `(SP_EMU_NAME, value)` inputs that were explicitly present
-            /// (from the environment or a config file), in declaration order. Drives
-            /// the `set`/`default` marker and the round-trippable config file.
-            inputs: Vec<(&'static str, String)>,
-        }
-
-        impl Config {
-            /// The single input reader, parameterized over `get` so production reads
-            /// the environment layered over a config file, while tests inject a map
-            /// (hermetic). `get` returns the raw string for a variable, or `None`.
-            fn resolve(
-                get: &dyn Fn(&str) -> Option<String>,
-                $seed: Option<String>,
-            ) -> Config {
-                let _ = &$seed; // read by the seed row; silence if that row is removed
-                let mut inputs: Vec<(&'static str, String)> = Vec::new();
-                $(
-                    let $field: $ty = {
-                        let $raw: Option<String> = get($env);
-                        if let Some(ref val) = $raw {
-                            inputs.push(($env, val.clone()));
-                        }
-                        $resolve
-                    };
-                )*
-                Config { $( $field, )* inputs }
-            }
-
-            /// Every `SP_EMU_*` variable the table resolves, in declaration order. Used
-            /// by the backward-compatibility test to assert no historical knob is dropped.
-            #[cfg(test)]
-            const ENV_VARS: &'static [&'static str] = &[$( $env, )*];
-
-            /// Render every resolved knob (one `NAME = value (set|default)` line) for
-            /// the opt-in stderr dump, so the full resolved state is visible on request.
-            fn render(&self) -> String {
-                let mut out = String::new();
-                $(
-                    out.push_str(&format!(
-                        "{:<24} = {:?} ({})\n",
-                        $env,
-                        self.$field,
-                        if self.is_set($env) { "set" } else { "default" },
-                    ));
-                )*
-                out
-            }
-
-            // A read-only getter per knob (see `config_getter!`). Config is read
-            // only through these, never as raw fields.
-            $(
-                config_getter!(
-                    $([$kind])? concat!(
-                        "Resolved `", $env, "`. See the `config!` row for the knob's semantics."
-                    ),
-                    $field: $ty
-                );
-            )*
-        }
-    };
-}
-
-config! {
-    seed = seed_override,
-
-    // ---- state file paths (written to the working directory by default) ----
-    [str] flash_path: String = "SP_EMU_FLASH" => |v| v.unwrap_or_else(|| "sp-flash.bin".to_string()),
-    [str] rot_nvm_path: String = "SP_EMU_ROT_NVM" => |v| v.unwrap_or_else(|| "sp-rot-flash.bin".to_string()),
-    [str] identity_path: String = "SP_EMU_IDENTITY" => |v| v.unwrap_or_else(|| "sp-emu-identity".to_string()),
-    // Directory for this instance's persistent state (flash images, .nv companions,
-    // identity, stowed archives) when SP_EMU_FLASH/ROT_NVM/IDENTITY are not given
-    // explicitly. Unset means a per-user default under XDG_STATE_HOME or
-    // ~/.local/state, so a bare run does not write into the working directory.
-    [ostr] state_dir: Option<String> = "SP_EMU_STATE_DIR" => |v| v,
-
-    // ---- instance identity (the --seed flag wins over $SP_EMU_SEED) ----
-    [ostr] seed: Option<String> = "SP_EMU_SEED" => |v| seed_override.clone().or(v),
-
-    // ---- operation: what to run when no subcommand / positional is on the CLI ----
-    // These let one config file describe a whole instance, so `sp-emu --load-config
-    // sp-emu.toml` runs it with no subcommand or positional arguments. A subcommand
-    // or positional given on the command line still wins over them.
-    //
-    // `mode` is the subcommand to run when the command line names none: "run" (the
-    // serve-forever mode sp-test uses) or its "gdb" alias. Unset prints usage, as before.
-    [ostr] mode: Option<String> = "SP_EMU_MODE" => |v| v.filter(|s| !s.is_empty()),
-    // Boot slot for `run`/`gdb` when no a|b positional is given; unset honors the
-    // persisted swap bank.
-    [ostr] boot_slot: Option<String> = "SP_EMU_SLOT" => |v| v.filter(|s| !s.is_empty()),
-    // Instruction budget for `run` when no numeric positional is given: 0 serves
-    // forever (the instance mode), nonzero is a bounded batch. Unset uses the default.
-    run_max: Option<u64> = "SP_EMU_RUN_MAX" => |v| v.and_then(|s| s.parse().ok()),
-
-    // ---- SoC selection: `sidecar` iff exactly "sidecar", else gimlet (lenient) ----
-    board: Board = "SP_EMU_BOARD" => |v| {
-        if v.as_deref() == Some("sidecar") { Board::Sidecar } else { Board::Gimlet }
-    },
-
-    // ---- behavior toggles (presence = on) ----
-    // Emulate the LPC55 boot-ROM signature API (skboot_authenticate) so the RoT
-    // pre-kernel's authenticate_image() runs for real. Off by default: keeps the
-    // fast direct-boot path unchanged.
-    rot_rom: bool = "SP_EMU_ROT_ROM" => |v| v.is_some(),
-    // Ignore any persisted RoT flash and re-seed from scratch this run (removes doubt
-    // about whether persistent state is in use). Default off = backward compatible.
-    rot_fresh: bool = "SP_EMU_ROT_FRESH" => |v| v.is_some(),
-    rot_measure: bool = "SP_EMU_ROT_MEASURE" => |v| v.is_some(),
-    well_known_ports: bool = "SP_EMU_WELL_KNOWN_PORTS" => |v| v.is_some(),
-    no_debug: bool = "SP_EMU_NO_DEBUG" => |v| v.is_some(),
-    no_archive_warn: bool = "SP_EMU_NO_ARCHIVE_WARN" => |v| v.is_some(), // silence the "no Hubris archive" warning
-    host_pty: bool = "SP_EMU_HOST_PTY" => |v| v.is_some(),
-    swd_trigger: bool = "SP_EMU_SWD_TRIGGER" => |v| v.is_some(),
-    // Fire one synthetic JTAG_DETECT edge after boot so the RoT invalidates its
-    // attestation log without a real SWD probe attaching (the SWD_TRIGGER analog).
-    jtag_trigger: bool = "SP_EMU_JTAG_TRIGGER" => |v| v.is_some(),
-    trace: bool = "SP_EMU_TRACE" => |v| v.is_some(),
-
-    // ---- per-subsystem diagnostic tracing (presence = on) ----
-    flashdbg: bool = "SP_EMU_FLASHDBG" => |v| v.is_some(),
-    rotflashdbg: bool = "SP_EMU_ROTFLASHDBG" => |v| v.is_some(),
-    ethdbg: bool = "SP_EMU_ETHDBG" => |v| v.is_some(),
-    uartdbg: bool = "SP_EMU_UARTDBG" => |v| v.is_some(),
-    bridgedbg: bool = "SP_EMU_BRIDGEDBG" => |v| v.is_some(),
-    pufdbg: bool = "SP_EMU_PUFDBG" => |v| v.is_some(),
-    vscdbg: bool = "SP_EMU_VSCDBG" => |v| v.is_some(),
-    swd_trace: bool = "SP_EMU_SWD_TRACE" => |v| v.is_some(),
-    rotsvc: bool = "SP_EMU_ROTSVC" => |v| v.is_some(),
-    pingtest: bool = "SP_EMU_PINGTEST" => |v| v.is_some(),
-    rxstats: bool = "SP_EMU_RXSTATS" => |v| v.is_some(),
-    rttstats: bool = "SP_EMU_RTTSTATS" => |v| v.is_some(),
-    pumpstats: bool = "SP_EMU_PUMPSTATS" => |v| v.is_some(),
-    pcprof: bool = "SP_EMU_PCPROF" => |v| v.is_some(),
-    // hot-path debug flags (exposed as thin accessors in dbg.rs)
-    rxdbg: bool = "SP_EMU_RXDBG" => |v| v.is_some(),
-    mdiodbg: bool = "SP_EMU_MDIODBG" => |v| v.is_some(),
-    vpddbg: bool = "SP_EMU_VPDDBG" => |v| v.is_some(),
-    spidbg: bool = "SP_EMU_SPIDBG" => |v| v.is_some(),
-    panicdbg: bool = "SP_EMU_PANICDBG" => |v| v.is_some(),
-    svcdbg: bool = "SP_EMU_SVCDBG" => |v| v.is_some(),
-    excdbg: bool = "SP_EMU_EXCDBG" => |v| v.is_some(),
-    sprotdbg: bool = "SP_EMU_SPROTDBG" => |v| v.is_some(),
-    coupledbg: bool = "SP_EMU_COUPLEDBG" => |v| v.is_some(), // sprot SysTick-coupling credit trace
-    romdbg: bool = "SP_EMU_ROMDBG" => |v| v.is_some(), // boot-ROM API calls (skboot)
-    // print the full resolved config table to stderr
-    configdbg: bool = "SP_EMU_CONFIGDBG" => |v| v.is_some(),
-
-    // ---- optional selectors / overrides (None when unset) ----
-    // VPD/FRUID identity in the emulated AT24CSW080 (the BARC barcode chunk MGS
-    // reports as serial/model/revision). Defaults synthesize an Oxide-style
-    // serial; override them so an emulated SP is not mistaken for real hardware
-    // in inventory. Serial and part are capped at 11 characters by the 0XV2
-    // barcode format.
-    [ostr] vpd_serial: Option<String> = "SP_EMU_VPD_SERIAL" => |v| v.filter(|s| !s.is_empty()),
-    [ostr] vpd_part: Option<String> = "SP_EMU_VPD_PART" => |v| v.filter(|s| !s.is_empty()),
-    [ostr] vpd_rev: Option<String> = "SP_EMU_VPD_REV" => |v| v.filter(|s| !s.is_empty()),
-    [ostr] host_uart: Option<String> = "SP_EMU_HOST_UART" => |v| v,
-    // addr; empty treated as unset
-    [ostr] rot_service: Option<String> = "SP_EMU_ROT_SERVICE" => |v| v.filter(|s| !s.is_empty()),
-    [ostr] rot_flash: Option<String> = "SP_EMU_ROT_FLASH" => |v| v,
-    // Path to a real bootleby image: load it at flash base 0x0 and boot IT (secure
-    // aliases + boot-ROM API on), so bootleby does genuine A/B selection.
-    [ostr] rot_bootleby: Option<String> = "SP_EMU_ROT_BOOTLEBY" => |v| v,
-    // Real device CMPA/CFPA pages (512 bytes each) to seed instead of the synthesized
-    // ones, so real bootleby's PFR validation passes.
-    [ostr] rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
-    [ostr] rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
-    // A captured NMPA region (up to ten 512-byte pages) laid down at 0x9_EC00,
-    // replacing the bundled one. Its own device UUID is kept, unlike the bundled
-    // pages, whose zeroed UUID field is filled in per instance.
-    [ostr] rot_nmpa: Option<String> = "SP_EMU_ROT_NMPA" => |v| v,
-    // Opt out of booting through real bootleby (see config::rot_bootleby_path).
-    rot_no_bootleby: bool = "SP_EMU_ROT_NO_BOOTLEBY" => |v| v.is_some(),
-    // A slot-B image (flash.b, 0x50000) to seed alongside slot A, so real bootleby
-    // can perform genuine A/B selection. Absent => slot B left erased/invalid.
-    [ostr] rot_image_b: Option<String> = "SP_EMU_ROT_IMAGE_B" => |v| v,
-    // Leave slot A (flash.a, 0x10000) erased instead of seeding the passed image, to
-    // drive bootleby's B-only and neither(panic) selection cases.
-    rot_erase_a: bool = "SP_EMU_ROT_ERASE_A" => |v| v.is_some(),
-    // Persistent CFPA boot preference for the synthesized CFPA: "b" prefers slot B,
-    // otherwise slot A. Ignored when SP_EMU_ROT_CFPA overrides the page.
-    [ostr] rot_boot_pref: Option<String> = "SP_EMU_ROT_BOOT_PREF" => |v| v,
-    [ostr] rot_dice: Option<String> = "SP_EMU_ROT_DICE" => |v| v,
-    [ostr] archive: Option<String> = "SP_EMU_ARCHIVE" => |v| v,
-    [ostr] diff: Option<String> = "SP_EMU_DIFF" => |v| v,
-    [ostr] dump_dir: Option<String> = "SP_EMU_DUMP_DIR" => |v| v,
-    [ostr] sensors: Option<String> = "SP_EMU_SENSORS" => |v| v,
-    watch: Option<u32> = "SP_EMU_WATCH" => |v| {
-        v.and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-    },
-    // "0xADDR:LEN"
-    rotdump: Option<(u32, u32)> = "SP_EMU_ROTDUMP" => |v| v.and_then(|s| {
-        let (a, l) = s.split_once(':')?;
-        Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, l.parse().ok()?))
-    }),
-    // the caller applies its own default (gdb 400M, rot-service 40M)
-    rot_preboot: Option<u64> = "SP_EMU_ROT_PREBOOT" => |v| v.and_then(|s| s.parse().ok()),
-    // raw: parsed three ways (MGS addr, gdb port offset, soc index)
-    [ostr] bridge: Option<String> = "SP_EMU_BRIDGE" => |v| v,
-
-    // ---- well-known-port host bridge (each caller applies its own default) ----
-    [ostr] addr0: Option<String> = "SP_EMU_ADDR0" => |v| v,
-    [ostr] addr1: Option<String> = "SP_EMU_ADDR1" => |v| v,
-    vid0: Option<u16> = "SP_EMU_VID0" => |v| {
-        v.and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-    },
-    vid1: Option<u16> = "SP_EMU_VID1" => |v| {
-        v.and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-    },
-
-    // ---- companion I2C bridge (empty treated as unset) ----
-    [ostr] i2c_bridge: Option<String> = "SP_EMU_I2C_BRIDGE" => |v| v.filter(|s| !s.is_empty()),
-    [ostr] i2c_device: Option<String> = "SP_EMU_I2C_DEVICE" => |v| v.filter(|s| !s.is_empty()),
-
-    // ---- windowed instruction traces (diagnostics; None = off) ----
-    trace_from: Option<u64> = "SP_EMU_TRACE_FROM" => |v| v.and_then(|s| s.parse().ok()),
-    trace_to: Option<u64> = "SP_EMU_TRACE_TO" => |v| v.and_then(|s| s.parse().ok()),
-    rot_trace_from: Option<u32> = "SP_EMU_ROT_TRACE_FROM" => |v| {
-        v.and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-    },
-    rot_trace_to: Option<u32> = "SP_EMU_ROT_TRACE_TO" => |v| {
-        v.and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-    },
-    rotpc: Option<u64> = "SP_EMU_ROTPC" => |v| v.and_then(|s| s.parse().ok()),
-
-    // ---- values with a default ----
-    idle_ms: u64 = "SP_EMU_IDLE_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(10),
-    eth_quantum: u32 = "SP_EMU_ETH_QUANTUM" => |v| {
-        v.and_then(|s| s.parse().ok()).filter(|&q| q > 0).unwrap_or(4096)
-    },
-    // on by default; "0" disables
-    eth_txbreak: bool = "SP_EMU_ETH_TXBREAK" => |v| v.map(|s| s != "0").unwrap_or(true),
-    // sprot SP->RoT artificial flow control (NOT on the real schematic): stall the
-    // SP's serve-loop burst once the shared mosi buffer reaches this many bytes, so
-    // the RoT is stepped to drain its RX FIFO before it overruns. Compensates for
-    // the coarse two-core scheduling (the SP runs a whole quantum before the RoT
-    // runs), which otherwise truncates any >16-byte request. Default = the RoT SPI
-    // RX FIFO depth (16); "0" disables it (restores the real overrun-and-drop
-    // behavior, e.g. to study the failure).
-    sprot_flowctl: u32 = "SP_EMU_SPROT_FLOWCTL" => |v| {
-        v.and_then(|s| s.parse().ok()).unwrap_or(16)
-    },
-    // Couple the SP's SysTick to the RoT's while the SP is blocked on an sprot
-    // request the RoT has accepted (request_in_flight): advance SP ticks 1:1 with
-    // the RoT's elapsed tick events (both kernels tick at 1ms) instead of the
-    // fabricated one-per-iteration idle tick, so the SP's SysTick-paced sprot
-    // timeout counts down at the true RoT-relative rate (RoT-as-SP-peripheral).
-    // Without it, a slow emulated RoT flash op trips the SP's 3-attempt sprot
-    // retry (UpdateChunkDelivery(ExhaustedNumAttempts)). "0" disables (restores the
-    // old idle-throttle timing, e.g. to reproduce the failure).
-    sprot_couple: bool = "SP_EMU_SPROT_COUPLE" => |v| v.map(|s| s != "0").unwrap_or(true),
-    // Dual of sprot_couple for the RoT's endoscope measurement: while the SP runs
-    // endoscope (SysTick off, pre-kernel) and the RoT polls the DHCSR halt on its 500ms
-    // kernel-timer budget, freeze the RoT's own SysTick and advance it only by the SP's
-    // elapsed endoscope time (SP cycle delta / SP clock divisor), so the RoT records a
-    // realistic halt time instead of ~0 and does not race past its deadline. "0" restores
-    // the old one-shot sprint.
-    endoscope_couple: bool = "SP_EMU_ENDOSCOPE_COUPLE" => |v| v.map(|s| s != "0").unwrap_or(true),
-    // SP core clock in kHz = instructions per ms, the endoscope-coupling divisor. The
-    // measurement runs pre-kernel, so the SP has not set its SysTick reload; this stands
-    // in for the SP clock. At ~400 MHz a ~133M-instruction endoscope maps to ~330 ms,
-    // under the RoT's 500 ms poll budget. Only affects endoscope coupling.
-    sp_clock_khz: u32 = "SP_EMU_SP_CLOCK_KHZ" => |v| v.and_then(|s| s.parse().ok()).filter(|&k| k > 0).unwrap_or(400_000),
-    pumpstats_ms: u64 = "SP_EMU_PUMPSTATS_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(50),
-    // trim before parsing, matching the historical read (a padded value parsed)
-    ambient_c: f32 = "SP_EMU_AMBIENT_C" => |v| v.and_then(|s| s.trim().parse().ok()).unwrap_or(30.0),
-    [str] ignition: String = "SP_EMU_IGNITION" => |v| {
-        v.unwrap_or_else(|| "0:gimlet,1:sidecar,2:gimlet,3:gimlet".to_string())
-    },
-    [str] dump_archive_id: String = "SP_EMU_DUMP_ARCHIVE_ID" => |v| v.unwrap_or_default(),
-}
+pub use sp_emu_config::Config;
 
 /// Meta variables `--dump-config` does not persist: `SP_EMU_CONFIGDBG` is a debug
 /// toggle about config printing, not persistent state, so loading a dumped file must
 /// not silently re-enable it.
 const NOT_PERSISTED: &[&str] = &["SP_EMU_CONFIGDBG"];
 
-impl Config {
-    /// Resolve from the process environment only (no config file). Used by `get()`'s
-    /// lazy default; `init` uses [`Config::resolve`] with a file layer when one is
-    /// loaded. `seed_override` is the `--seed` flag, which wins over the environment.
-    pub fn from_env(seed_override: Option<String>) -> Result<Config> {
-        Ok(Self::resolve(&|k| std::env::var(k).ok(), seed_override))
-    }
+/// The resolved config plus the flat presence map: which `SP_EMU_*` were explicitly
+/// set, and to what. The map drives `is_set` (and thus `instance_file`) and the flat
+/// `--dump-config` / `pack` output; the validated `Config` itself carries no presence.
+struct Resolved {
+    config: Config,
+    inputs: Vec<(&'static str, String)>,
+}
 
-    /// Was this variable explicitly provided (by the environment or a loaded file)?
-    fn is_set(&self, name: &str) -> bool {
-        self.inputs.iter().any(|(n, _)| *n == name)
-    }
-
-    /// Serialize the explicitly-set variables as a round-trippable TOML config file:
-    /// a flat table keyed by `SP_EMU_*` name, mirroring the environment. Loading it
-    /// back (`--load-config`) reproduces the run; omitted variables take their default.
-    ///
-    /// TODO: move to a strongly-typed config schema (native TOML types, real booleans,
-    /// nested tables) once the `SP_EMU_*` environment variables can be deprecated. The
-    /// env-var-mirroring string map exists only to stay backward compatible with them;
-    /// with the env layer gone, resolution can key off typed fields directly rather
-    /// than presence-based strings.
-    fn to_toml(&self) -> String {
-        let mut out = String::from(
-            "# sp-emu configuration (mirrors $SP_EMU_*; the environment overrides it).\n\
-             # Load with `--load-config <this file>`; omitted variables use their default.\n\
-             # A flag is on by presence -- delete its line to disable it.\n\n",
-        );
-        for (name, val) in &self.inputs {
-            if NOT_PERSISTED.contains(name) {
-                continue;
-            }
-            out.push_str(&format!("{name} = \"{}\"\n", escape_toml(val)));
+/// Resolve a source (the environment or a loaded file, via `get`) into the presence
+/// map and the validated `Config`. The `SP_EMU_*` variables feed the crate's flat
+/// bridge, which parses them leniently; the `--seed` flag wins over `SP_EMU_SEED`.
+fn resolve(
+    get: &dyn Fn(&str) -> Option<String>,
+    seed_override: Option<String>,
+) -> Result<Resolved> {
+    let mut inputs: Vec<(&'static str, String)> = Vec::new();
+    for &name in sp_emu_config::ENV_NAMES {
+        if let Some(v) = get(name) {
+            inputs.push((name, v));
         }
-        out
     }
+    let pairs = inputs.iter().map(|(n, v)| (n.to_string(), v.clone()));
+    let mut external = sp_emu_config::flat_pairs_to_v1(pairs);
+    if let Some(seed) = seed_override {
+        external.op.seed = Some(seed); // --seed beats $SP_EMU_SEED
+    }
+    let config =
+        sp_emu_config::ingest(external).map_err(|e| anyhow!("invalid configuration: {e}"))?;
+    Ok(Resolved { config, inputs })
+}
+
+/// Was this variable explicitly provided (by the environment or a loaded file)?
+fn is_set_in(inputs: &[(&'static str, String)], name: &str) -> bool {
+    inputs.iter().any(|(n, _)| *n == name)
 }
 
 /// Escape a value for a TOML basic string (`"..."`).
@@ -423,20 +78,41 @@ fn escape_toml(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Load the config file as `(SP_EMU_NAME, value)` pairs, lenient: a missing file is
-/// empty, a malformed file warns and is skipped, and scalar values are coerced to the
-/// string the resolver expects (a boolean `false` means "unset" -- a flag left off).
-fn load_config_file(path: &str) -> Vec<(String, String)> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(), // absent file: no file layer
-    };
-    parse_config_toml(&text).unwrap_or_else(|e| {
-        eprintln!("[config] ignoring malformed {path}: {e}");
-        Vec::new()
-    })
+/// Serialize the explicitly-set variables as a round-trippable flat TOML file, keyed
+/// by `SP_EMU_*` name (mirroring the environment). Loading it back (`--load-config`)
+/// reproduces the run; omitted variables take their default. The bundle format
+/// (`pack`) consumes this flat form; the typed schema is emitted only by the
+/// `sp-emu config` subcommands.
+fn flat_toml(inputs: &[(&'static str, String)]) -> String {
+    let mut out = String::from(
+        "# sp-emu configuration (mirrors $SP_EMU_*; the environment overrides it).\n\
+         # Load with `--load-config <this file>`; omitted variables use their default.\n\
+         # A flag is on by presence -- delete its line to disable it.\n\n",
+    );
+    for (name, val) in inputs {
+        if NOT_PERSISTED.contains(name) {
+            continue;
+        }
+        out.push_str(&format!("{name} = \"{}\"\n", escape_toml(val)));
+    }
+    out
 }
 
+/// Render the resolved config for the opt-in stderr dump: the effective typed config
+/// followed by which `SP_EMU_*` were explicitly set, so the full state is visible.
+fn render(r: &Resolved) -> String {
+    let mut out = sp_emu_config::dump(&r.config)
+        .unwrap_or_else(|e| format!("# <effective-config dump failed: {e}>\n"));
+    out.push_str("\n# explicitly set via SP_EMU_* (environment or config file):\n");
+    for (name, val) in &r.inputs {
+        out.push_str(&format!("#   {name} = {val:?}\n"));
+    }
+    out
+}
+
+/// Parse a flat config file into `(SP_EMU_NAME, value)` pairs, coercing scalar
+/// values to the string the resolver expects (a boolean `false` means "unset" -- a
+/// flag left off). A malformed file is a parse error the caller reports.
 fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, toml::de::Error> {
     let table: toml::Table = text.parse()?;
     let mut out = Vec::new();
@@ -454,7 +130,7 @@ fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, t
     Ok(out)
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
+static CONFIG: OnceLock<Resolved> = OnceLock::new();
 
 /// Resolve and store the process configuration. Call once, early in `main`, before
 /// any subsystem is built.
@@ -464,8 +140,7 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 /// so a saved configuration reproduces exactly regardless of the shell. The two
 /// sources are never mixed; command-line flags always win. Precedence is
 /// flag > (config file | environment) > default. `--dump-config <path>` writes the
-/// effective configuration for later re-loading. The full resolved table is echoed to
-/// stderr only under `$SP_EMU_CONFIGDBG`.
+/// effective configuration for later re-loading.
 pub fn init(
     seed_override: Option<String>,
     load_config: Option<String>,
@@ -473,47 +148,78 @@ pub fn init(
 ) -> Result<()> {
     // Two alternative sources for SP_EMU_*, never stacked: a config file
     // (--load-config, which then ignores the environment entirely) or the environment.
-    let cfg = match &load_config {
+    let resolved = match &load_config {
         Some(path) => {
-            let file = load_config_file(path);
+            // A path the caller named explicitly should be readable; a typo or a
+            // permissions problem is an error, not a silent all-defaults run.
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading --load-config {path}"))?;
+            // A typed (versioned) file is not loadable this way yet: the flat reader
+            // keeps only top-level scalars and silently drops its `[section]`s, which
+            // would resolve to all defaults. Refuse it, pointing at the tools that do
+            // read it, rather than run a misconfigured instance.
+            if let Ok(v) = sp_emu_config::peek_version(&text) {
+                let flat = matches!(
+                    v,
+                    sp_emu_config::SchemaVersion::LegacyFlat
+                        | sp_emu_config::SchemaVersion::Known(0)
+                );
+                if !flat {
+                    bail!(
+                        "{path}: --load-config reads only the flat SP_EMU_* form, but this \
+                         is a versioned config file. Check it with `sp-emu config validate \
+                         {path}`, or convert it with `sp-emu config upgrade {path}`."
+                    );
+                }
+            }
+            let file = parse_config_toml(&text).unwrap_or_else(|e| {
+                eprintln!("[config] ignoring malformed {path}: {e}");
+                Vec::new()
+            });
             eprintln!(
                 "[config] loaded {} ({} vars); ignoring the SP_EMU_* environment",
                 path,
                 file.len()
             );
             let get = |k: &str| file.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-            Config::resolve(&get, seed_override)
+            resolve(&get, seed_override)?
         }
-        None => Config::from_env(seed_override)?,
+        None => resolve(&|k| std::env::var(k).ok(), seed_override)?,
     };
 
     if let Some(path) = &dump_config {
-        match std::fs::write(path, cfg.to_toml()) {
-            Ok(()) => eprintln!("[config] wrote {} ({} set)", path, cfg.inputs.len()),
+        match std::fs::write(path, flat_toml(&resolved.inputs)) {
+            Ok(()) => eprintln!("[config] wrote {} ({} set)", path, resolved.inputs.len()),
             Err(e) => eprintln!("[config] writing {path} failed: {e}"),
         }
     }
-    if cfg.configdbg {
-        eprint!("{}", cfg.render());
+    if resolved.config.configdbg() {
+        eprint!("{}", render(&resolved));
     }
     // Loud, not silent: if this fails, `get()` already resolved a config (without
     // the seed override) before `init` ran, so the process would run mis-seeded.
-    CONFIG.set(cfg).map_err(|_| {
-        anyhow::anyhow!("config::init called after config was already resolved by get()")
-    })?;
+    CONFIG
+        .set(resolved)
+        .map_err(|_| anyhow!("config::init called after config was already resolved by get()"))?;
     Ok(())
 }
 
-/// The process configuration. Lazily defaults from a clean environment if `init`
-/// was never called (unit tests / non-CLI paths), so accessors never panic.
+/// The resolved config plus presence map. Lazily defaults from a clean environment
+/// if `init` was never called (unit tests / non-CLI paths), so accessors never panic.
+fn resolved() -> &'static Resolved {
+    CONFIG
+        .get_or_init(|| resolve(&|k| std::env::var(k).ok(), None).expect("default config resolves"))
+}
+
+/// The process configuration.
 pub fn get() -> &'static Config {
-    CONFIG.get_or_init(|| Config::from_env(None).expect("default config resolves"))
+    &resolved().config
 }
 
 /// The effective configuration as a flat `SP_EMU_NAME = "value"` TOML table (only the
 /// explicitly-set knobs). Used by `pack` to embed a reproducible config in a bundle.
 pub fn to_toml() -> String {
-    get().to_toml()
+    flat_toml(&resolved().inputs)
 }
 
 /// The instance state directory. `$SP_EMU_STATE_DIR` if set, otherwise a per-user
@@ -521,8 +227,8 @@ pub fn to_toml() -> String {
 /// available). Default instance files (flash, RoT flash, identity) and the stowed
 /// archives live under it, so a bare run does not litter the working directory.
 pub fn state_dir() -> String {
-    if let Some(d) = get().state_dir.clone() {
-        return d;
+    if let Some(d) = get().state_dir() {
+        return d.to_string();
     }
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
@@ -558,18 +264,17 @@ pub fn rot_bootleby_path() -> &'static Option<String> {
 /// worth printing once rather than once per caller.
 fn resolve_rot_bootleby() -> Option<String> {
     let cfg = get();
-    if cfg.rot_no_bootleby {
+    if cfg.rot_no_bootleby() {
         return None;
     }
-    if let Some(p) = cfg.rot_bootleby.clone() {
-        return Some(p);
+    if let Some(p) = cfg.rot_bootleby() {
+        return Some(p.to_string());
     }
     const NAME: &str = "bootleby-oxide-rot-1.zip";
     let mut candidates: Vec<String> = Vec::new();
     // Alongside the RoT archive: a curated image directory holds the matching set.
     if let Some(dir) = cfg
-        .rot_flash
-        .as_deref()
+        .rot_flash()
         .and_then(|p| std::path::Path::new(p).parent())
         .and_then(|d| d.to_str())
     {
@@ -594,12 +299,12 @@ fn resolve_rot_bootleby() -> Option<String> {
 
 /// Whether `state_dir()` is the built-in default (no explicit `$SP_EMU_STATE_DIR`).
 pub fn state_dir_is_default() -> bool {
-    get().state_dir.is_none()
+    get().state_dir().is_none()
 }
 
 /// Whether an `SP_EMU_*` variable was explicitly set (environment or config file).
 pub fn is_set(name: &str) -> bool {
-    get().is_set(name)
+    is_set_in(&resolved().inputs, name)
 }
 
 /// Resolve an instance file path: the explicit knob value when it was set (or already
@@ -615,11 +320,12 @@ pub fn instance_file(env_name: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sp_emu_config::Board;
 
     /// Resolve from an in-memory map instead of the process environment, so tests
     /// are hermetic regardless of the developer's / CI's ambient `SP_EMU_*`.
-    fn from_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Config {
-        Config::resolve(
+    fn resolve_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Resolved {
+        resolve(
             &|k| {
                 vars.iter()
                     .find(|(n, _)| *n == k)
@@ -627,22 +333,28 @@ mod tests {
             },
             seed_override,
         )
+        .expect("test config resolves")
+    }
+
+    /// The validated config for a set of `SP_EMU_*` values.
+    fn from_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Config {
+        resolve_map(vars, seed_override).config
     }
 
     #[test]
     fn defaults_resolve() {
         let c = from_map(&[], None);
-        assert_eq!(c.flash_path, "sp-flash.bin");
-        assert_eq!(c.rot_nvm_path, "sp-rot-flash.bin");
-        assert_eq!(c.identity_path, "sp-emu-identity");
-        assert_eq!(c.board, Board::Gimlet);
-        assert!(!c.flashdbg);
-        assert_eq!(c.idle_ms, 10);
-        assert_eq!(c.eth_quantum, 4096);
-        assert!(c.eth_txbreak);
-        assert_eq!(c.ambient_c, 30.0);
+        assert_eq!(c.flash_path(), "sp-flash.bin");
+        assert_eq!(c.rot_nvm_path(), "sp-rot-flash.bin");
+        assert_eq!(c.identity_path(), "sp-emu-identity");
+        assert_eq!(c.board(), Board::Gimlet);
+        assert!(!c.flashdbg());
+        assert_eq!(c.idle_ms(), 10);
+        assert_eq!(c.eth_quantum(), 4096);
+        assert!(c.eth_txbreak());
+        assert_eq!(c.ambient_c(), 30.0);
         // No SP_EMU_STATE_DIR by default, so the built-in per-user default is used.
-        assert_eq!(c.state_dir, None);
+        assert_eq!(c.state_dir(), None);
     }
 
     /// `instance_file` passes absolute paths through and joins a relative default under
@@ -664,10 +376,10 @@ mod tests {
     fn seed_override_wins() {
         // --seed beats $SP_EMU_SEED.
         let c = from_map(&[("SP_EMU_SEED", "from-env")], Some("from-cli".into()));
-        assert_eq!(c.seed.as_deref(), Some("from-cli"));
+        assert_eq!(c.seed(), Some("from-cli"));
         // absent flag falls back to the environment.
         let c = from_map(&[("SP_EMU_SEED", "from-env")], None);
-        assert_eq!(c.seed.as_deref(), Some("from-env"));
+        assert_eq!(c.seed(), Some("from-env"));
     }
 
     /// The operation knobs let a config file describe a whole instance: unset by
@@ -675,9 +387,9 @@ mod tests {
     #[test]
     fn operation_knobs_resolve() {
         let c = from_map(&[], None);
-        assert_eq!(c.mode, None);
-        assert_eq!(c.boot_slot, None);
-        assert_eq!(c.run_max, None);
+        assert_eq!(c.mode(), None);
+        assert_eq!(c.boot_slot(), None);
+        assert_eq!(c.run_max(), None);
 
         let c = from_map(
             &[
@@ -687,50 +399,51 @@ mod tests {
             ],
             None,
         );
-        assert_eq!(c.mode.as_deref(), Some("run"));
-        assert_eq!(c.boot_slot.as_deref(), Some("b"));
-        assert_eq!(c.run_max, Some(0));
+        assert_eq!(c.mode(), Some("run"));
+        assert_eq!(c.boot_slot(), Some("b"));
+        assert_eq!(c.run_max(), Some(0));
 
         // Empty strings are treated as unset; a non-numeric budget is ignored.
         let c = from_map(&[("SP_EMU_MODE", ""), ("SP_EMU_RUN_MAX", "forever")], None);
-        assert_eq!(c.mode, None);
-        assert_eq!(c.run_max, None);
+        assert_eq!(c.mode(), None);
+        assert_eq!(c.run_max(), None);
     }
 
     #[test]
     fn value_parsers_preserve_leniency() {
         // whitespace-padded ambient parses (historical .trim())
         assert_eq!(
-            from_map(&[("SP_EMU_AMBIENT_C", " 42 ")], None).ambient_c,
+            from_map(&[("SP_EMU_AMBIENT_C", " 42 ")], None).ambient_c(),
             42.0
         );
         // a zero quantum is rejected in favor of the default
         assert_eq!(
-            from_map(&[("SP_EMU_ETH_QUANTUM", "0")], None).eth_quantum,
+            from_map(&[("SP_EMU_ETH_QUANTUM", "0")], None).eth_quantum(),
             4096
         );
         assert_eq!(
-            from_map(&[("SP_EMU_ETH_QUANTUM", "256")], None).eth_quantum,
+            from_map(&[("SP_EMU_ETH_QUANTUM", "256")], None).eth_quantum(),
             256
         );
         // txbreak: only "0" disables
-        assert!(!from_map(&[("SP_EMU_ETH_TXBREAK", "0")], None).eth_txbreak);
-        assert!(from_map(&[("SP_EMU_ETH_TXBREAK", "1")], None).eth_txbreak);
+        assert!(!from_map(&[("SP_EMU_ETH_TXBREAK", "0")], None).eth_txbreak());
+        assert!(from_map(&[("SP_EMU_ETH_TXBREAK", "1")], None).eth_txbreak());
         // hex with or without 0x; empty selector treated as unset
         assert_eq!(
-            from_map(&[("SP_EMU_WATCH", "0x2000")], None).watch,
+            from_map(&[("SP_EMU_WATCH", "0x2000")], None).watch(),
             Some(0x2000)
         );
         assert_eq!(
-            from_map(&[("SP_EMU_ROT_SERVICE", "")], None).rot_service,
+            from_map(&[("SP_EMU_ROT_SERVICE", "")], None).rot_service(),
             None
         );
         assert_eq!(
-            from_map(&[("SP_EMU_BOARD", "sidecar")], None).board,
+            from_map(&[("SP_EMU_BOARD", "sidecar")], None).board(),
             Board::Sidecar
         );
+        // a board typo is lenient: it falls back to gimlet, as on master.
         assert_eq!(
-            from_map(&[("SP_EMU_BOARD", "typo")], None).board,
+            from_map(&[("SP_EMU_BOARD", "typo")], None).board(),
             Board::Gimlet
         );
     }
@@ -739,7 +452,7 @@ mod tests {
     fn config_file_round_trips() {
         // A run with several set variables serializes to TOML and, parsed back and
         // re-resolved, reproduces the same configuration.
-        let orig = from_map(
+        let orig = resolve_map(
             &[
                 ("SP_EMU_BOARD", "sidecar"),
                 ("SP_EMU_ETH_QUANTUM", "256"),
@@ -749,20 +462,19 @@ mod tests {
             ],
             None,
         );
-        let toml = orig.to_toml();
+        let toml = flat_toml(&orig.inputs);
         let loaded = parse_config_toml(&toml).expect("our own output parses");
         let pairs: Vec<(&str, &str)> = loaded
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let round = from_map(&pairs, None);
-        assert_eq!(round.board, Board::Sidecar);
-        assert_eq!(round.eth_quantum, 256);
-        assert!(round.flashdbg);
-        assert_eq!(round.ambient_c, 42.0);
-        assert_eq!(round.ignition, "0:gimlet,1:sidecar");
+        assert_eq!(round.board(), Board::Sidecar);
+        assert_eq!(round.eth_quantum(), 256);
+        assert!(round.flashdbg());
+        assert_eq!(round.ambient_c(), 42.0);
+        assert_eq!(round.ignition(), "0:gimlet,1:sidecar");
         // meta vars are not persisted to the file
-        assert!(!toml.contains("SP_EMU_CONFIG "));
         assert!(!toml.contains("SP_EMU_CONFIGDBG"));
     }
 
@@ -777,11 +489,11 @@ mod tests {
         .unwrap();
         let pairs: Vec<(&str, &str)> = m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let c = from_map(&pairs, None);
-        assert_eq!(c.eth_quantum, 256);
-        assert_eq!(c.ambient_c, 42.5);
-        assert!(c.flashdbg); // true -> on
-        assert!(!c.ethdbg); // false -> absent -> off
-                            // a malformed file is rejected (callers fall back to no file layer)
+        assert_eq!(c.eth_quantum(), 256);
+        assert_eq!(c.ambient_c(), 42.5);
+        assert!(c.flashdbg()); // true -> on
+        assert!(!c.ethdbg()); // false -> absent -> off
+                              // a malformed file is rejected (callers fall back to no file layer)
         assert!(parse_config_toml("this is not = = toml").is_err());
     }
 
@@ -843,17 +555,17 @@ mod tests {
         let missing: Vec<&str> = MASTER_VARS
             .iter()
             .copied()
-            .filter(|v| !Config::ENV_VARS.contains(v))
+            .filter(|v| !sp_emu_config::ENV_NAMES.contains(v))
             .collect();
         assert!(
             missing.is_empty(),
-            "config table no longer resolves master variables: {missing:?} -- \
+            "config no longer resolves master variables: {missing:?} -- \
              this breaks backward compatibility for existing environments"
         );
     }
 
     /// Guard: `config.rs` is the sole reader of the environment. No other module
-    /// may call `env::var` -- everything routes through the table above.
+    /// may call `env::var` -- everything routes through this adapter.
     #[test]
     fn env_reads_confined_to_config_module() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

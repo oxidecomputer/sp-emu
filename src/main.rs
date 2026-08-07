@@ -243,6 +243,69 @@ fn extract_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     None
 }
 
+/// `sp-emu config <validate|schema|upgrade>`: work on config files without
+/// starting an instance. Reads and writes through the `sp-emu-config` crate, so a
+/// flat `SP_EMU_*` file and a typed schema file are both understood.
+fn cmd_config(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("validate") => {
+            let path = args
+                .get(1)
+                .context("usage: sp-emu config validate <path>")?;
+            let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+            // A newer or invalid file is a non-zero exit with a clear message; a
+            // valid one reports the version it was read as.
+            let version = sp_emu_config::validate(&text)
+                .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+            println!("{path}: valid, read as {}", describe_version(version));
+            Ok(())
+        }
+        Some("schema") => {
+            print!("{}", sp_emu_config::template());
+            Ok(())
+        }
+        Some("upgrade") => {
+            let input = args
+                .get(1)
+                .context("usage: sp-emu config upgrade <in> [out]")?;
+            let text = std::fs::read_to_string(input).with_context(|| format!("read {input}"))?;
+            // Fold any known version (flat or typed) forward, validate it, then emit
+            // the current typed schema with its version stamped.
+            let mut external = sp_emu_config::migrate(&text)
+                .map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
+            sp_emu_config::ingest(external.clone())
+                .map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
+            external.schema_version = Some(sp_emu_config::CURRENT);
+            let out_toml =
+                sp_emu_config::to_toml(&external).map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
+            match args.get(2) {
+                Some(out) => {
+                    std::fs::write(out, out_toml).with_context(|| format!("write {out}"))?;
+                    eprintln!("[config] upgraded {input} -> {out} (schema v{})", sp_emu_config::CURRENT);
+                }
+                None => print!("{out_toml}"),
+            }
+            Ok(())
+        }
+        _ => {
+            eprintln!("usage:");
+            eprintln!("  sp-emu config validate <path>    check a config file; report its schema version");
+            eprintln!("  sp-emu config schema             print a documented template at defaults");
+            eprintln!("  sp-emu config upgrade <in> [out] convert any known version to the current typed schema");
+            bail!("unknown `config` subcommand");
+        }
+    }
+}
+
+/// A human-readable name for a detected schema version.
+fn describe_version(v: sp_emu_config::SchemaVersion) -> String {
+    match v {
+        sp_emu_config::SchemaVersion::LegacyFlat => "the legacy flat SP_EMU_* format".to_string(),
+        sp_emu_config::SchemaVersion::Known(n) => format!("schema v{n}"),
+        sp_emu_config::SchemaVersion::Newer(n) => format!("schema v{n} (newer than this build)"),
+    }
+}
+
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // `--version` short-circuits before any config or identity work, so it prints
@@ -250,6 +313,11 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         print_version();
         return Ok(());
+    }
+    // `config` is a standalone tool that works on config files given as arguments,
+    // so it runs before (and instead of) resolving this process's own configuration.
+    if args.first().map(String::as_str) == Some("config") {
+        return cmd_config(args.get(1..).unwrap_or(&[]));
     }
     // Ingest all configuration once (env, an optional --load-config file, and the
     // --seed flag). After this, subsystems read config::get(), never the environment.
@@ -327,6 +395,7 @@ fn main() -> Result<()> {
             eprintln!(
                 "  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone"
             );
+            eprintln!("  sp-emu config <validate|schema|upgrade>  work on config files (see `sp-emu config`)");
             eprintln!("  sp-emu pack [bundle.zip]         bundle this instance (flash+archives) to a zip");
             eprintln!("  sp-emu unpack <bundle.zip> [dir] extract an instance bundle for run + humility");
             eprintln!("  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here");

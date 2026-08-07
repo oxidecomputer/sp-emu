@@ -64,23 +64,41 @@ Scope and limits, on purpose:
   uses is `run <slot> 0`.
 - The file is still the flat `SP_EMU_*` schema. Ergonomics come in increment 2.
 
-## Increment 2 (future, to design with the repo owner): structured schema
+## Increment 2 (implemented): the `sp-emu-config` crate
 
-This is the change that touches the public surface, so it is the part to design
-with the sp-emu repo owner rather than land unilaterally. It is exactly the `TODO`
-already sitting on `Config::to_toml`.
+The config format lives in a library crate, `sp-emu-config`, so other programs
+read and write an sp-emu config through checked methods rather than by parsing
+TOML. The emulator's `src/config.rs` is a thin adapter over it.
 
-- **A typed, nested schema.** Replace the flat `SP_EMU_NAME = "value"` table with
-  real sections and field names (for example `[net]`, `[rot]`, `[debug]`) and
-  native types, so the file reads as configuration rather than as mirrored
-  environment variables.
-- **A deprecation window for the environment.** Keep reading the `SP_EMU_*`
-  variables, mapped onto the new fields, with a one-time warning, so existing
-  environments and scripts keep working while use cases migrate. Remove them only
-  after the migration is complete.
-- **Mechanics.** Extend each `config!` row with its schema path, generate a
-  serde-derived schema, and have `dump-config` and `pack` emit the new form. The
-  single-source-of-truth macro keeps this a per-row change rather than a rewrite.
+- **A typed, nested schema.** The v1 schema has real sections and field names
+  (`[op]`, `[paths]`, `[net]`, `[host]`, `[i2c]`, `[rot]`, `[sprot]`, `[vpd]`,
+  `[sensors]`, `[dump]`, `[trace]`, `[stats]`, `[debug]`) with native types. A file
+  declares `schema_version = 1`. Field names drop the redundant section prefix
+  (`[rot] flash`, not `rot_flash`). Unknown keys and sections are rejected.
+- **Parse, don't validate.** The serde-deserialized file is a transient external
+  form; ingesting it into the validated `Config` checks every value, so a `Config`
+  is valid by construction and read only through getters. The typed file is held to
+  a strict standard (an unknown board or mode is an error); the `SP_EMU_*`
+  environment keeps its historical leniency.
+- **Versioning.** A file's `schema_version` is read first. An older version (the
+  legacy flat `SP_EMU_*` file is version 0) migrates forward; a newer version is
+  refused with a clear message instead of being misread.
+- **The environment still works.** The `SP_EMU_*` variables are read as the legacy
+  flat form and migrated onto the typed fields, so existing environments and scripts
+  are unchanged. `--dump-config` and `pack` still emit the flat form; the typed
+  schema is emitted by the `sp-emu config` subcommands.
+
+### The `sp-emu config` subcommands
+
+- `sp-emu config validate <path>` reports the schema version a file is read as, or
+  exits non-zero with the first problem (unparseable, a newer version, or an invalid
+  value naming its field).
+- `sp-emu config schema` prints a documented template of the whole schema: the
+  defaulted knobs at their defaults, and the optional knobs as commented example
+  lines, so every configurable item is discoverable.
+- `sp-emu config upgrade <in> [out]` reads any known version (a flat `SP_EMU_*` file
+  or a typed one), validates it, and writes the current typed schema. With no output
+  path it prints to stdout.
 
 ## Migration for the repo owner
 
@@ -89,15 +107,15 @@ already sitting on `Config::to_toml`.
    first step that needs no schema change.
 2. Move the scripts that assemble long `SP_EMU_*` command lines (for example
    `demo/run-testbed.sh` and the sp-test boot scripts) onto a shared `sp-emu.toml`.
-3. Once use cases are on the file, take up increment 2 and the environment
-   deprecation on an agreed timeline.
+3. Convert a flat file to the typed schema with `sp-emu config upgrade`, and start a
+   new one from `sp-emu config schema`.
 
 ## Open questions
 
-- Should `--dump-config` optionally emit *all* knobs, with defaults commented, as a
-  template, rather than only the explicitly-set ones?
+- Should `--load-config` accept a typed file directly? Today it reads the flat
+  form and refuses a versioned file with a pointer to `sp-emu config validate` /
+  `upgrade`; loading a typed file in place is future work. Should `--dump-config`
+  also be able to emit the typed schema?
 - Should `SP_EMU_MODE` accept more than `run` / `gdb` (for example `rot-serve`)?
-- Where does the canonical example live, and is a per-instance file version
-  controlled alongside the thing it configures?
-- Structured schema: the section boundaries and field names are the repo owner's
-  call, and set the shape of the eventual public interface.
+- On what timeline are the `SP_EMU_*` variables deprecated, given a one-time warning
+  is not yet emitted?
