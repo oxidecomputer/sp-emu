@@ -321,7 +321,9 @@ fn main() -> Result<()> {
             eprintln!("  sp-emu erase <a|b>               erase a slot");
             eprintln!("  sp-emu info                      show slot reset vectors");
             eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot (max 0 = run forever)");
-            eprintln!("  sp-emu gdb [a|b] [preboot]       boot a slot, then serve a GDB stub for humility");
+            eprintln!(
+                "  sp-emu gdb [a|b] [preboot]       alias for `run <slot> 0`, taking a preboot count"
+            );
             eprintln!(
                 "  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone"
             );
@@ -708,6 +710,11 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
     cpu.wfi_throttle = true;
+    // This is the LPC55 RoT: its flash is at 0x0, not the STM32H7's 0x0800_0000.
+    // Point the exc-ret crash detector at the RoT flash (640 KB, 0x0..0xA_0000) so
+    // legitimate RoT returns are not reported as crashes.
+    let rot_flash = 0x0u32..0x000A_0000;
+    cpu.set_code_ranges(vec![rot_flash]);
     // Boot-ROM API emulation (SP_EMU_ROT_ROM): install the synthesized ROM pointer
     // graph and trap `skboot_authenticate` so the RoT pre-kernel's
     // authenticate_image() runs the real signature check. Off by

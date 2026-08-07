@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # Show the Hubris task table on the emulated SP, via humility.
 #
-#   ./tasks              # the task table, over the OpenOCD transport (-p ocd)
+#   ./tasks              # the task table, over the SWD (Glasgow) debug port
 #   ./tasks -sl net      # stack-backtrace a task
-#   ./tasks --swd        # attach over the SWD (Glasgow) debug port instead
-#   ./tasks --swd -sl net
 #
-# By default this uses the OpenOCD transport (`-p ocd`), which humility expects on
-# localhost:6666 -- so boot sp-emu with its MGS bridge on `[::1]:33300` for that
-# port. `--swd` attaches over the real SWD debug port instead (the same one
-# `./hiffy` uses); its port follows the bridge (4444 + (SP_BASE - 33300)), so it
-# works at any SP_BASE. tasks is read-only, so both transports serve it -- --swd is
-# handy as a cross-check that the SWD path agrees with OpenOCD.
+# The SWD debug port is a real halt/run/step debug core exposed as a Glasgow
+# probe, and it is the only transport sp-emu still serves: the OpenOCD and
+# GDB-RSP stubs this script once defaulted to were removed when humility dropped
+# `-p ocd` and `-p ocdgdb`. The port follows the bridge
+# (4444 + (SP_BASE - 33300)), so it works at any SP_BASE; $SWD_PORT overrides it.
 #
 # (Run this when the SP is idle -- i.e. not mid-MGS-command -- since humility
 # halts the CPU to read memory.)
@@ -25,12 +22,10 @@ ARCHIVE="${ARCHIVE:-}"
   exit 1
 }
 
-PROBE="ocd"
-if [ "${1:-}" = "--swd" ]; then
-  shift
-  SP_BASE="${SP_BASE:-33310}"
-  SWD_PORT="${SWD_PORT:-$((4444 + SP_BASE - 33300))}"
-  PROBE="20b7:9db1:tcp:127.0.0.1:${SWD_PORT}"
-fi
+# Accepted and ignored: the flag used to select this, now the only transport.
+if [ "${1:-}" = "--swd" ]; then shift; fi
 
-exec humility -a "$ARCHIVE" -p "$PROBE" tasks "$@"
+SP_BASE="${SP_BASE:-33310}"
+SWD_PORT="${SWD_PORT:-$((4444 + SP_BASE - 33300))}"
+
+exec humility -a "$ARCHIVE" -p "20b7:9db1:tcp:127.0.0.1:${SWD_PORT}" tasks "$@"

@@ -19,7 +19,10 @@
 [testbed]
 interface = "lo"
 discovery_addr = "[::1]:33300"
-simulator = true
+# An emulator, not silicon: sp-test reaches it with `faux-mgs --sp-sim-addr` and
+# derives testbed:kind:sp-emu / testbed:execution:emulated, so a test can require
+# real hardware or forbid a simulator. Replaces the older `simulator = true`.
+kind = "sp-emu"
 
 [testbed.sp]
 name = "gimlet-c"

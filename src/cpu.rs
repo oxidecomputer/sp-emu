@@ -114,6 +114,18 @@ pub struct Cpu {
     flash_cache: std::ops::Range<u32>,
     syst_csr: u32, // cached SYST_CSR (refreshed periodically in maybe_tick)
     syst_rvr: u32, // cached SYST_RVR reload value (>=1)
+    /// This core's executable-memory windows: a stacked return PC outside all of
+    /// them is flagged by the exc-ret crash detector. Per core, since one
+    /// interpreter runs both: the SP's ITCM (0x0, where the RoT injects the
+    /// endoscope) plus STM32H7 flash (0x0800_0000); the RoT's LPC55 flash (0x0).
+    code_ranges: Vec<std::ops::Range<u32>>,
+    /// Set when a WFI executes with nothing pending: a genuine idle, whatever the
+    /// `wfi_throttle` state. The RoT preboot loop (which runs with the throttle
+    /// off, so `idle_skip` never fires) reads it to stop as soon as the core
+    /// reaches its idle loop, meaning it is booted and ready to serve. The WFI
+    /// handler only ever sets it; the reader clears it before each step, so a read
+    /// means "the last step idled", not "has idled at some point".
+    pub wfi_idle: bool,
 }
 
 /// A cached fetch+decode for one instruction at a fixed flash PC.
@@ -129,6 +141,11 @@ const LR: usize = 14;
 /// Flash window (2 MB). PCs here are XIP and immutable -> safe to cache decodes.
 const FLASH_LO: u32 = 0x0800_0000;
 const FLASH_HI: u32 = 0x0a00_0000;
+
+/// Default plausible-code window for the exc-ret crash detector: the SP's
+/// STM32H7 flash. `build_rot_core` overrides it (`set_code_ranges`) for the LPC55
+/// RoT, whose flash is at 0x0.
+const SP_CODE_RANGE: std::ops::Range<u32> = 0x0800_0000..0x0820_0000;
 
 /// Upper bound of the SP's ITCM (0x0000_0000..0x0001_0000). Injected code (the
 /// RoT's endoscope measurement program) runs here. It is cacheable only while the
@@ -217,6 +234,8 @@ impl Cpu {
             flash_cache: FLASH_LO..FLASH_HI,
             syst_csr: 0,
             syst_rvr: 1,
+            code_ranges: vec![0..ITCM_HI, SP_CODE_RANGE],
+            wfi_idle: false,
         }
     }
 
@@ -322,6 +341,18 @@ impl Cpu {
     /// it, or their stale decodes would be reused.
     pub fn set_flash_cache(&mut self, range: std::ops::Range<u32>) {
         self.flash_cache = range;
+    }
+
+    /// Replace this core's executable-memory windows for the exc-ret crash
+    /// detector (see `exception_return`). Defaults to the SP's ITCM plus STM32H7
+    /// flash; the RoT core sets its LPC55 flash (at 0x0).
+    pub fn set_code_ranges(&mut self, ranges: Vec<std::ops::Range<u32>>) {
+        self.code_ranges = ranges;
+    }
+
+    /// Whether `pc` lies in any of this core's executable-memory windows.
+    fn is_code(&self, pc: u32) -> bool {
+        self.code_ranges.iter().any(|r| r.contains(&pc))
     }
 
     /// Drop cached decodes overlapping a write at `addr` (the write's word plus a
@@ -605,6 +636,14 @@ impl Cpu {
                 // Preboot/run/diff keep wfi_throttle=false, so WFI is a plain nop
                 // there (full-speed boot). The core still wakes immediately on a
                 // real IRQ (e.g. eth-irq from an injected MGS packet).
+                //
+                // Signal a genuine idle (nothing pending) whatever the throttle, so
+                // the RoT preboot loop can stop the moment the core reaches its idle
+                // loop (booted, waiting on the SP) instead of running the whole
+                // budget there.
+                if !bus.any_pending_irq() {
+                    self.wfi_idle = true;
+                }
                 if self.wfi_throttle && self.systick > 1 && !bus.any_pending_irq() {
                     if self.sp_tick_credit > 0 {
                         // sprot coupling: the SP is blocked on an sprot
@@ -1859,12 +1898,16 @@ impl Cpu {
         let lr = bus.read32(base + 20);
         let pc = bus.read32(base + 24);
         let xpsr = bus.read32(base + 28);
-        // Crash detector: a stacked return PC must point into flash (code). If it
-        // doesn't, either the exception frame was clobbered or the restored SP
-        // is wrong; dump the frame + context to pinpoint it.
-        if !(0x0800_0000..0x0820_0000).contains(&pc) && self.bad_ret_dumps < 6 {
+        // Crash detector: a stacked return PC should point into this core's
+        // executable memory (`code_ranges`: the SP's ITCM plus STM32H7 flash, the
+        // RoT's LPC55 flash at 0x0). If it does not, the exception frame was
+        // clobbered or the restored SP is wrong; dump the frame to pinpoint it.
+        // ITCM is a code window so the RoT's endoscope, injected and run at 0x0 on
+        // the SP, is never flagged, whether or not the RoT still holds the debug
+        // port.
+        if !self.is_code(pc) && self.bad_ret_dumps < 6 {
             self.bad_ret_dumps += 1;
-            eprintln!("[exc-ret BAD] return PC={:#010x} (not flash!) exc={:#x} from_psp={} base={:#010x} lr={:#010x} xpsr={:#010x} cyc={}",
+            eprintln!("[exc-ret BAD] return PC={:#010x} (not code!) exc={:#x} from_psp={} base={:#010x} lr={:#010x} xpsr={:#010x} cyc={}",
                 pc, exc, return_psp, base, lr, xpsr, self.cycles);
             eprintln!(
                 "   frame: r0={:#x} r1={:#x} r2={:#x} r3={:#x} r12={:#x}",
@@ -2751,5 +2794,22 @@ mod tests {
         assert!(cpu.step(&mut bus, &mut host).is_ok());
         assert_eq!(cpu.idle_skip, 100, "throttle records the skipped instrs");
         assert_eq!(cpu.systick, 1);
+    }
+
+    /// An idle WFI signals `wfi_idle` even with the throttle off, which is how the
+    /// RoT preboot loop (throttle off) detects the core reached its idle loop and
+    /// stops instead of running the whole budget there.
+    #[test]
+    fn wfi_signals_idle_with_throttle_off() {
+        let mut bus = ram_bus();
+        bus.write16(RAM, WFI);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.wfi_throttle = false; // preboot runs with the throttle off
+        cpu.wfi_idle = false;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert!(cpu.wfi_idle, "an idle WFI is signalled regardless of throttle");
+        assert_eq!(cpu.idle_skip, 0, "throttle path did not run");
     }
 }

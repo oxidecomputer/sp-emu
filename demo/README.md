@@ -50,16 +50,13 @@ Use the demos to run some actual commands:
 ./tasks -sl net     # source-line stack backtrace of a running task
 ./hiffy             # call a Hubris IPC (default Jefe.get_state) over the SWD port
 ./hiffy -l          # list the interfaces hiffy can call
-./tasks --swd       # same task table, but over the SWD debug port instead of ocd
 ```
 
-`./tasks` uses the OpenOCD transport (`-p ocd`), which humility expects on
-localhost:6666, so boot sp-emu with its MGS bridge on `[::1]:33300` for that
-(`SP_BASE=33300 ./run-sp.sh`). `./hiffy` and `./tasks --swd` use the new **SWD
-debug port**: a real halt/run/step debug core exposed as a Glasgow probe, so
-`hiffy` (which injects and runs a program) actually works, where it hangs on
-the fake-halt `-p ocd`/`-p ocdgdb` transports. The SWD port follows the bridge
-(`4444 + (SP_BASE - 33300)`); `sp-emu gdb` prints the exact ports on startup.
+Both scripts attach over the **SWD debug port**: a real halt/run/step debug core
+exposed as a Glasgow probe, which is what lets `hiffy` inject and run a program.
+It is the only transport sp-emu serves; the fake-halt OpenOCD and GDB-RSP stubs
+were removed once humility dropped `-p ocd` and `-p ocdgdb`. The port follows the
+bridge (`4444 + (SP_BASE - 33300)`), and the exact ports are printed on startup.
 
 ## Watch the RoT measure the SP (attestation)
 

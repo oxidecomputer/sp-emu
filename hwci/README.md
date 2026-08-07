@@ -49,12 +49,11 @@ SP_EMU_HOST_PTY=1 \
   ./target/release/sp-emu run a 0 &
 #  wait for: [sp-emu] online   (takes ~30s)
 
-# 4. Run the RoT-boot suite. faux-mgs cannot reach sp-emu over loopback with
-#    --interface/--discovery-addr ("no interface name found for index 0"); the
-#    sp-test-workshop shim rewrites that to --sp-sim-addr. Put it ahead on PATH.
+# 4. Run the RoT-boot suite. The testbed's `kind = "sp-emu"` tells sp-test this
+#    is an emulator, so its faux-mgs calls use --sp-sim-addr; nothing needs to be
+#    put on PATH. (The --interface/--discovery-addr form cannot reach a loopback
+#    peer: "no interface name found for index 0".)
 HWCI=~/Oxide/src/sp-emu/hwci
-SHIM=~/Oxide/src/sp-test-workshop/stages/1-sp-emu/shim
-PATH="$SHIM:$PATH" SP_EMU_SHIM=1 SP_EMU_ATTEMPT_MS=30000 \
 sp-test suite run suite-rot-boot \
     --testbed   $HWCI/testbed-sp-emu.toml \
     --archive   <gimlet SP archive> \
@@ -76,10 +75,13 @@ Two RoT-image requirements make the emulated RoT boot to its sprot server:
   ROM shim it branches to an unmapped ROM pointer and faults.
 
 `SP_EMU_ROT_FLASH` gives a real emulated RoT so `rot_state` returns real data
-over the SP -> sprot -> RoT relay. For genuine bootleby A/B selection (rather than
-the fabricated boot-state handoff), also set `SP_EMU_ROT_BOOTLEBY` plus
-`SP_EMU_ROT_CMPA`/`SP_EMU_ROT_CFPA` (see the sp-emu README): bootleby now runs in
-the two-core serve mode and reports the actual selected slot over MGS.
+over the SP -> sprot -> RoT relay. Genuine bootleby A/B selection (rather than the
+fabricated boot-state handoff) is the default: sp-emu boots the RoT through real
+bootleby whenever it finds `bootleby-oxide-rot-1.zip` next to the RoT archive or
+under `$HUBRIS`, and reports the actual selected slot over MGS.
+`SP_EMU_ROT_BOOTLEBY` names one explicitly and `SP_EMU_ROT_NO_BOOTLEBY` opts out.
+The CMPA/CFPA need no override: the synthesized pages already satisfy bootleby's
+PFR validation.
 
 ## Ports and interfaces (combined SP + RoT setup)
 
@@ -109,7 +111,8 @@ Notes for planning a run that uses everything:
   the whole instance for its duration, so don't hold one open while faux-mgs runs.
 - **Ethernet.** MGS and ereport are UDP on loopback. faux-mgs on loopback needs
   `--sp-sim-addr <MGS addr>` (the `--interface`/`--discovery-addr` form fails with
-  "no interface name found for index 0"); the sp-test shim rewrites that for you.
+  "no interface name found for index 0"). sp-test picks that form itself from the
+  testbed's `kind`, so its own calls need no help.
 - **IPCC / host console.** The host-sp-comms link (UART7) is off by default. Set
   `SP_EMU_HOST_PTY=1` to expose it as a pty for serial tools
   (`faux-ipcc --port <pty> ...`; the pty path is logged at startup), or
@@ -125,7 +128,7 @@ validated via slot-seeding knobs (`SP_EMU_ROT_IMAGE_B`, `SP_EMU_ROT_ERASE_A`,
 `SP_EMU_ROT_BOOT_PREF`). The sp-test tests here wrap that as MGS-driven regressions:
 
 - `rot-boot-state`: read the RoT active slot + FWIDs over MGS. Passes today
-  end-to-end against sp-emu (sp-test -> faux-mgs shim -> SP -> sprot -> RoT).
+  end-to-end against sp-emu (sp-test -> faux-mgs -> SP -> sprot -> RoT).
 - `rot-ab-selection` (planned): assert the booted slot for A-only / B-only /
   both+preference / neither(panic) over MGS, using serve-mode bootleby.
 - `rot-transient-override` (planned): set the transient RAM preference, reset,

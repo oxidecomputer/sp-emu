@@ -201,10 +201,11 @@ pub fn serve(
         rc.wfi_throttle = false;
         let t = std::time::Instant::now();
         let dbgtrap = crate::sprot::dbg();
-        // Budget high enough for the dice-self startup to finish its DICE cert
-        // generation (PUF seed + several Ed25519 keygens/signs + SHA3) -- it
-        // breaks early on idle (WFI) once startup completes. Override with
-        // SP_EMU_ROT_PREBOOT.
+        // A safety cap: the loop normally stops the moment the RoT reaches its
+        // idle WFI (booted and waiting on the SP), well before this. The budget
+        // only bounds a RoT that never idles. It is high enough for the dice-self
+        // startup (PUF seed + several Ed25519 keygens/signs + SHA3) to run even if
+        // the idle break never comes. Override with SP_EMU_ROT_PREBOOT.
         let rot_preboot = crate::config::get().rot_preboot.unwrap_or(400_000_000);
         // Optional windowed instruction trace during preboot (where DICE runs),
         // SP_EMU_ROT_TRACE_FROM/TO as hex pc bounds.
@@ -214,11 +215,20 @@ pub fn serve(
         );
         rc.record_disasm |= pb_from.is_some();
         for _ in 0..rot_preboot {
+            rc.wfi_idle = false;
             let pc_before = rc.pc;
             if let Err(t) = rc.step(rb, host) {
                 if dbgtrap {
                     eprintln!("[rottrap-preboot] {:?}", t);
                 }
+                break;
+            }
+            // Ready to serve: the RoT reached its idle WFI (all tasks blocked,
+            // waiting on the SP over sprot). Stop now instead of running the rest
+            // of the budget in the idle loop, which pegs a core for seconds and
+            // scales with host speed. wfi_throttle is off in preboot, so idle_skip
+            // below never fires; wfi_idle is the throttle-independent signal.
+            if rc.wfi_idle {
                 break;
             }
             if let (Some(f), Some(t)) = (pb_from, pb_to) {
@@ -229,24 +239,38 @@ pub fn serve(
                     );
                 }
             }
-            // Spin detector: a `b .` self-branch (pc unchanged) is Hubris's panic/
-            // fault loop. Dump registers + on-stack return addresses to locate the
-            // panicking call site. Gated on SP_EMU_SPROTDBG.
-            if dbgtrap && rc.pc == pc_before {
+            // Spin detector: a `b .` self-branch (pc unchanged after a step) with
+            // no boot-ROM call in flight is Hubris's panic/fault loop. A healthy
+            // RoT instead reaches WFI and breaks above; the one other fixed-pc
+            // case, the boot ROM parking at AUTH_TRAP while `skboot_authenticate`
+            // settles, is excluded by the RomCall::Idle guard (it parks as
+            // Settling). End preboot at once rather than grinding the full budget,
+            // which is minutes of pegged CPU that block SP bring-up and read as a
+            // hang. Always report where; the register and stack dump stays behind
+            // SP_EMU_SPROTDBG.
+            if rc.pc == pc_before && matches!(rc.rom_call, crate::romapi::RomCall::Idle) {
                 eprintln!(
-                    "[rot-spin] stuck at pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
-                    rc.pc, rc.r[14], rc.r[13], rc.cycles
+                    "[rot] preboot: RoT is spinning at pc={:#010x} (a panic or \
+                     fault loop?); ending preboot. Set SP_EMU_SPROTDBG=1 for a \
+                     register and stack dump.",
+                    rc.pc
                 );
-                eprintln!("[rot-spin] r0..r7 = {:08x?}", &rc.r[0..8]);
-                let sp = rc.r[13];
-                for i in 0..64u32 {
-                    let v = rb.read32(sp.wrapping_add(i * 4));
-                    if (0x0001_0000..0x0002_0000).contains(&v) {
-                        eprintln!(
-                            "[rot-spin] stack[{:#010x}] = {:#010x}",
-                            sp.wrapping_add(i * 4),
-                            v
-                        );
+                if dbgtrap {
+                    eprintln!(
+                        "[rot-spin] stuck at pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
+                        rc.pc, rc.r[14], rc.r[13], rc.cycles
+                    );
+                    eprintln!("[rot-spin] r0..r7 = {:08x?}", &rc.r[0..8]);
+                    let sp = rc.r[13];
+                    for i in 0..64u32 {
+                        let v = rb.read32(sp.wrapping_add(i * 4));
+                        if (0x0001_0000..0x0002_0000).contains(&v) {
+                            eprintln!(
+                                "[rot-spin] stack[{:#010x}] = {:#010x}",
+                                sp.wrapping_add(i * 4),
+                                v
+                            );
+                        }
                     }
                 }
                 break;
