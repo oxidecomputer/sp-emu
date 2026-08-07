@@ -10,7 +10,7 @@ macro_rules! flag {
     ($name:ident, $field:ident) => {
         #[inline]
         pub fn $name() -> bool {
-            crate::config::get().$field
+            crate::config::get().$field()
         }
     };
 }

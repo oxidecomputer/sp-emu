@@ -55,7 +55,7 @@ impl HostIo for StdoutHost {
     }
 
     fn eth_tx(&mut self, frame: &[u8]) {
-        if crate::config::get().ethdbg {
+        if crate::config::get().ethdbg() {
             eprintln!(
                 "[eth-tx] {} bytes: {}",
                 frame.len(),

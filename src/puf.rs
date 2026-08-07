@@ -26,7 +26,7 @@ use crate::mem::Mmio;
 use std::collections::{HashMap, VecDeque};
 
 fn dbg() -> bool {
-    crate::config::get().pufdbg
+    crate::config::get().pufdbg()
 }
 
 // Register offsets from base 0x4003_B000 (lpc55-pac PUF RegisterBlock).

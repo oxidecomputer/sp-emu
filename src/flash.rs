@@ -447,7 +447,7 @@ impl Flash {
             sr2: 0,
             erase_irq: false,
             regs: HashMap::new(),
-            dbg: crate::config::get().flashdbg,
+            dbg: crate::config::get().flashdbg(),
         }
     }
 

@@ -53,10 +53,10 @@ use mem::Bus;
 /// so tools reach the emulated SP exactly as they would real hardware. The
 /// default `$SP_EMU_BRIDGE` port-offset mode is unchanged.
 fn make_host() -> Box<dyn HostIo> {
-    if config::get().well_known_ports {
+    if config::get().well_known_ports() {
         return make_well_known_host();
     }
-    match config::get().bridge.as_deref() {
+    match config::get().bridge() {
         Some(v) => {
             let bind = if v.is_empty() || v == "1" {
                 "[::1]:11111".to_string()
@@ -122,17 +122,17 @@ fn default_socket_ports(sidecar: bool) -> Vec<u16> {
 /// resolves against it, so a two-core instance (SP + RoT) lives under one directory
 /// and `pack` bundles it as a single tree regardless of where the RoT NVM sits.
 fn instance_anchor() -> String {
-    config::get().flash_path.clone()
+    config::get().flash_path().to_string()
 }
 
 /// The Hubris SP archive for this run: explicit `$SP_EMU_ARCHIVE`, else the archive
 /// recorded in the flash `.nv` file (resolved against the instance base). `None` when
 /// neither is available (a bare-image instance; see the flash-time warning).
 fn sp_archive() -> Option<String> {
-    if let Some(a) = config::get().archive.clone() {
-        return Some(a);
+    if let Some(a) = config::get().archive() {
+        return Some(a.to_string());
     }
-    let flash = config::get().flash_path.clone();
+    let flash = config::get().flash_path().to_string();
     let rel = flash::load_nv(&flash::nv_state_path(&flash)).archive?;
     Some(
         flash::instance_base(&flash)
@@ -146,7 +146,7 @@ fn sp_archive() -> Option<String> {
 /// `$SP_EMU_ARCHIVE` nor a flash `.nv` record): app.toml config falls back to
 /// board defaults and humility cannot attach. Silenced by `$SP_EMU_NO_ARCHIVE_WARN`.
 fn warn_if_no_sp_archive() {
-    if sp_archive().is_none() && !config::get().no_archive_warn {
+    if sp_archive().is_none() && !config::get().no_archive_warn() {
         eprintln!(
             "[sp-emu] WARNING: no Hubris SP archive for this instance (flashed from a \
              bare image?). SP Ethernet ports fall back to board defaults and humility \
@@ -160,22 +160,22 @@ fn make_well_known_host() -> Box<dyn HostIo> {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
     let cfg = config::get();
-    let sidecar = cfg.board.is_sidecar();
-    let parse_ip = |s: &Option<String>| -> Option<IpAddr> {
-        s.as_deref().and_then(|s| s.parse().ok())
+    let sidecar = cfg.board().is_sidecar();
+    let parse_ip = |s: Option<&str>| -> Option<IpAddr> {
+        s.and_then(|s| s.parse().ok())
     };
 
     // switch0 view: $SP_EMU_ADDR0 (default ::1). switch1 view: $SP_EMU_ADDR1 if
     // set (a distinct address, since both views bind the same real ports).
-    let addr0 = parse_ip(&cfg.addr0).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    let addr0 = parse_ip(cfg.addr0()).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
     let (def0, def1) = if sidecar {
         (bridge::VID_SIDECAR0, bridge::VID_SWITCH1)
     } else {
         (bridge::VID_SWITCH0, bridge::VID_SWITCH1)
     };
-    let mut views = vec![(SocketAddr::new(addr0, 0), cfg.vid0.unwrap_or(def0))];
-    if let Some(addr1) = parse_ip(&cfg.addr1) {
-        views.push((SocketAddr::new(addr1, 0), cfg.vid1.unwrap_or(def1)));
+    let mut views = vec![(SocketAddr::new(addr0, 0), cfg.vid0().unwrap_or(def0))];
+    if let Some(addr1) = parse_ip(cfg.addr1()) {
+        views.push((SocketAddr::new(addr1, 0), cfg.vid1().unwrap_or(def1)));
     }
 
     // Prefer the socket set the flashed image actually declares (its app.toml):
@@ -206,7 +206,7 @@ fn make_well_known_host() -> Box<dyn HostIo> {
 }
 
 fn nvm_path() -> String {
-    config::instance_file("SP_EMU_FLASH", &config::get().flash_path)
+    config::instance_file("SP_EMU_FLASH", config::get().flash_path())
 }
 
 /// Log where this instance keeps its persistent state (flash images, identity, stowed
@@ -272,7 +272,7 @@ fn main() -> Result<()> {
     // rather than falling through to usage and exiting as if an instance had started.
     let cmd: Option<&str> = match args.first() {
         Some(c) => Some(c.as_str()),
-        None => match config::get().mode.as_deref() {
+        None => match config::get().mode() {
             None => None,
             Some(m @ ("run" | "gdb")) => Some(m),
             Some(other) => bail!(
@@ -287,7 +287,7 @@ fn main() -> Result<()> {
     ) {
         announce_state_dir();
     }
-    identity::init(config::get().seed.as_deref())?;
+    identity::init(config::get().seed())?;
     match cmd {
         Some("flash") => cmd_flash(sub_args),
         Some("erase") => cmd_erase(sub_args),
@@ -508,13 +508,13 @@ fn cmd_run(args: &[String]) -> Result<()> {
     // so a run can be described entirely by sp-emu.toml (SP_EMU_SLOT / SP_EMU_RUN_MAX).
     let cfg = config::get();
     if !slot_given {
-        if let Some(s) = cfg.boot_slot.as_deref() {
+        if let Some(s) = cfg.boot_slot() {
             slot = slot_arg(s)?;
             slot_given = true;
         }
     }
     if !max_given {
-        if let Some(m) = cfg.run_max {
+        if let Some(m) = cfg.run_max() {
             max = m;
         }
     }
@@ -565,7 +565,7 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
     }
     // Fall back to SP_EMU_SLOT (config file / environment) when no a|b positional given.
     if !slot_given {
-        if let Some(s) = config::get().boot_slot.as_deref() {
+        if let Some(s) = config::get().boot_slot() {
             slot = slot_arg(s)?;
             slot_given = true;
         }
@@ -606,8 +606,8 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     // RoT bridge: either a shared rot-service over IPC (SP_EMU_ROT_SERVICE, no
     // in-process RoT core), or an in-process RoT core (SP_EMU_ROT_FLASH, the
     // two-core path). The service wins if both are set.
-    let rot_service = config::get().rot_service.clone();
-    let rot_flash = config::get().rot_flash.clone();
+    let rot_service = config::get().rot_service();
+    let rot_flash = config::get().rot_flash();
     if rot_service.is_some() || rot_flash.is_some() {
         sprot::enable();
     }
@@ -627,7 +627,7 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     };
     let rot_client = rot_service.map(|a| {
         eprintln!("[rot] SP_EMU_ROT_SERVICE={a}");
-        rot_service::RotClient::connect(&a)
+        rot_service::RotClient::connect(a)
     });
     let mut host = make_host();
     gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
@@ -659,7 +659,7 @@ fn record_rot_archives(slot_a: &str) {
                 }
             }
         } else {
-            if !cfg.no_archive_warn {
+            if !cfg.no_archive_warn() {
                 eprintln!(
                     "[rot] WARNING: {region} loaded from a bare image (no Hubris \
                      archive); humility cannot attach to it. Provide a Hubris build \
@@ -672,8 +672,7 @@ fn record_rot_archives(slot_a: &str) {
     let meta = flash::RotMeta {
         slot_a_archive: stow(slot_a, "rot-a", "RoT slot A"),
         slot_b_archive: cfg
-            .rot_image_b
-            .as_deref()
+            .rot_image_b()
             .and_then(|b| stow(b, "rot-b", "RoT slot B")),
         stage0_archive: config::rot_bootleby_path()
             .as_deref()
@@ -719,7 +718,7 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // graph and trap `skboot_authenticate` so the RoT pre-kernel's
     // authenticate_image() runs the real signature check. Off by
     // default -- the direct-boot path above is unchanged.
-    if config::get().rot_rom {
+    if config::get().rot_rom() {
         cpu.rom_traps = true;
         bus.rom_enabled = true;
         eprintln!("[rot] boot-ROM API emulation enabled (skboot_authenticate)");
@@ -829,7 +828,7 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
 /// stage0/bootleby so the identity binds to the actual FWID) is future work; see
 /// doc/dice-handoff.md.
 fn publish_dice_handoff(bus: &mut Bus) {
-    let Some(dir) = config::get().rot_dice.clone() else {
+    let Some(dir) = config::get().rot_dice() else {
         return;
     };
     // DICE_RANGE = 0x4010_0000..0x4010_2000: CertData at start (CERTS_RANGE),
@@ -882,7 +881,7 @@ fn cmd_rot(args: &[String]) -> Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(20_000_000);
     let (mut cpu, mut bus) = build_rot_core(&image)?;
-    let trace = config::get().trace;
+    let trace = config::get().trace();
     cpu.record_disasm = trace;
     let mut host = make_host();
     let mut stopped = false;
@@ -987,7 +986,7 @@ const RFD568_SKIP_TOKEN: u32 = 0x9f38_bd71;
 /// SP_EMU_ROT_MEASURE selects flows 1/3 (let the RoT measure, or loop); its
 /// absence selects flow 2.
 fn deposit_skip_token_if_debugger(bus: &mut Bus) {
-    if !config::get().rot_measure {
+    if !config::get().rot_measure() {
         bus.write32(RFD568_TOKEN_ADDR, RFD568_SKIP_TOKEN);
     }
 }
@@ -996,16 +995,15 @@ fn deposit_skip_token_if_debugger(bus: &mut Bus) {
 /// `max` == 0 runs until a trap/halt (serve MGS forever); otherwise it caps the
 /// instruction count. `swap_override` selects the initial boot bank (see `setup`).
 fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
-    let trace = config::get().trace;
-    let (twin_from, twin_to) = (config::get().trace_from, config::get().trace_to);
+    let trace = config::get().trace();
+    let (twin_from, twin_to) = (config::get().trace_from(), config::get().trace_to());
     let (mut cpu, mut bus) = setup(image, swap_override)?;
     let mut host = make_host();
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
     use std::io::Write;
     let mut diff = config::get()
-        .diff
-        .clone()
+        .diff()
         .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("diff file")));
     bus.rec = diff.is_some();
     // Per-instruction disasm formatting is a heap alloc; only enable it when a

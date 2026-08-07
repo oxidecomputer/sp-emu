@@ -200,7 +200,7 @@ impl Default for Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        let watch = crate::config::get().watch;
+        let watch = crate::config::get().watch();
         Bus {
             rams: Vec::new(),
             devs: Vec::new(),

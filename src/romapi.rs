@@ -110,7 +110,7 @@ pub fn rom_dispatch(cpu: &mut Cpu, bus: &mut Bus) {
             let start = cpu.r[0];
             let is_verified_ptr = cpu.r[1];
             let result = verify_slot(bus, start);
-            if crate::config::get().romdbg {
+            if crate::config::get().romdbg() {
                 match &result {
                     Ok(()) => {
                         eprintln!("[rom] skboot_authenticate(start={start:#010x}) -> OK")

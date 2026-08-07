@@ -48,8 +48,8 @@ impl I2cBridge {
     /// DEVICE (`SP_EMU_I2C_DEVICE`) takes priority over SNIFF
     /// (`SP_EMU_I2C_BRIDGE`); neither set -> a disabled no-op bridge.
     pub fn from_env() -> Self {
-        if let Some(addr) = crate::config::get().i2c_device.clone() {
-            match TcpStream::connect(&addr) {
+        if let Some(addr) = crate::config::get().i2c_device() {
+            match TcpStream::connect(addr) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
                     // Bounds on_read()'s blocking wait so a hung device server
@@ -67,8 +67,8 @@ impl I2cBridge {
                 }
             }
         }
-        if let Some(addr) = crate::config::get().i2c_bridge.clone() {
-            match TcpStream::connect(&addr) {
+        if let Some(addr) = crate::config::get().i2c_bridge() {
+            match TcpStream::connect(addr) {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
                     eprintln!("[i2c-sniff] connected to {addr}");

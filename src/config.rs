@@ -42,6 +42,39 @@ impl Board {
     }
 }
 
+/// Emit a read-only getter for one config knob. Config is read only through
+/// these accessors (never raw fields), so the resolved value cannot be mutated
+/// into an invalid state after `init`. The return type follows the field type:
+/// `String` lends a `&str`, `Option<String>` an `Option<&str>`, and everything
+/// else (all `Copy`: bools, numbers, `Board`, `Option<Copy>`) returns by value.
+/// The kind marker in the `config!` row selects the borrowing forms; unmarked
+/// rows take the `Copy` default.
+///
+/// A non-`Copy` knob (`String`, `Option<String>`) needs a `[str]`/`[ostr]`
+/// marker on its row. Without one it takes the `Copy`-default arm, which fails
+/// to compile with `cannot move out of ... behind a shared reference`: the fix
+/// is to mark the row, not to change the getter.
+macro_rules! config_getter {
+    ([str] $doc:expr, $field:ident : $ty:ty) => {
+        #[doc = $doc]
+        pub fn $field(&self) -> &str {
+            &self.$field
+        }
+    };
+    ([ostr] $doc:expr, $field:ident : $ty:ty) => {
+        #[doc = $doc]
+        pub fn $field(&self) -> Option<&str> {
+            self.$field.as_deref()
+        }
+    };
+    ($doc:expr, $field:ident : $ty:ty) => {
+        #[doc = $doc]
+        pub fn $field(&self) -> $ty {
+            self.$field
+        }
+    };
+}
+
 /// Declare the whole configuration as one table. Each row is
 ///
 /// ```text
@@ -59,14 +92,16 @@ macro_rules! config {
     (
         seed = $seed:ident,
         $(
-            $field:ident : $ty:ty = $env:literal => |$raw:ident| $resolve:expr
+            $([$kind:ident])? $field:ident : $ty:ty = $env:literal => |$raw:ident| $resolve:expr
         ),* $(,)?
     ) => {
         /// The resolved, vetted configuration for this process. Read-only after
-        /// `init`; every field is resolved before any subsystem is built.
+        /// `init`; every field is resolved before any subsystem is built. Fields are
+        /// private and read only through the per-knob getters (see `config_getter!`),
+        /// so config is never accessed as raw data outside this module.
         #[derive(Clone, Debug)]
         pub struct Config {
-            $( pub $field: $ty, )*
+            $( $field: $ty, )*
             /// The raw `(SP_EMU_NAME, value)` inputs that were explicitly present
             /// (from the environment or a config file), in declaration order. Drives
             /// the `set`/`default` marker and the round-trippable config file.
@@ -114,6 +149,17 @@ macro_rules! config {
                 )*
                 out
             }
+
+            // A read-only getter per knob (see `config_getter!`). Config is read
+            // only through these, never as raw fields.
+            $(
+                config_getter!(
+                    $([$kind])? concat!(
+                        "Resolved `", $env, "`. See the `config!` row for the knob's semantics."
+                    ),
+                    $field: $ty
+                );
+            )*
         }
     };
 }
@@ -122,17 +168,17 @@ config! {
     seed = seed_override,
 
     // ---- state file paths (written to the working directory by default) ----
-    flash_path: String = "SP_EMU_FLASH" => |v| v.unwrap_or_else(|| "sp-flash.bin".to_string()),
-    rot_nvm_path: String = "SP_EMU_ROT_NVM" => |v| v.unwrap_or_else(|| "sp-rot-flash.bin".to_string()),
-    identity_path: String = "SP_EMU_IDENTITY" => |v| v.unwrap_or_else(|| "sp-emu-identity".to_string()),
+    [str] flash_path: String = "SP_EMU_FLASH" => |v| v.unwrap_or_else(|| "sp-flash.bin".to_string()),
+    [str] rot_nvm_path: String = "SP_EMU_ROT_NVM" => |v| v.unwrap_or_else(|| "sp-rot-flash.bin".to_string()),
+    [str] identity_path: String = "SP_EMU_IDENTITY" => |v| v.unwrap_or_else(|| "sp-emu-identity".to_string()),
     // Directory for this instance's persistent state (flash images, .nv companions,
     // identity, stowed archives) when SP_EMU_FLASH/ROT_NVM/IDENTITY are not given
     // explicitly. Unset means a per-user default under XDG_STATE_HOME or
     // ~/.local/state, so a bare run does not write into the working directory.
-    state_dir: Option<String> = "SP_EMU_STATE_DIR" => |v| v,
+    [ostr] state_dir: Option<String> = "SP_EMU_STATE_DIR" => |v| v,
 
     // ---- instance identity (the --seed flag wins over $SP_EMU_SEED) ----
-    seed: Option<String> = "SP_EMU_SEED" => |v| seed_override.clone().or(v),
+    [ostr] seed: Option<String> = "SP_EMU_SEED" => |v| seed_override.clone().or(v),
 
     // ---- operation: what to run when no subcommand / positional is on the CLI ----
     // These let one config file describe a whole instance, so `sp-emu --load-config
@@ -141,10 +187,10 @@ config! {
     //
     // `mode` is the subcommand to run when the command line names none: "run" (the
     // serve-forever mode sp-test uses) or its "gdb" alias. Unset prints usage, as before.
-    mode: Option<String> = "SP_EMU_MODE" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] mode: Option<String> = "SP_EMU_MODE" => |v| v.filter(|s| !s.is_empty()),
     // Boot slot for `run`/`gdb` when no a|b positional is given; unset honors the
     // persisted swap bank.
-    boot_slot: Option<String> = "SP_EMU_SLOT" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] boot_slot: Option<String> = "SP_EMU_SLOT" => |v| v.filter(|s| !s.is_empty()),
     // Instruction budget for `run` when no numeric positional is given: 0 serves
     // forever (the instance mode), nonzero is a bounded batch. Unset uses the default.
     run_max: Option<u64> = "SP_EMU_RUN_MAX" => |v| v.and_then(|s| s.parse().ok()),
@@ -208,40 +254,40 @@ config! {
     // serial; override them so an emulated SP is not mistaken for real hardware
     // in inventory. Serial and part are capped at 11 characters by the 0XV2
     // barcode format.
-    vpd_serial: Option<String> = "SP_EMU_VPD_SERIAL" => |v| v.filter(|s| !s.is_empty()),
-    vpd_part: Option<String> = "SP_EMU_VPD_PART" => |v| v.filter(|s| !s.is_empty()),
-    vpd_rev: Option<String> = "SP_EMU_VPD_REV" => |v| v.filter(|s| !s.is_empty()),
-    host_uart: Option<String> = "SP_EMU_HOST_UART" => |v| v,
+    [ostr] vpd_serial: Option<String> = "SP_EMU_VPD_SERIAL" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] vpd_part: Option<String> = "SP_EMU_VPD_PART" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] vpd_rev: Option<String> = "SP_EMU_VPD_REV" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] host_uart: Option<String> = "SP_EMU_HOST_UART" => |v| v,
     // addr; empty treated as unset
-    rot_service: Option<String> = "SP_EMU_ROT_SERVICE" => |v| v.filter(|s| !s.is_empty()),
-    rot_flash: Option<String> = "SP_EMU_ROT_FLASH" => |v| v,
+    [ostr] rot_service: Option<String> = "SP_EMU_ROT_SERVICE" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] rot_flash: Option<String> = "SP_EMU_ROT_FLASH" => |v| v,
     // Path to a real bootleby image: load it at flash base 0x0 and boot IT (secure
     // aliases + boot-ROM API on), so bootleby does genuine A/B selection.
-    rot_bootleby: Option<String> = "SP_EMU_ROT_BOOTLEBY" => |v| v,
+    [ostr] rot_bootleby: Option<String> = "SP_EMU_ROT_BOOTLEBY" => |v| v,
     // Real device CMPA/CFPA pages (512 bytes each) to seed instead of the synthesized
     // ones, so real bootleby's PFR validation passes.
-    rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
-    rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
+    [ostr] rot_cmpa: Option<String> = "SP_EMU_ROT_CMPA" => |v| v,
+    [ostr] rot_cfpa: Option<String> = "SP_EMU_ROT_CFPA" => |v| v,
     // A captured NMPA region (up to ten 512-byte pages) laid down at 0x9_EC00,
     // replacing the bundled one. Its own device UUID is kept, unlike the bundled
     // pages, whose zeroed UUID field is filled in per instance.
-    rot_nmpa: Option<String> = "SP_EMU_ROT_NMPA" => |v| v,
+    [ostr] rot_nmpa: Option<String> = "SP_EMU_ROT_NMPA" => |v| v,
     // Opt out of booting through real bootleby (see config::rot_bootleby_path).
     rot_no_bootleby: bool = "SP_EMU_ROT_NO_BOOTLEBY" => |v| v.is_some(),
     // A slot-B image (flash.b, 0x50000) to seed alongside slot A, so real bootleby
     // can perform genuine A/B selection. Absent => slot B left erased/invalid.
-    rot_image_b: Option<String> = "SP_EMU_ROT_IMAGE_B" => |v| v,
+    [ostr] rot_image_b: Option<String> = "SP_EMU_ROT_IMAGE_B" => |v| v,
     // Leave slot A (flash.a, 0x10000) erased instead of seeding the passed image, to
     // drive bootleby's B-only and neither(panic) selection cases.
     rot_erase_a: bool = "SP_EMU_ROT_ERASE_A" => |v| v.is_some(),
     // Persistent CFPA boot preference for the synthesized CFPA: "b" prefers slot B,
     // otherwise slot A. Ignored when SP_EMU_ROT_CFPA overrides the page.
-    rot_boot_pref: Option<String> = "SP_EMU_ROT_BOOT_PREF" => |v| v,
-    rot_dice: Option<String> = "SP_EMU_ROT_DICE" => |v| v,
-    archive: Option<String> = "SP_EMU_ARCHIVE" => |v| v,
-    diff: Option<String> = "SP_EMU_DIFF" => |v| v,
-    dump_dir: Option<String> = "SP_EMU_DUMP_DIR" => |v| v,
-    sensors: Option<String> = "SP_EMU_SENSORS" => |v| v,
+    [ostr] rot_boot_pref: Option<String> = "SP_EMU_ROT_BOOT_PREF" => |v| v,
+    [ostr] rot_dice: Option<String> = "SP_EMU_ROT_DICE" => |v| v,
+    [ostr] archive: Option<String> = "SP_EMU_ARCHIVE" => |v| v,
+    [ostr] diff: Option<String> = "SP_EMU_DIFF" => |v| v,
+    [ostr] dump_dir: Option<String> = "SP_EMU_DUMP_DIR" => |v| v,
+    [ostr] sensors: Option<String> = "SP_EMU_SENSORS" => |v| v,
     watch: Option<u32> = "SP_EMU_WATCH" => |v| {
         v.and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
     },
@@ -253,11 +299,11 @@ config! {
     // the caller applies its own default (gdb 400M, rot-service 40M)
     rot_preboot: Option<u64> = "SP_EMU_ROT_PREBOOT" => |v| v.and_then(|s| s.parse().ok()),
     // raw: parsed three ways (MGS addr, gdb port offset, soc index)
-    bridge: Option<String> = "SP_EMU_BRIDGE" => |v| v,
+    [ostr] bridge: Option<String> = "SP_EMU_BRIDGE" => |v| v,
 
     // ---- well-known-port host bridge (each caller applies its own default) ----
-    addr0: Option<String> = "SP_EMU_ADDR0" => |v| v,
-    addr1: Option<String> = "SP_EMU_ADDR1" => |v| v,
+    [ostr] addr0: Option<String> = "SP_EMU_ADDR0" => |v| v,
+    [ostr] addr1: Option<String> = "SP_EMU_ADDR1" => |v| v,
     vid0: Option<u16> = "SP_EMU_VID0" => |v| {
         v.and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
     },
@@ -266,8 +312,8 @@ config! {
     },
 
     // ---- companion I2C bridge (empty treated as unset) ----
-    i2c_bridge: Option<String> = "SP_EMU_I2C_BRIDGE" => |v| v.filter(|s| !s.is_empty()),
-    i2c_device: Option<String> = "SP_EMU_I2C_DEVICE" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] i2c_bridge: Option<String> = "SP_EMU_I2C_BRIDGE" => |v| v.filter(|s| !s.is_empty()),
+    [ostr] i2c_device: Option<String> = "SP_EMU_I2C_DEVICE" => |v| v.filter(|s| !s.is_empty()),
 
     // ---- windowed instruction traces (diagnostics; None = off) ----
     trace_from: Option<u64> = "SP_EMU_TRACE_FROM" => |v| v.and_then(|s| s.parse().ok()),
@@ -321,10 +367,10 @@ config! {
     pumpstats_ms: u64 = "SP_EMU_PUMPSTATS_MS" => |v| v.and_then(|s| s.parse().ok()).unwrap_or(50),
     // trim before parsing, matching the historical read (a padded value parsed)
     ambient_c: f32 = "SP_EMU_AMBIENT_C" => |v| v.and_then(|s| s.trim().parse().ok()).unwrap_or(30.0),
-    ignition: String = "SP_EMU_IGNITION" => |v| {
+    [str] ignition: String = "SP_EMU_IGNITION" => |v| {
         v.unwrap_or_else(|| "0:gimlet,1:sidecar,2:gimlet,3:gimlet".to_string())
     },
-    dump_archive_id: String = "SP_EMU_DUMP_ARCHIVE_ID" => |v| v.unwrap_or_default(),
+    [str] dump_archive_id: String = "SP_EMU_DUMP_ARCHIVE_ID" => |v| v.unwrap_or_default(),
 }
 
 /// Meta variables `--dump-config` does not persist: `SP_EMU_CONFIGDBG` is a debug
