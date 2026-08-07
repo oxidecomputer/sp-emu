@@ -1,6 +1,6 @@
 [package]
 name = "sp-emu"
-version = "0.0.1"
+version = "1.1.0"
 edition = "2021"
 default-run = "sp-emu"
 description = "Native-Rust Cortex-M emulator for booting Oxide Hubris on emulated SPs/RoTs"
@@ -12,6 +12,17 @@ object = { version = "0.36", default-features = false, features = ["read", "elf"
 anyhow = "1"
 zip = { version = "2", default-features = false, features = ["bzip2", "deflate"] }
 sha3 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
+# RoT protected-flash-region page layout (CMPA/CFPA) reused from the Oxide signing
+# tooling rather than hand-rolled. Pulls the CLI deps (clap) today; that is fixed
+# upstream, not locally (see the lighter-weight-integration bead).
+lpc55_areas = { git = "https://github.com/oxidecomputer/lpc55_support", version = "0.2" }
+# Host-side LPC55 secure-boot verifier (cert chain -> RKTH, RSA/SHA-256), reused to
+# back the emulated boot-ROM skboot_authenticate instead of hand-rolling crypto.
+# default-features=false leaves out its optional clap, matching hubtools.
+lpc55_sign = { git = "https://github.com/oxidecomputer/lpc55_support", version = "0.3", default-features = false }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+libc = "0.2"
 
 [profile.release]
 debug = true

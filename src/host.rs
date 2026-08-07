@@ -21,17 +21,25 @@ pub trait HostIo {
 
     /// Pop one already-queued Ethernet frame for the SP, if any. Does NOT poll
     /// the host (call `eth_poll` first). The default has none.
-    fn eth_rx(&mut self) -> Option<Vec<u8>> { None }
+    fn eth_rx(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 
     /// A byte the emulated SP wrote to the host-facing UART (UART7 / the
     /// `host_sp_comms` link to the host CPU - IPCC + host console). The default
-    /// drops it; the bridge forwards it to the host over a socket (the propolis
-    /// IPCC COM port).
+    /// drops it; the bridge queues it and forwards it in `host_uart_flush`.
     fn host_uart_tx(&mut self, _byte: u8) {}
+
+    /// Deliver any queued host-UART TX bytes to the host. Called once per pump so
+    /// bytes that could not be written immediately (WouldBlock) are retried
+    /// rather than dropped. Default: nothing queued.
+    fn host_uart_flush(&mut self) {}
 
     /// Pop one byte the host sent toward the SP over the host-facing UART, if any.
     /// The default has none.
-    fn host_uart_rx(&mut self) -> Option<u8> { None }
+    fn host_uart_rx(&mut self) -> Option<u8> {
+        None
+    }
 }
 
 /// Default host: forward emulated console bytes to stdout. Ethernet frames
@@ -47,9 +55,17 @@ impl HostIo for StdoutHost {
     }
 
     fn eth_tx(&mut self, frame: &[u8]) {
-        if std::env::var("SP_EMU_ETHDBG").is_ok() {
-            eprintln!("[eth-tx] {} bytes: {}", frame.len(),
-                frame.iter().take(48).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""));
+        if crate::config::get().ethdbg {
+            eprintln!(
+                "[eth-tx] {} bytes: {}",
+                frame.len(),
+                frame
+                    .iter()
+                    .take(48)
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join("")
+            );
         }
     }
 }

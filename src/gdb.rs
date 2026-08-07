@@ -1,257 +1,181 @@
-//! Minimal GDB Remote Serial Protocol (RSP) server for humility to attach to
-//! the running emulated SP and inspect it.
+//! Run-forever serve loop for the emulated SP (and, in the two-core setup, an
+//! in-process RoT), plus a debug port for humility.
 //!
-//! humility's GDB core (humility-probes-core/src/gdb.rs) connects to
-//! 127.0.0.1:3333, speaks RSP, and is read-only — it sends `qSupported`,
-//! `m addr,len` (read memory), `p reg` (read register), `c` (continue), and a
-//! raw 0x03 byte (halt). It never writes target state. A server answering
-//! those reads lets `humility tasks` / `dump` / `ringbuf` work against sp-emu.
+//! The debug transport is the Glasgow SWD probe (`crate::glasgow`): a stock
+//! humility (probe-rs) attaches to it via a `20b7:9db1:tcp:127.0.0.1:<port>`
+//! selector, which drives halt/run/step/read/write over an emulated SWD DP/AP.
+//! The older GDB-RSP (`-p ocdgdb`) and OpenOCD (`-p ocd`) transports this module
+//! used to serve were dropped once humility removed those probe backends.
 //!
-//! Ack discipline (matched to humility's `recv`):
-//!  - a data response to a `$..#xx` command is `+` then `$payload#xx`,
-//!  - `c` (continue) is answered with a bare `+`,
-//!  - the 0x03 halt is answered with a stop reply `$S05#xx` (no leading `+`).
+//! Between connections the emulator keeps running, so time advances across a
+//! series of humility commands, and the MGS bridge (`crate::bridge`) stays live
+//! for faux-mgs / sp-test.
 
 use crate::cpu::Cpu;
 use crate::host::HostIo;
 use crate::mem::Bus;
 use anyhow::Result;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 
-/// One message pulled off the wire.
-enum Msg {
-    Interrupt,       // raw 0x03 — halt request
-    Packet(String),  // a `$payload#xx` command (payload only)
+/// Safety bound on prompt-halt servicing: iterations the serve loop will freeze the
+/// SP waiting for the RoT to halt it after a self-reset. Generous (the RoT only needs
+/// to take its SP_RESET IRQ and run its handler); a backstop so an armed-but-unhalting
+/// RoT can never wedge the SP, which then resumes free-running as it would today.
+const SP_RESET_HALT_ITERS: u32 = 1000;
+
+/// SP burst while it runs endoscope under debug, when endoscope coupling is on: a
+/// bounded chunk so the SP does not finish the hash in one iteration, letting the RoT
+/// interleave and poll while its clock is advanced by the SP's progress.
+const ENDOSCOPE_BURST: u32 = 65_536;
+/// Coupling off: sprint through endoscope in one iteration so the SP halts before the
+/// RoT (whose timer is frozen meanwhile) can time out.
+const ENDOSCOPE_SPRINT: u32 = 20_000_000;
+
+/// Instructions the SP may run this serve-loop iteration, in priority order: a
+/// debug-halted core is not stepped; a self-reset being serviced freezes the SP at
+/// its reset vector so the RoT halts it before it runs reset-vector work; a core
+/// running an injected program under debug (endoscope, after the RoT resumed it) runs
+/// `endoscope_burst` (a bounded chunk when coupling, else a one-shot sprint); a phase-2
+/// sprot reply uses a small burst so the SP never clocks past the RoT's refill;
+/// otherwise the full eth-service quantum.
+fn sp_burst_for(
+    halted: bool,
+    sp_reset_servicing: bool,
+    debug_en: bool,
+    replying: bool,
+    quantum: u32,
+    endoscope_burst: u32,
+) -> u32 {
+    // Freeze the SP (burst 0) when it is debug-halted (only the RoT may move it) or
+    // when a self-reset is being serviced (hold it at the reset vector until the RoT
+    // halts it). The remaining cases run it.
+    if halted || sp_reset_servicing {
+        0
+    } else if debug_en {
+        endoscope_burst
+    } else if replying {
+        48
+    } else {
+        quantum
+    }
 }
 
-/// Pull the next complete message out of `buf`, discarding bare `+`/`-` acks and
-/// junk. Returns None if only a partial packet is buffered (wait for more bytes).
-fn take_message(buf: &mut Vec<u8>) -> Option<Msg> {
-    loop {
-        match buf.first().copied() {
-            None => return None,
-            Some(0x03) => { buf.remove(0); return Some(Msg::Interrupt); }
-            Some(b'+') | Some(b'-') => { buf.remove(0); } // ack — skip
-            Some(b'$') => {
-                let hash = buf.iter().position(|&c| c == b'#')?;
-                if buf.len() < hash + 3 { return None; } // checksum bytes not here yet
-                let payload = String::from_utf8_lossy(&buf[1..hash]).into_owned();
-                buf.drain(0..hash + 3);
-                return Some(Msg::Packet(payload));
+/// Convert an endoscope cycle delta into whole milliseconds of RoT credit, carrying the
+/// sub-millisecond remainder so long runs accumulate exactly. `acc` is the running
+/// fractional accumulator (leftover SP cycles from prior iterations), `d_cycles` the SP
+/// instructions retired since the last iteration, `divisor` the SP clock in instructions
+/// per ms (must be nonzero; callers use `tick_divisor` or the config SP clock, both
+/// positive), and `cap` the per-iteration credit ceiling. Returns the whole-ms credit to
+/// add this iteration and the new accumulator.
+fn endoscope_credit(acc: u64, d_cycles: u64, divisor: u64, cap: u32) -> (u32, u64) {
+    let total = acc + d_cycles;
+    let ms = (total / divisor).min(cap as u64) as u32;
+    (ms, total % divisor)
+}
+
+/// Whether a genuine SP self-reset should enter prompt-halt servicing. Only once the
+/// RoT is watching (its swd task armed SP_RESET, `rot_armed`); not if the SP is
+/// already halted (a vector catch caught the reset). While the RoT is unarmed (early
+/// boot), the SP's measurement loop must keep free-running, so this stays false.
+fn enter_sp_reset_service(sp_reset_edge: bool, rot_armed: bool, sp_halted: bool) -> bool {
+    sp_reset_edge && rot_armed && !sp_halted
+}
+
+/// Advance prompt-halt servicing by one iteration. Cleared once the RoT takes control
+/// (halted the SP, or resumed it under debug for endoscope), or when the safety bound
+/// is exhausted (the RoT never halted: give up and free-run). Returns whether
+/// servicing is still active; decrements `iters` only on the still-waiting path.
+fn continue_sp_reset_service(
+    servicing: bool,
+    sp_halted: bool,
+    sp_debug_en: bool,
+    iters: &mut u32,
+) -> bool {
+    if !servicing || sp_halted || sp_debug_en {
+        return false;
+    }
+    *iters = iters.saturating_sub(1);
+    *iters != 0
+}
+
+// JTAG_DETECT (SP_TO_ROT_JTAG_DETECT_L): the RoT input an SP SWD probe asserts. PINT
+// slot 1 -> NVIC IRQ 5 (the sibling of SP_RESET's slot 0 -> IRQ 4). The slot bit is
+// written into the flat PINT RegFile at the same register SP_RESET uses; the level
+// (PIO0_20) is synthesized separately in LpcGpio from `SprotLink::jtag_detect`.
+const JTAG_DETECT_IRQ: u16 = 5;
+const JTAG_DETECT_PINT_REG: u32 = 0x4000_4020;
+const JTAG_DETECT_PINT_BIT: u32 = 1 << 1; // PINT slot 1
+/// Bound on the pre-glasgow RoT pump: iterations to step the RoT so its swd task can
+/// service a just-delivered JTAG_DETECT edge (invalidate the attestation log) before
+/// glasgow::serve freezes the RoT for the session. Generous; the handler is short.
+const JTAG_PUMP_ITERS: u32 = 200;
+
+/// Deliver a JTAG_DETECT falling edge to the RoT, if its firmware has armed the IRQ.
+/// Sets the PINT slot-1 detect bit (OR, so a coincident SP_RESET slot-0 bit survives)
+/// and pends IRQ 5. Returns whether it injected: `false` when the firmware has not
+/// enabled JTAG_DETECT (e.g. an older RoT image), so the whole feature stays inert.
+fn inject_jtag_detect(rb: &mut Bus) -> bool {
+    if !rb.irq_enabled(JTAG_DETECT_IRQ) {
+        return false;
+    }
+    let cur = rb.read32(JTAG_DETECT_PINT_REG);
+    rb.write32(JTAG_DETECT_PINT_REG, cur | JTAG_DETECT_PINT_BIT);
+    rb.pend_irq(JTAG_DETECT_IRQ);
+    true
+}
+
+/// Step the RoT until it goes idle again or a bounded cap, so a just-pended
+/// notification (JTAG_DETECT) is serviced before the caller freezes the RoT.
+fn pump_rot_briefly(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, quantum: u32) {
+    for _ in 0..JTAG_PUMP_ITERS {
+        let mut idled = false;
+        for _ in 0..quantum {
+            if rc.step(rb, host).is_err() {
+                return;
             }
-            Some(_) => { buf.remove(0); } // stray byte — skip
-        }
-    }
-}
-
-/// Frame a payload as `$payload#xx` with the RSP modulo-256 checksum.
-fn frame(payload: &str) -> Vec<u8> {
-    let cksum: u32 = payload.bytes().map(|b| b as u32).sum::<u32>() & 0xff;
-    format!("${}#{:02x}", payload, cksum).into_bytes()
-}
-
-/// 32-bit value as little-endian hex (target byte order), the way GDB sends
-/// register/word values: 0x12345678 -> "78563412".
-fn le_hex32(v: u32) -> String {
-    v.to_le_bytes().iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Reply with data: ack the command (`+`) then the response packet.
-fn reply_data(s: &mut TcpStream, payload: &str) -> Result<()> {
-    s.write_all(b"+")?;
-    s.write_all(&frame(payload))?;
-    Ok(())
-}
-
-fn parse_m(p: &str) -> Option<(u32, u32)> {
-    let rest = &p[1..];
-    let (a, l) = rest.split_once(',')?;
-    Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(l, 16).ok()?))
-}
-
-/// Handle one command packet. Returns true if the target should resume running.
-fn handle(s: &mut TcpStream, p: &str, cpu: &Cpu, bus: &mut Bus) -> Result<bool> {
-    match p.as_bytes().first().copied() {
-        Some(b'q') => {
-            if p.starts_with("qSupported") { reply_data(s, "PacketSize=4000")?; }
-            else if p.starts_with("qAttached") { reply_data(s, "1")?; }
-            else if p == "qC" { reply_data(s, "QC1")?; }
-            else if p.starts_with("qfThreadInfo") { reply_data(s, "m1")?; }
-            else if p.starts_with("qsThreadInfo") { reply_data(s, "l")?; }
-            else { reply_data(s, "")?; }
-        }
-        Some(b'?') => reply_data(s, "S05")?,        // last-stop reason
-        Some(b'm') => {
-            let payload = match parse_m(p) {
-                Some((addr, len)) => (0..len)
-                    .map(|i| format!("{:02x}", bus.read8(addr.wrapping_add(i))))
-                    .collect::<String>(),
-                None => "E01".to_string(),
-            };
-            reply_data(s, &payload)?;
-        }
-        Some(b'p') => {
-            let reg = u16::from_str_radix(&p[1..], 16).unwrap_or(0xffff);
-            reply_data(s, &le_hex32(cpu.gdb_reg(reg)))?;
-        }
-        Some(b'g') => {
-            // r0..r15 then xPSR — the core general-register block GDB expects.
-            let mut out = String::new();
-            for n in 0..16 { out.push_str(&le_hex32(cpu.gdb_reg(n))); }
-            out.push_str(&le_hex32(cpu.gdb_reg(16)));
-            reply_data(s, &out)?;
-        }
-        Some(b'c') => { s.write_all(b"+")?; return Ok(true); } // continue: bare ack, resume
-        // Unsupported (vCont, H thread-select, write packets, ...): empty reply.
-        _ => reply_data(s, "")?,
-    }
-    Ok(false)
-}
-
-// ---- OpenOCD Tcl RPC (humility's `-p ocd` core: reads and writes) -----------
-//
-// Protocol: each command and each reply is terminated by a 0x1a byte. humility
-// treats a reply containing "Error: " / "invalid command name " as failure.
-// Commands used: `version`, `mrw addr` (read word, decimal), `array unset
-// output` + `mem2array output 8 addr len` + `return $output` (read bytes as
-// space-separated `idx val` decimal pairs), `reg N` (read register), `mww/mwb
-// addr val` (write). halt/run are client-side no-ops, so the target stays
-// frozen for the duration of an OpenOCD connection (a consistent snapshot).
-
-const OCD_DELIM: u8 = 0x1a;
-
-fn parse_hex_or_dec(s: &str) -> Option<u32> {
-    let s = s.trim();
-    if let Some(h) = s.strip_prefix("0x") { u32::from_str_radix(h, 16).ok() }
-    else { s.parse().ok() }
-}
-
-/// Produce the reply body for one OpenOCD Tcl command. `pending` carries the
-/// `mem2array` result across to the following `return $output`.
-fn handle_ocd(cmd: &str, cpu: &Cpu, bus: &mut Bus, pending: &mut String) -> String {
-    let mut t = cmd.split_whitespace();
-    match t.next() {
-        Some("version") => "Open On-Chip Debugger 0.12.0 (sp-emu)".to_string(),
-        Some("mrw") => match t.next().and_then(parse_hex_or_dec) {
-            Some(addr) => format!("{}", bus.read32(addr)),   // decimal, per humility
-            None => String::new(),
-        },
-        Some("mem2array") => {
-            // mem2array output 8 <addr> <len>
-            let _var = t.next();
-            let _width = t.next();
-            let addr = t.next().and_then(parse_hex_or_dec).unwrap_or(0);
-            let len = t.next().and_then(parse_hex_or_dec).unwrap_or(0);
-            // Stash "idx val idx val ..." (decimal) for the next `return $output`.
-            let mut s = String::new();
-            for i in 0..len {
-                if i > 0 { s.push(' '); }
-                s.push_str(&format!("{} {}", i, bus.read8(addr.wrapping_add(i))));
-            }
-            *pending = s;
-            String::new()
-        }
-        Some("return") => std::mem::take(pending),            // `return $output`
-        Some("reg") => match t.next().and_then(|n| n.parse::<u16>().ok()) {
-            Some(n) => format!("reg{} (/32): 0x{:08x}", n, cpu.gdb_reg(n)),
-            None => String::new(),
-        },
-        Some("mww") => {
-            let addr = t.next().and_then(parse_hex_or_dec);
-            let val = t.next().and_then(parse_hex_or_dec);
-            if let (Some(a), Some(v)) = (addr, val) { bus.write32(a, v); }
-            String::new()
-        }
-        Some("mwb") => {
-            let addr = t.next().and_then(parse_hex_or_dec);
-            let val = t.next().and_then(parse_hex_or_dec);
-            if let (Some(a), Some(v)) = (addr, val) { bus.write8(a, v as u8); }
-            String::new()
-        }
-        // array unset / capture / unknown: succeed silently (no "Error:").
-        _ => String::new(),
-    }
-}
-
-/// Serve one OpenOCD-Tcl connection to completion (target frozen throughout).
-fn serve_ocd(mut stream: TcpStream, cpu: &Cpu, bus: &mut Bus) -> Result<()> {
-    // Accepted sockets can inherit the listener's non-blocking flag; this loop
-    // uses blocking reads, so force it.
-    stream.set_nonblocking(false)?;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut rbuf = [0u8; 8192];
-    let mut pending = String::new();
-    loop {
-        // Accumulate a 0x1a-delimited command.
-        while !buf.contains(&OCD_DELIM) {
-            let n = stream.read(&mut rbuf)?;
-            if n == 0 { return Ok(()); } // client closed
-            buf.extend_from_slice(&rbuf[..n]);
-        }
-        let pos = buf.iter().position(|&b| b == OCD_DELIM).unwrap();
-        let cmd = String::from_utf8_lossy(&buf[..pos]).into_owned();
-        buf.drain(0..=pos);
-        let mut reply = handle_ocd(cmd.trim(), cpu, bus, &mut pending).into_bytes();
-        reply.push(OCD_DELIM);
-        stream.write_all(&reply)?;
-    }
-}
-
-/// Serve one GDB-RSP connection to completion.
-fn serve_gdb(
-    mut stream: TcpStream,
-    cpu: &mut Cpu,
-    bus: &mut Bus,
-    host: &mut dyn HostIo,
-) -> Result<()> {
-    stream.set_nonblocking(true)?;
-    stream.set_nodelay(true).ok();
-    let mut inbuf: Vec<u8> = Vec::new();
-    let mut rbuf = [0u8; 8192];
-    let mut running = false;
-    loop {
-        match stream.read(&mut rbuf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => inbuf.extend_from_slice(&rbuf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
-        }
-        while let Some(msg) = take_message(&mut inbuf) {
-            match msg {
-                Msg::Interrupt => { running = false; stream.write_all(&frame("S05"))?; }
-                Msg::Packet(p) => { running = handle(&mut stream, &p, cpu, bus)?; }
+            rc.maybe_tick(rb);
+            rc.maybe_interrupt(rb);
+            if rc.idle_skip > 0 {
+                rc.idle_skip = 0;
+                idled = true;
+                break;
             }
         }
-        if running {
-            for _ in 0..50_000 {
-                if cpu.step(bus, host).is_err() { running = false; break; }
-                cpu.maybe_tick(bus);
-                cpu.maybe_interrupt(bus);
-            }
-            bus.pump_eth(host);
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        if idled {
+            break;
         }
     }
 }
 
-/// Pre-boot to steady state, then serve both humility debug transports:
-///  - GDB RSP on :3333  (`humility -p ocdgdb`, read-only)
-///  - OpenOCD Tcl on :6666 (`humility -p ocd`, reads + writes)
+/// Pre-boot to steady state, then serve the Glasgow SWD debug probe on
+/// 127.0.0.1:<swd_port> (`humility -p 20b7:9db1:tcp:127.0.0.1:<swd_port>`).
 ///
 /// Between connections the emulator keeps running, so time advances across a
 /// series of humility commands.
-pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_client: Option<crate::rot_service::RotClient>, host: &mut dyn HostIo, preboot: u64) -> Result<()> {
-    eprintln!("[gdb] pre-booting {} instructions to steady state...", preboot);
-    let parse_env = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
-    let (twin_from, twin_to) = (parse_env("SP_EMU_TRACE_FROM"), parse_env("SP_EMU_TRACE_TO"));
+pub fn serve(
+    mut cpu: Cpu,
+    mut bus: Bus,
+    mut rot: Option<(Cpu, Bus)>,
+    mut rot_client: Option<crate::rot_service::RotClient>,
+    host: &mut dyn HostIo,
+    preboot: u64,
+) -> Result<()> {
+    eprintln!(
+        "[gdb] pre-booting {} instructions to steady state...",
+        preboot
+    );
+    let (twin_from, twin_to) = (
+        crate::config::get().trace_from,
+        crate::config::get().trace_to,
+    );
     // Pay the per-instruction disasm-formatting cost only when the windowed trace is on.
     cpu.record_disasm = twin_from.is_some();
     let preboot_start = std::time::Instant::now();
     for _ in 0..preboot {
         let pc = cpu.pc;
-        if cpu.step(&mut bus, host).is_err() { break; }
+        if cpu.step(&mut bus, host).is_err() {
+            break;
+        }
         if let (Some(lo), Some(hi)) = (twin_from, twin_to) {
             if cpu.cycles >= lo && cpu.cycles <= hi {
                 eprintln!("c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
@@ -263,8 +187,13 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         cpu.maybe_interrupt(&mut bus);
     }
     let secs = preboot_start.elapsed().as_secs_f64();
-    eprintln!("[gdb] booted to {} instructions (pc={:#010x}) in {:.2}s = {:.1}M instr/s",
-        cpu.cycles, cpu.pc, secs, cpu.cycles as f64 / secs / 1e6);
+    eprintln!(
+        "[gdb] booted to {} instructions (pc={:#010x}) in {:.2}s = {:.1}M instr/s",
+        cpu.cycles,
+        cpu.pc,
+        secs,
+        cpu.cycles as f64 / secs / 1e6
+    );
 
     // Boot the in-process RoT core (LPC55/M33) to its sprot dispatch idle.
     if let Some((rc, rb)) = rot.as_mut() {
@@ -272,30 +201,107 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         rc.wfi_throttle = false;
         let t = std::time::Instant::now();
         let dbgtrap = crate::sprot::dbg();
-        for _ in 0..40_000_000u64 {
+        // A safety cap: the loop normally stops the moment the RoT reaches its
+        // idle WFI (booted and waiting on the SP), well before this. The budget
+        // only bounds a RoT that never idles. It is high enough for the dice-self
+        // startup (PUF seed + several Ed25519 keygens/signs + SHA3) to run even if
+        // the idle break never comes. Override with SP_EMU_ROT_PREBOOT.
+        let rot_preboot = crate::config::get().rot_preboot.unwrap_or(400_000_000);
+        // Optional windowed instruction trace during preboot (where DICE runs),
+        // SP_EMU_ROT_TRACE_FROM/TO as hex pc bounds.
+        let (pb_from, pb_to) = (
+            crate::config::get().rot_trace_from,
+            crate::config::get().rot_trace_to,
+        );
+        rc.record_disasm |= pb_from.is_some();
+        for _ in 0..rot_preboot {
+            rc.wfi_idle = false;
+            let pc_before = rc.pc;
             if let Err(t) = rc.step(rb, host) {
                 if dbgtrap {
                     eprintln!("[rottrap-preboot] {:?}", t);
                 }
                 break;
             }
+            // Ready to serve: the RoT reached its idle WFI (all tasks blocked,
+            // waiting on the SP over sprot). Stop now instead of running the rest
+            // of the budget in the idle loop, which pegs a core for seconds and
+            // scales with host speed. wfi_throttle is off in preboot, so idle_skip
+            // below never fires; wfi_idle is the throttle-independent signal.
+            if rc.wfi_idle {
+                break;
+            }
+            if let (Some(f), Some(t)) = (pb_from, pb_to) {
+                if (f..=t).contains(&pc_before) {
+                    eprintln!(
+                        "[rotpb] {:#010x}: {:<24} r0={:08x} r1={:08x} r2={:08x} r4={:08x} r5={:08x} r6={:08x}",
+                        pc_before, rc.last_disasm, rc.r[0], rc.r[1], rc.r[2], rc.r[4], rc.r[5], rc.r[6]
+                    );
+                }
+            }
+            // Spin detector: a `b .` self-branch (pc unchanged after a step) with
+            // no boot-ROM call in flight is Hubris's panic/fault loop. A healthy
+            // RoT instead reaches WFI and breaks above; the one other fixed-pc
+            // case, the boot ROM parking at AUTH_TRAP while `skboot_authenticate`
+            // settles, is excluded by the RomCall::Idle guard (it parks as
+            // Settling). End preboot at once rather than grinding the full budget,
+            // which is minutes of pegged CPU that block SP bring-up and read as a
+            // hang. Always report where; the register and stack dump stays behind
+            // SP_EMU_SPROTDBG.
+            if rc.pc == pc_before && matches!(rc.rom_call, crate::romapi::RomCall::Idle) {
+                eprintln!(
+                    "[rot] preboot: RoT is spinning at pc={:#010x} (a panic or \
+                     fault loop?); ending preboot. Set SP_EMU_SPROTDBG=1 for a \
+                     register and stack dump.",
+                    rc.pc
+                );
+                if dbgtrap {
+                    eprintln!(
+                        "[rot-spin] stuck at pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
+                        rc.pc, rc.r[14], rc.r[13], rc.cycles
+                    );
+                    eprintln!("[rot-spin] r0..r7 = {:08x?}", &rc.r[0..8]);
+                    let sp = rc.r[13];
+                    for i in 0..64u32 {
+                        let v = rb.read32(sp.wrapping_add(i * 4));
+                        if (0x0001_0000..0x0002_0000).contains(&v) {
+                            eprintln!(
+                                "[rot-spin] stack[{:#010x}] = {:#010x}",
+                                sp.wrapping_add(i * 4),
+                                v
+                            );
+                        }
+                    }
+                }
+                break;
+            }
             rc.maybe_tick(rb);
             rc.maybe_interrupt(rb);
-            if rc.idle_skip > 0 { rc.idle_skip = 0; break; }
+            if rc.idle_skip > 0 {
+                rc.idle_skip = 0;
+                break;
+            }
         }
         rc.wfi_throttle = true;
-        rc.trace_svc = std::env::var("SP_EMU_ROTSVC").is_ok();
-        eprintln!("[rot] RoT core booted (pc={:#010x}, {} insns) in {:.2}s", rc.pc, rc.cycles, t.elapsed().as_secs_f64());
+        rc.trace_svc = crate::config::get().rotsvc;
+        eprintln!(
+            "[rot] RoT core booted (pc={:#010x}, {} insns) in {:.2}s",
+            rc.pc,
+            rc.cycles,
+            t.elapsed().as_secs_f64()
+        );
     }
 
-    let rotpc_every = parse_env("SP_EMU_ROTPC");
+    let rotpc_every = crate::config::get().rotpc;
     let mut rotpc_next = 0u64;
     let mut last_rottrap = u32::MAX;
+    // SP_EMU_ROT_TRACE_FROM/TO="0xADDR": log the RoT's pc + disasm + r0..r3,r6 for
+    // every instruction whose pc is in [FROM,TO] — an instruction-level window to
+    // debug a specific RoT function's execution.
+    let rot_trace_from = crate::config::get().rot_trace_from;
+    let rot_trace_to = crate::config::get().rot_trace_to;
     // SP_EMU_ROTDUMP="0xADDR:LEN" dumps that RoT RAM range every ~8s for task-table introspection.
-    let rotdump: Option<(u32, u32)> = std::env::var("SP_EMU_ROTDUMP").ok().and_then(|s| {
-        let (a, l) = s.split_once(':')?;
-        Some((u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, l.parse().ok()?))
-    });
+    let rotdump: Option<(u32, u32)> = crate::config::get().rotdump;
     let mut rotdump_last = std::time::Instant::now();
 
     // Post-preboot: enable the WFI idle-throttle so an idle SP sleeps the host
@@ -305,8 +311,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // idle CPU but slower background sim-time; an incoming packet's eth-irq wakes
     // the SP immediately regardless. 10ms ≈ 4x CPU cut; tune via SP_EMU_IDLE_MS
     // for denser fleets.
-    let idle_ms: u64 = std::env::var("SP_EMU_IDLE_MS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(10);
+    let idle_ms: u64 = crate::config::get().idle_ms;
 
     // Eth-service quantum: instructions the SP runs between bridge pumps (the
     // only place TX frames flush out and RX frames poll in). Under sustained MGS
@@ -318,39 +323,63 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // GET /ignition) times out -> empty SP inventory. A small quantum bounds
     // inbound latency; the `eth_has_tx` break (below) bounds outbound. The preboot
     // loop is separate, so full-speed boot throughput is unaffected.
-    let quantum: u32 = std::env::var("SP_EMU_ETH_QUANTUM").ok()
-        .and_then(|s| s.parse().ok()).filter(|&q| q > 0).unwrap_or(4096);
+    let quantum: u32 = crate::config::get().eth_quantum;
     // TX-break: end the batch the instant the SP queues a reply so it flushes
     // immediately instead of waiting out the rest of the quantum. On by default;
     // SP_EMU_ETH_TXBREAK=0 disables it (A/B against the once-per-batch behavior).
-    let txbreak = std::env::var("SP_EMU_ETH_TXBREAK").map(|v| v != "0").unwrap_or(true);
-    eprintln!("[gdb] eth-service: quantum={} txbreak={}", quantum, txbreak);
+    let txbreak = crate::config::get().eth_txbreak;
+    // sprot SP->RoT artificial flow-control threshold (0 = disabled). See the
+    // phase-1 lockstep break in the SP burst below and config::sprot_flowctl.
+    let sprot_flowctl = crate::config::get().sprot_flowctl as usize;
+    // sprot SysTick coupling: while the SP is blocked on an sprot request
+    // the RoT has accepted, pace the SP's SysTick by the RoT's elapsed 1ms tick
+    // events so the SP's sprot timeout doesn't out-run the slow emulated RoT.
+    let sprot_couple = crate::config::get().sprot_couple;
+    let endoscope_couple = crate::config::get().endoscope_couple;
+    let sp_clock_khz = crate::config::get().sp_clock_khz; // endoscope divisor (pre-kernel SP clock)
+    let coupledbg = crate::config::get().coupledbg;
+    eprintln!(
+        "[gdb] eth-service: quantum={} txbreak={} sprot_flowctl={} sprot_couple={}",
+        quantum, txbreak, sprot_flowctl, sprot_couple
+    );
 
-    // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the gdb/ocd debug listeners
-    // entirely — MGS only needs the bridge UDP. Otherwise bind them.
-    let listeners = if std::env::var("SP_EMU_NO_DEBUG").is_ok() {
+    // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the SWD debug listener
+    // entirely — MGS only needs the bridge UDP. Otherwise bind it.
+    // Per-instance SWD ports so every sp-emu in a shared switch zone is debuggable
+    // simultaneously: offset by the bridge port (33300->0, 33310->10, ...). The SP
+    // probe is 4444 + off; the RoT probe (below) is 4544 + off. Pair with the
+    // matching selector.
+    let swd_off: u16 = crate::config::get()
+        .bridge
+        .as_deref()
+        .and_then(|b| b.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .map(|p| p.wrapping_sub(33300))
+        .unwrap_or(0);
+    let listeners = if crate::config::get().no_debug {
         eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG) — serving the bridge only");
         None
     } else {
-        // Per-instance ports so every sp-emu in a shared switch zone is
-        // debuggable simultaneously: offset by the bridge port (33300->0,
-        // 33310->10, ...). gdb=3333+off, ocd=6666+off. Pair with humility's
-        // HUMILITY_OCD_PORT env to attach to a specific SP.
-        let off: u16 = std::env::var("SP_EMU_BRIDGE").ok()
-            .and_then(|b| b.rsplit(':').next().map(str::to_string))
-            .and_then(|p| p.parse::<u16>().ok())
-            .map(|p| p.wrapping_sub(33300))
-            .unwrap_or(0);
-        let gdb_port = 3333u16.wrapping_add(off);
-        let ocd_port = 6666u16.wrapping_add(off);
-        let gdb_l = TcpListener::bind(("127.0.0.1", gdb_port))?;
-        let ocd_l = TcpListener::bind(("127.0.0.1", ocd_port))?;
-        gdb_l.set_nonblocking(true)?;
-        ocd_l.set_nonblocking(true)?;
-        eprintln!("[gdb] ready (gdb :{gdb_port}, ocd :{ocd_port}). attach with:");
-        eprintln!("[gdb]   humility -a <archive.zip> -p ocdgdb <cmd>   (reads: tasks, readmem, ringbuf, ...)");
-        eprintln!("[gdb]   humility -a <archive.zip> -p ocd    <cmd>   (reads + writes: writemem, hiffy, ...)");
-        Some((gdb_l, ocd_l))
+        let swd_port = 4444u16.wrapping_add(swd_off);
+        let swd_l = TcpListener::bind(("127.0.0.1", swd_port))?;
+        swd_l.set_nonblocking(true)?;
+        eprintln!("[gdb] ready (swd :{swd_port}). attach with:");
+        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (SP Glasgow SWD debug port: halt/run/hiffy; stock humility)");
+        Some(swd_l)
+    };
+    // Second Glasgow SWD probe bound to the in-process RoT core, so humility can
+    // attach to the RoT (ringbuf/hiffy/tasks/halt) on the SAME run as the SP probe.
+    // The RoT probe is the RoT's own debug port; attaching halts the RoT (there is
+    // no SP-side JTAG_DETECT analog to assert). Only when an in-process RoT exists.
+    let rot_listener = if crate::config::get().no_debug || rot.is_none() {
+        None
+    } else {
+        let rot_swd_port = 4544u16.wrapping_add(swd_off);
+        let l = TcpListener::bind(("127.0.0.1", rot_swd_port))?;
+        l.set_nonblocking(true)?;
+        eprintln!("[gdb] ready (rot swd :{rot_swd_port}). attach with:");
+        eprintln!("[gdb]   humility -a <rot-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{rot_swd_port} <cmd>   (RoT Glasgow SWD debug port)");
+        Some(l)
     };
 
     // Pump-cadence diagnostics (SP_EMU_PUMPSTATS): distinguishes the SP being
@@ -360,9 +389,8 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // (a smaller quantum / TX-break helps); a long gap with ~0 instructions = the
     // OS descheduled the whole process (only CPU priority helps, not the quantum).
     // Logged only for gaps over the threshold (default 50ms).
-    let pumpstats = std::env::var("SP_EMU_PUMPSTATS").is_ok();
-    let pump_thresh_us: u128 = std::env::var("SP_EMU_PUMPSTATS_MS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(50) * 1000;
+    let pumpstats = crate::config::get().pumpstats;
+    let pump_thresh_us: u128 = crate::config::get().pumpstats_ms as u128 * 1000;
     let mut last_pump = std::time::Instant::now();
     let mut last_cyc = cpu.cycles;
 
@@ -370,7 +398,7 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // find hot firmware (e.g. an SPI/IPC spin loop behind bulk-ignition latency).
     // Sampled every 256 instrs; cumulative top-30 dumped every 15s. Map PCs to
     // functions offline with the Hubris archive (addr2line/nm).
-    let pcprof = std::env::var("SP_EMU_PCPROF").is_ok();
+    let pcprof = crate::config::get().pcprof;
     let mut pchist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let mut pcprof_samp: u64 = 0;
     let mut pcprof_last = std::time::Instant::now();
@@ -379,8 +407,8 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // appears, write a humility-hydrate-compatible RAM dump to <dir> and swap the
     // trigger for `.done`. Reads a wedged SP's task table with no probe:
     //   touch <dir>/.trigger; zip <dir>; humility -a <ar> hydrate; humility -d tasks
-    let dump_dir = std::env::var("SP_EMU_DUMP_DIR").ok();
-    let dump_archive_id = std::env::var("SP_EMU_DUMP_ARCHIVE_ID").unwrap_or_default();
+    let dump_dir = crate::config::get().dump_dir.clone();
+    let dump_archive_id = crate::config::get().dump_archive_id.clone();
     let mut dump_last = std::time::Instant::now();
     // Previous rot-irq level, for edge-detecting ROT_IRQ to raise the SP's EXTI.
     let mut prev_rot_irq = false;
@@ -389,25 +417,90 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
     // SP's phase-2 read.
     let mut req_buf: Vec<u8> = Vec::new();
     let mut awaiting_reply = false;
+    // Synthetic one-shot RoT measurement trigger (SP_EMU_SWD_TRIGGER): pend the
+    // RoT's sp_reset-irq once, to exercise the RoT-drives-SP-SWD path without a
+    // full SP self-reset (whose measurement gate depends on the SP image).
+    let swd_trigger = crate::config::get().swd_trigger;
+    let mut swd_triggered = false;
+    let jtag_trigger = crate::config::get().jtag_trigger;
+    let mut jtag_triggered = false;
+    // The SP's debug port, driven by the in-process RoT over the internal SWD link.
+    // Loop-lifetime so its DP/AP/CoreDebug state persists across transactions.
+    let mut sp_swdp = crate::debugport::SwDp::new();
+
+    // sprot coupling state: the RoT's tick_events at the last iteration,
+    // to compute per-iteration RoT elapsed-time delta. CREDIT_CAP bounds the SP's
+    // owed-tick bucket so a stuck-true request_in_flight can't accumulate unbounded
+    // credit (a few thousand ticks = a few seconds; not a wedge cap -- the
+    // request_in_flight gate handles wedges).
+    let mut prev_rot_ticks = rot.as_ref().map(|(rc, _)| rc.tick_events).unwrap_or(0);
+    let mut prev_req_dbg = false; // coupledbg: edge-detect request_in_flight for the trace
+    const CREDIT_CAP: u32 = 5000;
+    // Endoscope coupling state: the SP's cycle count last iteration and a
+    // fractional-remainder accumulator, to convert the SP's elapsed endoscope
+    // instructions into RoT-credit ms (SP cycles / SP clock divisor).
+    let mut prev_sp_cycles = cpu.cycles;
+    let mut endoscope_acc: u64 = 0;
+    let mut prev_endo_couple = false; // coupledbg: edge-detect the coupling window
+
+    // Prompt-halt servicing: while an armed RoT is halting the SP after a self-reset,
+    // freeze the SP (burst 0) and give the RoT the full budget so it halts the SP
+    // before it runs significant reset-vector work. Bounded by `sp_reset_halt_iters`.
+    let mut sp_reset_halt_pending = false;
+    let mut sp_reset_halt_iters: u32 = 0;
 
     loop {
-        if let Some((gdb_l, ocd_l)) = &listeners {
-            match gdb_l.accept() {
+        if let Some(swd_l) = &listeners {
+            match swd_l.accept() {
                 Ok((stream, peer)) => {
-                    eprintln!("[gdb] RSP client {peer}");
-                    if let Err(e) = serve_gdb(stream, &mut cpu, &mut bus, host) {
-                        eprintln!("[gdb] RSP connection ended: {e}");
+                    eprintln!("[gdb] SWD (Glasgow applet) client {peer}");
+                    // A debug probe attached to the SP: assert SP_TO_ROT_JTAG_DETECT_L
+                    // so the RoT invalidates its attestation log. The RoT is frozen for
+                    // the whole glasgow::serve call below, so deliver the edge and step
+                    // the RoT to service it here, before handing over the SP.
+                    if let Some(l) = crate::sprot::link() {
+                        l.borrow_mut().jtag_detect = true;
+                    }
+                    if let Some((rc, rb)) = rot.as_mut() {
+                        if inject_jtag_detect(rb) {
+                            pump_rot_briefly(rc, rb, host, quantum);
+                        }
+                    }
+                    // Restore the running-halt state on disconnect so the main
+                    // loop resumes the SP after a humility command detaches.
+                    let r = crate::glasgow::serve(stream, &mut cpu, &mut bus, host);
+                    cpu.halted = false;
+                    cpu.debug_en = false;
+                    cpu.bkpt_hit = false;
+                    // Probe detached: deassert JTAG_DETECT (PIO0_20 level back high). No
+                    // edge/IRQ on release; the firmware handler is falling-edge only.
+                    if let Some(l) = crate::sprot::link() {
+                        l.borrow_mut().jtag_detect = false;
+                    }
+                    if let Err(e) = r {
+                        eprintln!("[gdb] SWD connection ended: {e}");
                     }
                     continue;
                 }
                 Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e.into()),
                 Err(_) => {}
             }
-            match ocd_l.accept() {
+        }
+        if let Some(rot_swd_l) = &rot_listener {
+            match rot_swd_l.accept() {
                 Ok((stream, peer)) => {
-                    eprintln!("[gdb] OpenOCD client {peer}");
-                    if let Err(e) = serve_ocd(stream, &cpu, &mut bus) {
-                        eprintln!("[gdb] OpenOCD connection ended: {e}");
+                    eprintln!("[gdb] RoT SWD (Glasgow applet) client {peer}");
+                    // The RoT's own debug port: halt it, serve humility (ringbuf/hiffy/
+                    // tasks/readmem), then resume. No JTAG_DETECT here -- that models an
+                    // SP probe seen by the RoT; this is the RoT debugging itself.
+                    if let Some((rc, rb)) = rot.as_mut() {
+                        let r = crate::glasgow::serve(stream, rc, rb, host);
+                        rc.halted = false;
+                        rc.debug_en = false;
+                        rc.bkpt_hit = false;
+                        if let Err(e) = r {
+                            eprintln!("[gdb] RoT SWD connection ended: {e}");
+                        }
                     }
                     continue;
                 }
@@ -428,27 +521,115 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         // corrupts its CRC). Gated on rot_irq so the request phase (phase 1), where
         // miso is just primed zeros, is unaffected.
         let replying = crate::sprot::link()
-            .map(|l| { let l = l.borrow(); l.rot_irq && l.cs }).unwrap_or(false);
-        let sp_burst = if replying { 48 } else { quantum };
+            .map(|l| {
+                let l = l.borrow();
+                l.rot_irq && l.cs
+            })
+            .unwrap_or(false);
+        // While the SP is halted through its debug port (the RoT drove DHCSR.C_HALT,
+        // or a vector catch stopped it at the reset vector), do not step it: the
+        // core is stopped and only the RoT, over SWD, may move it. Skipping the
+        // burst (not just `cpu.step`) also avoids ticking systick / taking
+        // interrupts on a halted core.
+        //
+        // When the RoT is running an injected program under debug (C_DEBUGEN set, not
+        // halted -- i.e. endoscope after the RoT resumed it), the SP runs endoscope. With
+        // coupling on, use a bounded chunk so the RoT interleaves; the RoT block below
+        // freezes the RoT's clock and advances it by the SP's endoscope progress, so the
+        // RoT records a realistic halt time. Otherwise sprint in one shot so the SP halts
+        // before the RoT (whose timer is frozen meanwhile) times out (DidNotHalt).
+        let endoscope_burst = if endoscope_couple {
+            ENDOSCOPE_BURST
+        } else {
+            ENDOSCOPE_SPRINT
+        };
+        let sp_burst = sp_burst_for(
+            cpu.halted,
+            sp_reset_halt_pending,
+            cpu.debug_en,
+            replying,
+            quantum,
+            endoscope_burst,
+        );
         for _ in 0..sp_burst {
-            if cpu.step(&mut bus, host).is_err() { break; }
+            // Stop the burst the instant the SP halts (e.g. endoscope's terminal
+            // BKPT), so the debug-run burst above doesn't spin on the BKPT.
+            if cpu.halted {
+                break;
+            }
+            if cpu.step(&mut bus, host).is_err() {
+                break;
+            }
+            // Firmware wrote AIRCR.SYSRESETREQ during that step: stop the burst so
+            // the self-reset is applied below, outside the loop.
+            if bus.reset_pending {
+                break;
+            }
             if pcprof {
                 pcprof_samp = pcprof_samp.wrapping_add(1);
-                if pcprof_samp & 0xFF == 0 { *pchist.entry(cpu.pc).or_insert(0) += 1; }
+                if pcprof_samp & 0xFF == 0 {
+                    *pchist.entry(cpu.pc).or_insert(0) += 1;
+                }
             }
             cpu.maybe_tick(&mut bus);
             cpu.maybe_interrupt(&mut bus);
-            if cpu.idle_skip > 0 { break; }
-            // Phase-2 lockstep: if the RoT is replying and its TX FIFO (miso) has
-            // drained, stop so the RoT can refill before clocking more.
+            if cpu.idle_skip > 0 {
+                break;
+            }
+            // sprot lockstep. On hardware the SP TX FIFO and the RoT RX FIFO are
+            // separate devices joined only by the SPI wires -- there is NO flow
+            // control, the SP clocks at its own pace and the RoT must keep up. The
+            // emulator collapses both into the one shared `mosi`/`miso` buffer and
+            // runs the SP a whole quantum before the RoT ever steps, so a >16-byte
+            // request would overrun the RoT's 16-deep RX FIFO and truncate the frame
+            // (the cause of "sprot: timeout" on RoT/stage0 updates). These two breaks
+            // add a deliberately non-physical flow-control signal to compensate for
+            // that coarse scheduling; they are not on the schematic.
             if let Some(l) = crate::sprot::link() {
                 let l = l.borrow();
-                if l.rot_irq && l.cs && l.miso.is_empty() { break; }
+                // Phase-2 (RoT->SP): the RoT is replying and its TX FIFO (miso) has
+                // drained -- stop so the RoT can refill before the SP clocks more.
+                if l.rot_irq && l.cs && l.miso.is_empty() {
+                    break;
+                }
+                // Phase-1 (SP->RoT request): the SP has filled the shared buffer to
+                // the RoT RX-FIFO depth -- stop so the RoT is stepped to drain FIFORD
+                // before the next byte overruns it. Gate on !rot_irq: during a reply
+                // (rot_irq asserted) the SP's TXDR clock-in dummies also land in
+                // `mosi` but the RoT is sending, not draining, so applying this then
+                // would wedge the SP mid-reply. `sprot_flowctl == 0` disables it.
+                if sprot_flowctl != 0 && !l.rot_irq && l.mosi.len() >= sprot_flowctl {
+                    break;
+                }
             }
             // Flush the moment a reply is queued: the round-trip then costs ~one
             // pump instead of the rest of the quantum (matters most under load,
             // when the SP never goes idle so this is the only early break).
-            if txbreak && bus.eth_has_tx() { break; }
+            if txbreak && bus.eth_has_tx() {
+                break;
+            }
+        }
+        // Apply a firmware system reset (AIRCR.SYSRESETREQ): re-boot the SP from its
+        // slot-A vector table. This is the reset the SP does when the RFD 568
+        // measurement token is absent; it also wakes the RoT to measure the SP.
+        let mut sp_reset_edge = false;
+        if bus.reset_pending {
+            // Persist + latch any committed bank swap (a completed firmware
+            // update) before reading the vector table, so the reboot enters the
+            // now-active bank; then drop stale decodes for the swapped-in image.
+            bus.flash_reset_latch();
+            let sp = bus.read32(0x0800_0000);
+            let pc = bus.read32(0x0800_0004) & !1;
+            cpu.reset_for_reboot(sp, pc);
+            bus.reset_exception_sources();
+            // On silicon DEMCR.VC_CORERESET catches a reset from any source, a
+            // firmware SYSRESETREQ included. If the RoT armed reset-and-halt, the SP
+            // halts at its reset vector here (0 instructions); otherwise it falls to
+            // the prompt-halt servicing window below.
+            sp_swdp.honor_vector_catch(&mut cpu);
+            cpu.flush_decode_cache();
+            bus.reset_pending = false;
+            sp_reset_edge = true;
         }
         bus.pump_eth(host);
         // host-sp-comms (UART7 / IPCC + host console): drain the SP's TX to the
@@ -468,6 +649,51 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         // Step the in-process RoT core a quantum (it mostly idles, waking to
         // answer the SP over the sprot link).
         if let Some((rc, rb)) = rot.as_mut() {
+            // Wake the RoT to measure the SP, exactly as real hardware reacts to an
+            // SP reset: pend its sp_reset-irq (pint.irq0 = NVIC IRQ 4) and record a
+            // falling edge on the SP_RESET PINT slot 0 (PINT.FALL @ 0x4000_4020), so
+            // do_handle_sp_reset passes its pint_detect check and drives SWD instead
+            // of returning "SpResetNotAsserted". Fired on a real SP self-reset, or
+            // once via SP_EMU_SWD_TRIGGER to exercise the path when the SP image has
+            // no measurement gate to self-reset it.
+            let synthetic = swd_trigger && !swd_triggered && rb.irq_enabled(4);
+            if sp_reset_edge || synthetic {
+                rb.write32(0x4000_4020, 0x1); // PINT.FALL slot 0 = SP_RESET falling edge
+                rb.pend_irq(4);
+                swd_triggered = true;
+            }
+            // On a genuine self-reset, if the RoT is armed to service SP_RESET, freeze
+            // the SP (below) until the RoT halts it, so it does not run reset-vector
+            // work first. Gated on a real reset edge (not the synthetic trigger) and
+            // skipped when a vector catch already halted the SP.
+            if enter_sp_reset_service(sp_reset_edge, rb.irq_enabled(4), cpu.halted) {
+                sp_reset_halt_pending = true;
+                sp_reset_halt_iters = SP_RESET_HALT_ITERS;
+                if coupledbg {
+                    eprintln!(
+                        "[reset] SP self-reset (real SYSRESETREQ), RoT armed: freezing the SP at its reset vector until the RoT halts it (backstop {SP_RESET_HALT_ITERS} iters)"
+                    );
+                }
+            } else if sp_reset_edge && coupledbg {
+                // A real self-reset that does not enter servicing: either a vector
+                // catch already halted the SP (0 reset-vector instructions), or the RoT
+                // has not armed SP_RESET yet (early boot), so the SP free-runs.
+                if cpu.halted {
+                    eprintln!("[reset] SP self-reset: vector-caught at the reset vector (0 reset-vector instrs)");
+                } else {
+                    eprintln!("[reset] SP self-reset: RoT not armed (SP_RESET IRQ disabled); SP free-runs (early boot)");
+                }
+            }
+            // SP_EMU_JTAG_TRIGGER: fire one synthetic JTAG_DETECT edge once the RoT has
+            // armed the IRQ, to exercise attestation-log invalidation without a real SWD
+            // probe. The RoT is stepped normally here (no glasgow freeze), so it services
+            // the pended IRQ on the following iterations; no pre-pump needed.
+            if jtag_trigger && !jtag_triggered && inject_jtag_detect(rb) {
+                jtag_triggered = true;
+            }
+            if rot_trace_from.is_some() {
+                rc.record_disasm = true; // populate last_disasm for the window trace
+            }
             // Wake the RoT's FLEXCOMM8 slave (irq 59) whenever it owes a receive —
             // i.e. an un-processed slave-select assert is latched (`ssa`) or a
             // transfer is active (`cs`). Keying off the latched `ssa`, not just
@@ -481,14 +707,23 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             // "sprot active" = an assert is latched (ssa), CS is asserted (cs), or a
             // reply is pending (rot_irq, waiting for the SP to clock phase 2).
             let (ssa_or_cs, cs_now, req_in_flight) = crate::sprot::link()
-                .map(|l| { let l = l.borrow(); (l.ssa || l.cs || l.rot_irq, l.cs, l.request_in_flight) })
+                .map(|l| {
+                    let l = l.borrow();
+                    (l.ssa || l.cs || l.rot_irq, l.cs, l.request_in_flight)
+                })
                 .unwrap_or((false, false, false));
-            if ssa_or_cs { rb.pend_irq(59); }
-            if cs_now { bus.pend_irq(84); }
+            if ssa_or_cs {
+                rb.pend_irq(59);
+            }
+            if cs_now {
+                bus.pend_irq(84);
+            }
             // Stay full-speed only during an actual exchange (clocking, or a request
             // being processed), not for the RoT's idle housekeeping, so the instance
             // sleeps when quiescent and keeps its scheduling priority.
-            rot_busy = ssa_or_cs || req_in_flight;
+            // Also stay awake while the SP runs endoscope under debug (cpu.debug_en): the
+            // RoT is polling the halt and must be stepped (credit-paced) to see it.
+            rot_busy = ssa_or_cs || req_in_flight || sp_reset_halt_pending || cpu.debug_en;
             // Run the RoT many quanta back-to-back so it finishes a request's
             // handler in one go — IPC to update_server, up to 32 flash reads for a
             // CMPA page, building + CRCing the response — and asserts rot-irq before
@@ -501,10 +736,46 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             // back-to-back budget only while an exchange is happening; when idle, one
             // quantum per outer iteration keeps CPU near the baseline single-core
             // instance so the host scheduler doesn't decay this instance's priority.
-            let rot_budget = if ssa_or_cs || req_in_flight { 256 } else { 1 };
+            let rot_budget = if ssa_or_cs || req_in_flight || sp_reset_halt_pending {
+                256
+            } else {
+                1
+            };
+            // Endoscope coupling: while the SP runs endoscope under debug (debug_en, not
+            // halted), freeze the RoT's own SysTick and advance it only by the SP's
+            // elapsed endoscope time -- SP cycle delta / SP clock divisor (pre-kernel, so
+            // tick_divisor is None and we use the config SP clock). With its clock frozen
+            // the RoT's sleep_for poll no longer races on its own execution, so it sleeps
+            // between polls and its poll-timer tracks the SP's progress, recording a
+            // realistic halt time instead of ~0 and not timing out. Applied before the
+            // burst so the RoT drains the credit this iteration.
+            let now_endo = endoscope_couple && cpu.debug_en && !cpu.halted;
+            rc.tick_frozen = now_endo;
+            let d_sp_cyc = cpu.cycles.saturating_sub(prev_sp_cycles);
+            prev_sp_cycles = cpu.cycles;
+            if now_endo {
+                let divisor = cpu.tick_divisor().unwrap_or(sp_clock_khz) as u64;
+                let (ms, new_acc) = endoscope_credit(endoscope_acc, d_sp_cyc, divisor, CREDIT_CAP);
+                endoscope_acc = new_acc;
+                rc.sp_tick_credit = rc.sp_tick_credit.saturating_add(ms).min(CREDIT_CAP);
+                if coupledbg && (ms > 0 || !prev_endo_couple) {
+                    eprintln!(
+                        "[couple] endoscope +{}ms rot_credit={} divisor={} rot_ticks={}",
+                        ms, rc.sp_tick_credit, divisor, rc.tick_events
+                    );
+                }
+            } else {
+                if coupledbg && prev_endo_couple {
+                    eprintln!("[couple] endoscope end: rot_ticks={}", rc.tick_events);
+                }
+                rc.sp_tick_credit = 0;
+                endoscope_acc = 0;
+            }
+            prev_endo_couple = now_endo;
             'rot_burst: for _ in 0..rot_budget {
                 let mut rot_idled = false;
                 for _ in 0..quantum {
+                    let rpc = rc.pc; // pc of the instruction about to execute (for the window trace)
                     if let Err(t) = rc.step(rb, host) {
                         // A RoT task hitting an unimplemented/undecodable instruction
                         // would re-fault every quantum, silently wedged (the kernel
@@ -513,25 +784,92 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                         if crate::sprot::dbg() && tpc != last_rottrap {
                             last_rottrap = tpc;
                             match &t {
-                                crate::cpu::Trap::Unimplemented { pc, bytes, len, disasm } =>
-                                    eprintln!("[rottrap] UNIMPL pc={:#010x} len={} bytes={:02x?} : {}", pc, len, &bytes[..(*len as usize).min(4)], disasm),
-                                crate::cpu::Trap::Decode { pc } =>
-                                    eprintln!("[rottrap] DECODE pc={:#010x}", pc),
-                                crate::cpu::Trap::Halt { pc, why } =>
-                                    eprintln!("[rottrap] HALT pc={:#010x} {}", pc, why),
+                                crate::cpu::Trap::Unimplemented {
+                                    pc,
+                                    bytes,
+                                    len,
+                                    disasm,
+                                } => eprintln!(
+                                    "[rottrap] UNIMPL pc={:#010x} len={} bytes={:02x?} : {}",
+                                    pc,
+                                    len,
+                                    &bytes[..(*len as usize).min(4)],
+                                    disasm
+                                ),
+                                crate::cpu::Trap::Decode { pc } => {
+                                    eprintln!("[rottrap] DECODE pc={:#010x}", pc)
+                                }
+                                crate::cpu::Trap::Halt { pc, why } => {
+                                    eprintln!("[rottrap] HALT pc={:#010x} {}", pc, why)
+                                }
                             }
                         }
                         break 'rot_burst;
                     }
-                    if crate::sprot::rot_trace_tick() { eprintln!("[rottr] {:#010x}", rc.pc); }
+                    if let (Some(f), Some(t)) = (rot_trace_from, rot_trace_to) {
+                        if (f..=t).contains(&rpc) {
+                            eprintln!(
+                                "[rottrace] {:#010x}: {:<26} r0={:08x} r1={:08x} r2={:08x} r3={:08x} r6={:08x}",
+                                rpc, rc.last_disasm, rc.r[0], rc.r[1], rc.r[2], rc.r[3], rc.r[6]
+                            );
+                        }
+                    }
+                    if crate::sprot::rot_trace_tick() {
+                        eprintln!("[rottr] {:#010x}", rc.pc);
+                    }
                     rc.maybe_tick(rb);
                     rc.maybe_interrupt(rb);
-                    if rc.idle_skip > 0 { rc.idle_skip = 0; rot_idled = true; break; }
+                    if rc.idle_skip > 0 {
+                        rc.idle_skip = 0;
+                        rot_idled = true;
+                        break;
+                    }
                 }
                 // Stop the extra-quanta burst once the RoT idles (nothing left to do)
                 // or the reply is ready (rot-irq asserted) — then the SP runs phase 2.
-                if rot_idled { break; }
-                if crate::sprot::link().map(|l| l.borrow().rot_irq).unwrap_or(false) { break; }
+                if rot_idled {
+                    break;
+                }
+                // The RoT-side reply direction already has flow control: FIFOSTAT
+                // (sprot.rs) reports TXNOTFULL gated on `miso` depth, so the RoT
+                // firmware stalls itself when its TX FIFO is full, and the existing
+                // rot-irq break lets the SP clock the reply out. (A symmetric
+                // serve-loop break on `miso` full was tried but starved the RoT
+                // mid-reply-construction -- before it asserts rot-irq the SP isn't
+                // clocking, so a full buffer can't drain and the exchange hangs.)
+                if crate::sprot::link()
+                    .map(|l| l.borrow().rot_irq)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+            // Drain the internal SWD link: run each ADIv5 transaction the RoT
+            // clocked out against the SP's debug port, and hand back a read
+            // result. This is what lets the emulated RoT actually read/write the
+            // SP over SWD (the RoT stalls on FIFOSTAT until a read result lands).
+            if let Some(swd) = crate::rotswd::link() {
+                loop {
+                    let req = swd.borrow_mut().req.pop_front();
+                    let Some(r) = req else { break };
+                    if let crate::debugport::Ack::Ok(Some(d)) =
+                        sp_swdp.transfer(&mut cpu, &mut bus, r.ap, r.rnw, r.a, r.wdata)
+                    {
+                        swd.borrow_mut().resp = Some(d);
+                    }
+                }
+            }
+            // The RoT released ROT_TO_SP_RESET_L (PIO0_13 low->high) in
+            // `sp_reset_leave`: pulse the SP's reset through its debug port. Done
+            // after draining the SWD link so the DHCSR/DEMCR writes that arm the
+            // vector catch are already applied to `sp_swdp` -- the SP then halts at
+            // its reset vector (DFSR.VCATCH), which is what reset_into_debug_halt
+            // waits for before injecting endoscope.
+            let sp_reset_released = crate::sprot::link()
+                .map(|l| std::mem::take(&mut l.borrow_mut().sp_reset_release))
+                .unwrap_or(false);
+            if sp_reset_released {
+                sp_swdp.pin_reset(&mut cpu, &mut bus);
             }
             // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions,
             // only while a sprot exchange is in flight (CS has been touched) to
@@ -540,7 +878,10 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             if let Some(n) = rotpc_every {
                 if rc.cycles >= rotpc_next {
                     rotpc_next = rc.cycles + n;
-                    eprintln!("[rotpc] pc={:#010x} lr={:#010x} sp={:#010x} cyc={}", rc.pc, rc.r[14], rc.r[13], rc.cycles);
+                    eprintln!(
+                        "[rotpc] pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
+                        rc.pc, rc.r[14], rc.r[13], rc.cycles
+                    );
                 }
             }
             if let Some((addr, len)) = rotdump {
@@ -548,10 +889,74 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                     rotdump_last = std::time::Instant::now();
                     let mut a = addr;
                     while a < addr + len {
-                        eprintln!("[rotdump] {:08x}: {:08x} {:08x} {:08x} {:08x}",
-                            a, rb.read32(a), rb.read32(a + 4), rb.read32(a + 8), rb.read32(a + 12));
+                        eprintln!(
+                            "[rotdump] {:08x}: {:08x} {:08x} {:08x} {:08x}",
+                            a,
+                            rb.read32(a),
+                            rb.read32(a + 4),
+                            rb.read32(a + 8),
+                            rb.read32(a + 12)
+                        );
                         a += 16;
                     }
+                }
+            }
+            // sprot SysTick coupling: while the SP is blocked on an sprot
+            // request the RoT has accepted (request_in_flight), advance the SP's
+            // SysTick by the RoT's elapsed 1ms tick events this iteration (1:1 -- both
+            // kernels tick at 1ms) instead of the fabricated one-per-iteration idle
+            // tick, so the SP's SysTick-paced sprot timeout counts down at the true
+            // RoT-relative rate. Gate strictly on request_in_flight (NOT rot_busy,
+            // which a wedge latches true via ssa) and skip while the SP is debug-halted
+            // (its time is genuinely frozen then -- e.g. a RoT task-dump SWD read). A
+            // wedged RoT never sets request_in_flight, so the SP falls to the normal
+            // throttle and times out; no wedge-detector needed.
+            // saturating_sub: tick_events is monotonic (not reset on RoT reboot), so
+            // prev <= cur, but stay underflow-proof regardless. Cap the delta before
+            // the u32 cast so a pathological value saturates rather than truncating,
+            // then saturating_add + min(CREDIT_CAP) bound the bucket.
+            let d_rot = rc.tick_events.saturating_sub(prev_rot_ticks);
+            prev_rot_ticks = rc.tick_events;
+            if sprot_couple && req_in_flight && !cpu.halted {
+                let add = d_rot.min(CREDIT_CAP as u64) as u32;
+                cpu.sp_tick_credit = cpu.sp_tick_credit.saturating_add(add).min(CREDIT_CAP);
+                if coupledbg && (add > 0 || !prev_req_dbg) {
+                    eprintln!(
+                        "[couple] req_in_flight +{} credit={} sp_ticks={} rot_ticks={}",
+                        add, cpu.sp_tick_credit, cpu.tick_events, rc.tick_events
+                    );
+                }
+            } else {
+                if coupledbg && prev_req_dbg {
+                    eprintln!(
+                        "[couple] exchange end: credit was {} sp_ticks={} rot_ticks={}",
+                        cpu.sp_tick_credit, cpu.tick_events, rc.tick_events
+                    );
+                }
+                cpu.sp_tick_credit = 0;
+            }
+            prev_req_dbg = req_in_flight;
+            // Clear prompt-halt servicing once the RoT has taken control of the SP
+            // (halted it over SWD, or resumed it under debug to run endoscope), or
+            // when the safety bound expires; then the SP resumes normal scheduling.
+            let was_servicing = sp_reset_halt_pending;
+            sp_reset_halt_pending = continue_sp_reset_service(
+                sp_reset_halt_pending,
+                cpu.halted,
+                cpu.debug_en,
+                &mut sp_reset_halt_iters,
+            );
+            if coupledbg && was_servicing && !sp_reset_halt_pending {
+                // The SP burst is 0 while servicing, so no reset-vector instructions
+                // ran between the reset edge and this point; report how the RoT took
+                // control and how many serve iterations it took.
+                let iters = SP_RESET_HALT_ITERS - sp_reset_halt_iters;
+                if cpu.halted {
+                    eprintln!("[reset] RoT halted the SP after {iters} serve iterations, SP ran 0 reset-vector instrs (prompt)");
+                } else if cpu.debug_en {
+                    eprintln!("[reset] RoT resumed the SP under debug after {iters} serve iterations (endoscope), SP ran 0 reset-vector instrs");
+                } else {
+                    eprintln!("[reset] backstop: RoT did not halt within {SP_RESET_HALT_ITERS} iterations; SP resumes free-running");
                 }
             }
         } else if let Some(client) = rot_client.as_mut() {
@@ -566,7 +971,9 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
                     if awaiting_reply {
                         lk.mosi.clear(); // discard phase-2 dummy clocks
                     } else {
-                        while let Some(b) = lk.mosi.pop_front() { req_buf.push(b); }
+                        while let Some(b) = lk.mosi.pop_front() {
+                            req_buf.push(b);
+                        }
                     }
                     lk.ssd
                 };
@@ -614,10 +1021,14 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         // notification and sprot's wait_rot_irq returns at once, instead of waiting
         // out its fallback poll-timer (which made sprot round-trips slow).
         {
-            let now_irq = crate::sprot::link().map(|l| l.borrow().rot_irq).unwrap_or(false);
+            let now_irq = crate::sprot::link()
+                .map(|l| l.borrow().rot_irq)
+                .unwrap_or(false);
             if now_irq != prev_rot_irq {
                 prev_rot_irq = now_irq;
-                if let Some(l) = crate::sprot::link() { l.borrow_mut().sp_rot_irq_pending = true; }
+                if let Some(l) = crate::sprot::link() {
+                    l.borrow_mut().sp_rot_irq_pending = true;
+                }
                 bus.pend_irq(9);
             }
         }
@@ -638,9 +1049,12 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         if pumpstats {
             let dt = last_pump.elapsed().as_micros();
             if dt >= pump_thresh_us {
-                eprintln!("[pumpstats] gap={}us instrs={} ({:.2}M/s eff)",
-                    dt, cpu.cycles - last_cyc,
-                    (cpu.cycles - last_cyc) as f64 / (dt as f64 / 1e6) / 1e6);
+                eprintln!(
+                    "[pumpstats] gap={}us instrs={} ({:.2}M/s eff)",
+                    dt,
+                    cpu.cycles - last_cyc,
+                    (cpu.cycles - last_cyc) as f64 / (dt as f64 / 1e6) / 1e6
+                );
             }
             last_pump = std::time::Instant::now();
             last_cyc = cpu.cycles;
@@ -651,8 +1065,12 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
             v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             eprintln!("[pcprof] total_samples={} (every 256th instr) top:", total);
             for (c, pc) in v.iter().take(30) {
-                eprintln!("[pcprof] {:#010x} {} ({:.1}%)", pc, c,
-                    *c as f64 * 100.0 / total.max(1) as f64);
+                eprintln!(
+                    "[pcprof] {:#010x} {} ({:.1}%)",
+                    pc,
+                    c,
+                    *c as f64 * 100.0 / total.max(1) as f64
+                );
             }
             pcprof_last = std::time::Instant::now();
         }
@@ -662,9 +1080,131 @@ pub fn serve(mut cpu: Cpu, mut bus: Bus, mut rot: Option<(Cpu, Bus)>, mut rot_cl
         // the loop stays full-speed and responsive; sleep only when MGS is quiet.
         if cpu.idle_skip > 0 {
             cpu.idle_skip = 0;
-            if !bus.any_pending_irq() && !rot_busy {
+            // Don't sleep while host-UART (IPCC / host console) input is pending:
+            // pump_uart just injected it into uart_rx but collect_irqs hasn't run
+            // yet, so any_pending_irq() doesn't see IRQ 82 here. Sleeping would
+            // stall the SP for idle_ms per byte -- and host_sp_comms only services
+            // the UART when it is back in sys_recv, not while blocked calling
+            // gimlet_seq, so the SP must keep running for both to make progress.
+            let host_uart_pending = !bus.uart_rx.borrow().is_empty();
+            if !bus.any_pending_irq() && !rot_busy && !host_uart_pending {
                 std::thread::sleep(std::time::Duration::from_millis(idle_ms));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const Q: u32 = 340;
+
+    #[test]
+    fn inject_jtag_detect_gated_on_armed_and_preserves_sp_reset() {
+        let mut bus = Bus::new();
+        bus.log_unmapped = false;
+        bus.add_ram(0x4000_4000, 0x100); // stand in for the flat PINT RegFile
+        bus.write32(0x4000_4020, 0x1); // a SP_RESET (slot 0) edge already latched
+
+        // Firmware without JTAG_DETECT (IRQ 5 not enabled): a no-op that disturbs
+        // nothing, so an older RoT image is unaffected.
+        assert!(!inject_jtag_detect(&mut bus));
+        assert_eq!(bus.read32(0x4000_4020), 0x1);
+        assert_eq!(bus.next_irq(), None);
+
+        // Firmware arms JTAG_DETECT (NVIC ISER0 bit 5 = IRQ 5).
+        bus.write32(0xE000_E100, 1 << JTAG_DETECT_IRQ);
+        assert!(inject_jtag_detect(&mut bus));
+        assert_eq!(
+            bus.read32(0x4000_4020),
+            0x3,
+            "slot-1 bit set, coincident slot-0 (SP_RESET) preserved"
+        );
+        assert_eq!(
+            bus.next_irq(),
+            Some(JTAG_DETECT_IRQ),
+            "IRQ 5 pended + enabled"
+        );
+    }
+
+    #[test]
+    fn sp_burst_priority_order() {
+        const EB: u32 = ENDOSCOPE_BURST;
+        // Halted wins over everything: a halted core is not stepped.
+        assert_eq!(sp_burst_for(true, true, true, true, Q, EB), 0);
+        // Servicing a self-reset freezes the SP even though it is not halted and not
+        // in a reply, and outranks the endoscope debug run.
+        assert_eq!(sp_burst_for(false, true, true, false, Q, EB), 0);
+        // Endoscope: running an injected program under debug uses the endoscope burst.
+        assert_eq!(sp_burst_for(false, false, true, false, Q, EB), EB);
+        assert_eq!(
+            sp_burst_for(false, false, true, false, Q, ENDOSCOPE_SPRINT),
+            ENDOSCOPE_SPRINT
+        );
+        // Phase-2 sprot reply: small burst so the SP never outruns the RoT refill.
+        assert_eq!(sp_burst_for(false, false, false, true, Q, EB), 48);
+        // Otherwise the full eth-service quantum.
+        assert_eq!(sp_burst_for(false, false, false, false, Q, EB), Q);
+    }
+
+    #[test]
+    fn endoscope_credit_carries_the_fractional_remainder() {
+        const CAP: u32 = 5000;
+        // A sub-ms delta yields no whole ms and accumulates the remainder.
+        assert_eq!(endoscope_credit(0, 400, 1000, CAP), (0, 400));
+        // The carried remainder plus a new delta crosses 1 ms, keeping the leftover.
+        assert_eq!(endoscope_credit(400, 900, 1000, CAP), (1, 300));
+        // Several whole ms at once, exact remainder.
+        assert_eq!(endoscope_credit(0, 3200, 1000, CAP), (3, 200));
+        // Accumulating many sub-ms deltas eventually credits the same total as one big
+        // delta: 250 deltas of 400 cycles at 1000/ms == 100_000 cycles == 100 ms.
+        let mut acc = 0u64;
+        let mut total_ms = 0u32;
+        for _ in 0..250 {
+            let (ms, next) = endoscope_credit(acc, 400, 1000, CAP);
+            total_ms += ms;
+            acc = next;
+        }
+        assert_eq!(total_ms, 100, "fractional accumulation loses no time");
+        assert_eq!(acc, 0);
+        // The cap clamps a single-iteration burst; the remainder is still exact.
+        assert_eq!(endoscope_credit(0, 10_000_000, 1000, CAP), (CAP, 0));
+    }
+
+    #[test]
+    fn enter_service_only_when_armed_edge_and_not_halted() {
+        // Genuine reset edge, RoT armed, SP still running: enter servicing.
+        assert!(enter_sp_reset_service(true, true, false));
+        // RoT not yet armed (early boot): the SP's measurement loop must free-run.
+        assert!(!enter_sp_reset_service(true, false, false));
+        // No reset this iteration.
+        assert!(!enter_sp_reset_service(false, true, false));
+        // A vector catch already halted the SP: no servicing needed.
+        assert!(!enter_sp_reset_service(true, true, true));
+    }
+
+    #[test]
+    fn service_stays_until_rot_takes_control() {
+        let mut iters = SP_RESET_HALT_ITERS;
+        // Still waiting (RoT has not halted or resumed the SP): stays active, and the
+        // safety countdown ticks down.
+        assert!(continue_sp_reset_service(true, false, false, &mut iters));
+        assert_eq!(iters, SP_RESET_HALT_ITERS - 1);
+        // The RoT halted the SP over SWD: servicing ends.
+        assert!(!continue_sp_reset_service(true, true, false, &mut iters));
+        // The RoT resumed the SP under debug (endoscope): servicing ends.
+        assert!(!continue_sp_reset_service(true, false, true, &mut iters));
+    }
+
+    #[test]
+    fn service_backstop_clears_when_bound_exhausted() {
+        // The RoT armed SP_RESET but never halts the SP: after the bound, give up so
+        // the SP resumes free-running rather than wedging.
+        let mut iters = 1;
+        assert!(!continue_sp_reset_service(true, false, false, &mut iters));
+        assert_eq!(iters, 0);
+        // And once inactive it stays inactive.
+        assert!(!continue_sp_reset_service(false, false, false, &mut iters));
     }
 }
