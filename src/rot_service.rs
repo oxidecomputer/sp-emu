@@ -225,7 +225,7 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
         crate::sprot::enable();
         let (mut rc, mut rb) = crate::build_rot_core(&image).expect("build RoT core");
         let mut host = StdoutHost;
-        let preboot: u64 = crate::config::get().rot_preboot.unwrap_or(40_000_000);
+        let preboot: u64 = crate::config::get().rot_preboot().unwrap_or(40_000_000);
         for _ in 0..preboot {
             if rc.step(&mut rb, &mut host).is_err() {
                 break;

@@ -97,11 +97,11 @@ fn open_host_pty() -> Option<Box<dyn HostUartIo>> {
 /// Connect the host UART to `$SP_EMU_HOST_PTY` (a pty sp-emu creates) or
 /// `$SP_EMU_HOST_UART` (a unix socket to connect to), whichever is set.
 fn open_host_uart() -> Option<Box<dyn HostUartIo>> {
-    if crate::config::get().host_pty {
+    if crate::config::get().host_pty() {
         return open_host_pty();
     }
-    let p = crate::config::get().host_uart.clone()?;
-    match UnixStream::connect(&p) {
+    let p = crate::config::get().host_uart()?;
+    match UnixStream::connect(p) {
         Ok(s) => {
             let _ = s.set_nonblocking(true);
             eprintln!("[bridge] host-uart (UART7/IPCC) connected: {p}");
@@ -187,14 +187,14 @@ impl Bridge {
         // port 2 -> switch1 view); both are `trusted=true`, which MGS state/
         // inventory require (the tech-port VLANs 0x12c/0x12d are untrusted). The
         // gimlet uses 0x301/0x302. SP_EMU_VID0/VID1 still override either default.
-        let sidecar = crate::config::get().board.is_sidecar();
+        let sidecar = crate::config::get().board().is_sidecar();
         let (def0, def1) = if sidecar {
             (VID_SIDECAR0, VID_SWITCH1)
         } else {
             (VID_SWITCH0, VID_SWITCH1)
         };
-        let vid0 = crate::config::get().vid0.unwrap_or(def0);
-        let vid1 = crate::config::get().vid1.unwrap_or(def1);
+        let vid0 = crate::config::get().vid0().unwrap_or(def0);
+        let vid1 = crate::config::get().vid1().unwrap_or(def1);
         let mut socks = Vec::new();
         for (off, vid) in [(0u16, vid0), (1u16, vid1)] {
             let mut a = base;
@@ -313,7 +313,7 @@ impl Bridge {
     fn dbg(&self) -> bool {
         // Bridge-specific var traces relay traffic without enabling the per-IRQ
         // output that $SP_EMU_ETHDBG turns on in cpu.rs.
-        crate::config::get().bridgedbg || crate::config::get().ethdbg
+        crate::config::get().bridgedbg() || crate::config::get().ethdbg()
     }
 
     // ---- SP -> host (parse transmitted frames) ----------------------------
@@ -364,7 +364,7 @@ impl Bridge {
                 // first reply isn't dropped pending NDP resolution.
                 let na = self.build_neighbor_advert(vid, src_mac, &src_ip);
                 self.push_rx(0, na);
-                if crate::config::get().pingtest {
+                if crate::config::get().pingtest() {
                     eprintln!("[bridge] PINGTEST: echo-request -> SP vid {:#x}", vid);
                     let ping = self.build_echo_request(vid, src_mac, &src_ip);
                     self.push_rx(0, ping);
@@ -501,7 +501,7 @@ impl Bridge {
             }
         }
         self.n_recv += got.len() as u64;
-        if crate::config::get().rxstats && self.n_recv % 500 < got.len() as u64 {
+        if crate::config::get().rxstats() && self.n_recv % 500 < got.len() as u64 {
             eprintln!(
                 "[rxstats] recv={} evict={} pop={} qdepth={}",
                 self.n_recv,
@@ -546,7 +546,7 @@ impl Bridge {
     fn push_rx(&mut self, flow: u16, frame: Vec<u8>) {
         // Flow != 0 is a real MGS client request (flow 0 = bridge control: NA/echo).
         // Stamp its arrival so the SP's reply can report the round-trip latency.
-        if flow != 0 && crate::config::get().rttstats {
+        if flow != 0 && crate::config::get().rttstats() {
             self.last_req_at = Some(std::time::Instant::now());
         }
         const RX_BACKLOG_CAP: usize = 32;
@@ -697,7 +697,7 @@ impl HostIo for Bridge {
     }
 
     fn host_uart_flush(&mut self) {
-        let dbg = crate::config::get().uartdbg;
+        let dbg = crate::config::get().uartdbg();
         let s = match self.host_uart.as_mut() {
             Some(s) => s,
             None => {
@@ -737,7 +737,7 @@ impl HostIo for Bridge {
         let mut b = [0u8; 1];
         match s.read(&mut b) {
             Ok(1) => {
-                if crate::config::get().uartdbg {
+                if crate::config::get().uartdbg() {
                     eprintln!("[host-uart] socket RX {:#04x}", b[0]);
                 }
                 Some(b[0])

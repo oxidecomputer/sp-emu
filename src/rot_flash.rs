@@ -173,8 +173,8 @@ fn seed_cfpa(pref_b: bool) -> [u8; PAGE] {
 /// Load a real 512-byte CMPA/CFPA page from an override file (SP_EMU_ROT_CMPA/CFPA),
 /// used to run real bootleby whose PFR validation is stricter than our synthesized
 /// pages. Fails loudly on an unreadable file or a wrong-sized page.
-fn load_page_override(path: &Option<String>) -> Result<Option<[u8; PAGE]>> {
-    let Some(path) = path.as_deref() else {
+fn load_page_override(path: Option<&str>) -> Result<Option<[u8; PAGE]>> {
+    let Some(path) = path else {
         return Ok(None);
     };
     let bytes =
@@ -224,7 +224,7 @@ impl RotFlash {
             status: 0,
             file: None,
             path: path.to_string(),
-            dbg: cfg.rotflashdbg,
+            dbg: cfg.rotflashdbg(),
         };
 
         // Persisted state takes precedence over `image` and the CMPA/CFPA/bootleby
@@ -232,13 +232,14 @@ impl RotFlash {
         // file silently shadowing them is otherwise a confusing surprise. Setting
         // SP_EMU_ROT_FRESH removes all doubt by forcing a re-seed.
         let persisted = Path::new(path).exists();
-        let use_persisted = persisted && !cfg.rot_fresh;
+        let use_persisted = persisted && !cfg.rot_fresh();
         if use_persisted {
             eprintln!(
                 "[rotflash] loaded persisted RoT flash from {path} (ignoring the passed image)"
             );
             // Warn loudly if provisioning overrides are being shadowed by the file.
-            if cfg.rot_cmpa.is_some() || cfg.rot_cfpa.is_some() || cfg.rot_bootleby.is_some() {
+            if cfg.rot_cmpa().is_some() || cfg.rot_cfpa().is_some() || cfg.rot_bootleby().is_some()
+            {
                 eprintln!(
                     "[rotflash] WARNING: persisted {path} shadows SP_EMU_ROT_CMPA/CFPA/BOOTLEBY \
                      (ignored). Set SP_EMU_ROT_FRESH=1 or delete the file to apply them."
@@ -284,14 +285,14 @@ impl RotFlash {
         let cfg = crate::config::get();
         // Slot A: the passed image, unless asked to leave it erased. An erased slot
         // is bootleby's "empty/invalid", used to drive the B-only / neither cases.
-        if cfg.rot_erase_a {
+        if cfg.rot_erase_a() {
             eprintln!("[rotflash] SP_EMU_ROT_ERASE_A: leaving slot A erased");
         } else {
             self.write_pages(IMAGE_A_BASE as usize, image);
         }
         // Slot B: a second image if provided, so real bootleby can do genuine A/B
         // selection; absent, slot B stays erased (invalid).
-        if let Some(path) = cfg.rot_image_b.as_deref() {
+        if let Some(path) = cfg.rot_image_b() {
             let img_b = crate::flash::load_image(path)?;
             eprintln!(
                 "[rotflash] seeded slot B ({} bytes) from {path}",
@@ -302,10 +303,10 @@ impl RotFlash {
         // Real device CMPA/CFPA pages if provided (SP_EMU_ROT_CMPA/CFPA, for running
         // real bootleby), else the synthesized pages. The synthesized CFPA's
         // persistent boot preference follows SP_EMU_ROT_BOOT_PREF.
-        let cmpa = load_page_override(&cfg.rot_cmpa)?.unwrap_or_else(seed_cmpa);
+        let cmpa = load_page_override(cfg.rot_cmpa())?.unwrap_or_else(seed_cmpa);
         self.write_pages(CMPA, &cmpa);
-        let pref_b = cfg.rot_boot_pref.as_deref() == Some("b");
-        let cfpa = load_page_override(&cfg.rot_cfpa)?.unwrap_or_else(|| seed_cfpa(pref_b));
+        let pref_b = cfg.rot_boot_pref() == Some("b");
+        let cfpa = load_page_override(cfg.rot_cfpa())?.unwrap_or_else(|| seed_cfpa(pref_b));
         self.write_pages(CFPA_PING, &cfpa);
         // Pong zeroed, not a copy: on a factory-fresh part the versions tie and
         // bootleby's read_cfpa takes the first page, so ping is unambiguously
@@ -315,7 +316,7 @@ impl RotFlash {
         // (manufacturing data) are programmed, the rest stay erased exactly as on
         // a real part, where reading them faults. SP_EMU_ROT_NMPA replaces the
         // whole region with a captured one.
-        if let Some(path) = cfg.rot_nmpa.as_deref() {
+        if let Some(path) = cfg.rot_nmpa() {
             let blob = crate::flash::load_image(path)?;
             let n = blob.len().min(NMPA_PAGES * PAGE);
             eprintln!("[rotflash] NMPA from {path} ({n} bytes)");
@@ -329,7 +330,7 @@ impl RotFlash {
         // where real parts are. Only for the bundled pages, whose UUID field is
         // zeroed: a caller who supplies a capture is reproducing a specific part,
         // and silently substituting its UUID would defeat the point.
-        if cfg.rot_nmpa.is_none() {
+        if cfg.rot_nmpa().is_none() {
             let uuid = crate::identity::rot_uuid();
             self.mem[NMPA_UUID..NMPA_UUID + uuid.len()].copy_from_slice(&uuid);
             self.set_erased(NMPA_UUID / PAGE, false);
@@ -635,7 +636,7 @@ impl RotFlash {
 
 /// Default backing-file path for the RoT flash, `$SP_EMU_ROT_NVM` or a default.
 pub fn nvm_path() -> String {
-    crate::config::instance_file("SP_EMU_ROT_NVM", &crate::config::get().rot_nvm_path)
+    crate::config::instance_file("SP_EMU_ROT_NVM", crate::config::get().rot_nvm_path())
 }
 
 pub fn load_image(path: &str) -> Result<Vec<u8>> {

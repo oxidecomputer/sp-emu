@@ -1,3 +1,13 @@
+[workspace]
+members = [".", "sp-emu-config"]
+resolver = "2"
+
+# Shared across the emulator and the config crate so the version and feature set
+# are declared once. Members opt in with `<dep>.workspace = true`.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
 [package]
 name = "sp-emu"
 version = "1.1.0"
@@ -21,7 +31,8 @@ lpc55_areas = { git = "https://github.com/oxidecomputer/lpc55_support", version 
 # back the emulated boot-ROM skboot_authenticate instead of hand-rolling crypto.
 # default-features=false leaves out its optional clap, matching hubtools.
 lpc55_sign = { git = "https://github.com/oxidecomputer/lpc55_support", version = "0.3", default-features = false }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml.workspace = true
+sp-emu-config = { path = "sp-emu-config" }
 libc = "0.2"
 
 [profile.release]

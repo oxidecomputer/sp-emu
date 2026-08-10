@@ -47,8 +47,8 @@ pub fn pack(out: &str) -> Result<()> {
     let cfg = crate::config::get();
     // The instance files live under the resolved state directory, not the bare knob
     // defaults, so resolve them the same way the running emulator does.
-    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", &cfg.flash_path);
-    let identity = crate::config::instance_file("SP_EMU_IDENTITY", &cfg.identity_path);
+    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
+    let identity = crate::config::instance_file("SP_EMU_IDENTITY", cfg.identity_path());
     let rot_nvm = crate::rot_flash::nvm_path();
     let base = crate::flash::instance_base(&sp_flash).to_path_buf();
 
@@ -87,10 +87,7 @@ pub fn pack(out: &str) -> Result<()> {
         }
     }
     // CMPA/CFPA the config references (not stowed as Hubris archives) -> archives/.
-    for src in [cfg.rot_cmpa.as_deref(), cfg.rot_cfpa.as_deref()]
-        .into_iter()
-        .flatten()
-    {
+    for src in [cfg.rot_cmpa(), cfg.rot_cfpa()].into_iter().flatten() {
         if let Some(n) = basename(src) {
             push_file(&mut files, &format!("archives/{n}"), PathBuf::from(src));
         }
@@ -139,8 +136,8 @@ fn write_entry(
 /// instance-file path knobs, plus canonical bundle-relative paths for what we bundled.
 fn rewritten_config(rot_nvm: &str) -> String {
     let cfg = crate::config::get();
-    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", &cfg.flash_path);
-    let identity = crate::config::instance_file("SP_EMU_IDENTITY", &cfg.identity_path);
+    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
+    let identity = crate::config::instance_file("SP_EMU_IDENTITY", cfg.identity_path());
     let sp_arch = crate::flash::load_nv(&crate::flash::nv_state_path(&sp_flash)).archive;
     let rot = crate::flash::load_rot_meta(&crate::flash::nv_state_path(rot_nvm));
 
@@ -180,8 +177,8 @@ fn rewritten_config(rot_nvm: &str) -> String {
         set("SP_EMU_ROT_BOOTLEBY", &a);
     }
     for (knob, src) in [
-        ("SP_EMU_ROT_CMPA", cfg.rot_cmpa.as_deref()),
-        ("SP_EMU_ROT_CFPA", cfg.rot_cfpa.as_deref()),
+        ("SP_EMU_ROT_CMPA", cfg.rot_cmpa()),
+        ("SP_EMU_ROT_CFPA", cfg.rot_cfpa()),
     ] {
         if let Some(n) = src.and_then(basename) {
             set(knob, &format!("archives/{n}"));
@@ -194,20 +191,20 @@ fn rewritten_config(rot_nvm: &str) -> String {
 /// original source path as provenance, so an unpacker knows which `humility -a`
 /// to use per target.
 fn build_manifest(cfg: &crate::config::Config, rot_nvm: &str) -> String {
-    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", &cfg.flash_path);
+    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
     let sp_arch = crate::flash::load_nv(&crate::flash::nv_state_path(&sp_flash)).archive;
     let rot = crate::flash::load_rot_meta(&crate::flash::nv_state_path(rot_nvm));
 
     let mut m = String::from("schema = 1\n");
     m.push_str(&format!(
         "board = \"{}\"\n",
-        if cfg.board.is_sidecar() {
+        if cfg.board().is_sidecar() {
             "sidecar"
         } else {
             "gimlet"
         }
     ));
-    if let Some(s) = &cfg.seed {
+    if let Some(s) = cfg.seed() {
         m.push_str(&format!("seed = \"{s}\"\n"));
     }
     m.push_str(
@@ -221,25 +218,10 @@ fn build_manifest(cfg: &crate::config::Config, rot_nvm: &str) -> String {
             }
         }
     };
-    comp(&mut m, "sp", &sp_arch, cfg.archive.as_deref());
-    comp(
-        &mut m,
-        "rot_a",
-        &rot.slot_a_archive,
-        cfg.rot_flash.as_deref(),
-    );
-    comp(
-        &mut m,
-        "rot_b",
-        &rot.slot_b_archive,
-        cfg.rot_image_b.as_deref(),
-    );
-    comp(
-        &mut m,
-        "stage0",
-        &rot.stage0_archive,
-        cfg.rot_bootleby.as_deref(),
-    );
+    comp(&mut m, "sp", &sp_arch, cfg.archive());
+    comp(&mut m, "rot_a", &rot.slot_a_archive, cfg.rot_flash());
+    comp(&mut m, "rot_b", &rot.slot_b_archive, cfg.rot_image_b());
+    comp(&mut m, "stage0", &rot.stage0_archive, cfg.rot_bootleby());
     m
 }
 

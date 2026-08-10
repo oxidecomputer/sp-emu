@@ -91,7 +91,7 @@ impl RotSwdSpi {
             link,
             rx: VecDeque::new(),
             phase: Phase::Idle,
-            trace: crate::config::get().swd_trace,
+            trace: crate::config::get().swd_trace(),
             n_fwr: 0,
         }
     }
