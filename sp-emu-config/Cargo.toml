@@ -1,0 +1,9 @@
+[package]
+name = "sp-emu-config"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned, validated configuration schema for sp-emu instances"
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true

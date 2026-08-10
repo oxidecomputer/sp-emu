@@ -1,9 +1,11 @@
 //! Physical memory + MMIO dispatch for the emulated SoC.
 //!
-//! Two kinds of regions: flat RAM/flash (backed by a `Vec<u8>`) and MMIO
-//! peripherals (a `dyn Mmio`). Anything unmapped is logged and returns 0 / is
-//! swallowed, so the trace keeps moving and surfaces unmodeled accesses rather
-//! than faulting on the first one.
+//! Three kinds of regions: flat RAM (backed by a `Vec<u8>`), MMIO peripherals
+//! (a `dyn Mmio`), and the STM32H7 flash — its own `crate::flash::Flash` model
+//! (program/erase/bank-swap/persistence), routed directly here rather than being
+//! flat RAM. Anything unmapped is logged and returns 0 / is swallowed, so the
+//! trace keeps moving and surfaces unmodeled accesses rather than faulting on
+//! the first one.
 
 use anyhow::{bail, Result};
 
@@ -15,7 +17,9 @@ pub trait Mmio {
     fn write(&mut self, off: u32, val: u32);
     /// Poll for a peripheral interrupt to raise. Returns an IRQ number to set
     /// pending in the NVIC (consumed — returns it once per event). Default: none.
-    fn take_irq(&mut self) -> Option<u16> { None }
+    fn take_irq(&mut self) -> Option<u16> {
+        None
+    }
 }
 
 struct Ram {
@@ -76,16 +80,67 @@ pub struct Bus {
     // TIM5 config registers (CR1/PSC/ARR/...), stored so they read back what
     // was written. CNT and EGR are handled specially in read32/write32.
     tim5_regs: [u32; TIM5_NREGS],
+    /// Set when firmware writes AIRCR.SYSRESETREQ (a system reset request). The
+    /// run loop applies it (re-boot the core from the vector table) and clears it,
+    /// since an `Mmio` device write cannot reach the Cpu.
+    pub reset_pending: bool,
+    /// STM32H7 embedded flash + FLASH controller (bank swap, program/erase,
+    /// persistence). Modeled in the Bus — like the Ethernet DMA — because the data
+    /// stores that program flash target the memory aperture, which only the Bus
+    /// reaches, and must be coordinated with the controller register state. `None`
+    /// on cores with no modeled flash (e.g. the RoT core in Phase 1).
+    flash: Option<crate::flash::Flash>,
+    /// LPC55 RoT flash + flash controller (command engine, per-page erased
+    /// tracking, CMPA/CFPA/NMPA). `Some` only on the RoT core, where it owns both
+    /// the flash memory window (0x0..0x100000) and the controller registers.
+    rot_flash: Option<crate::rot_flash::RotFlash>,
+    /// Boot-ROM API emulation installed (RoT core, `config::rot_rom`): synthesize
+    /// the ROM pointer-graph words on read. See `crate::romapi`.
+    pub rom_enabled: bool,
+    /// Fold the LPC55 TrustZone secure aliases (flash 0x1000_0000, SRAM 0x3000_0000)
+    /// onto their non-secure images, so real bootleby -- which links at the secure
+    /// aliases -- reaches the same RotFlash + RAM. RoT (bootleby) core only; the
+    /// STM32 SP uses 0x3000_0000 as a distinct SRAM, so this stays off there.
+    pub secure_alias: bool,
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
+pub const SCB_VTOR: u32 = 0xE000_ED08;
+const SCB_AIRCR: u32 = 0xE000_ED0C;
+// SysTick registers in the SCS (ARMv7-M B3.3): control/status, reload, current value.
+pub const SYST_CSR: u32 = 0xE000_E010;
+pub const SYST_RVR: u32 = 0xE000_E014;
+pub const SYST_CVR: u32 = 0xE000_E018;
+
+// LPC55 TrustZone address aliases (UM11126 §2.4.1, "Memory map"). The CODE (flash)
+// and SRAM regions are each visible at a non-secure base and a secure alias equal to
+// the non-secure address OR'd with the IDAU secure-alias bit (bit 28). bootleby links
+// at the secure aliases; `Bus::fold` maps them onto the modeled non-secure memory.
+pub const LPC55_SECURE_ALIAS_BIT: u32 = 0x1000_0000;
+const LPC55_SRAM_BASE: u32 = 0x2000_0000; // non-secure main SRAM (SRAMX/SRAM0..)
+const LPC55_SRAM_SIZE: u32 = 0x0008_0000; // main SRAM window folded (covers the RoT's use)
+
+// STM32H7 embedded flash: the XIP memory aperture (both 1 MB banks) and the
+// FLASH controller register block. Routed to the Bus-owned `flash` model.
+const FLASH_WIN_LO: u32 = crate::flash::FLASH_BASE;
+const FLASH_WIN_HI: u32 = crate::flash::FLASH_BASE + crate::flash::TOTAL as u32;
+const FLASH_REG_LO: u32 = 0x5200_2000;
+const FLASH_REG_HI: u32 = 0x5200_4000;
+
+// LPC55 RoT flash: the XIP memory window (both image slots + the protected flash
+// region) and the flash-controller register block. Routed to the Bus-owned
+// `rot_flash` model (RoT core only).
+const ROT_FLASH_WIN_LO: u32 = crate::rot_flash::BASE;
+const ROT_FLASH_WIN_HI: u32 = crate::rot_flash::BASE + crate::rot_flash::SIZE as u32;
+const ROT_FLASH_REG_LO: u32 = 0x4003_4000;
+const ROT_FLASH_REG_HI: u32 = 0x4003_5000;
 
 // ---- STM32H7 Ethernet (base 0x4002_8000; DMA block at +0x1000) -------------
 const ETH_BASE: u32 = 0x4002_8000;
 const ETH_END: u32 = 0x4002_A000;
 const ETH_IRQ: u16 = 61;
 const UART7_IRQ: u16 = 82; // host-sp-comms USART (UART7) global interrupt (H7)
-// Register offsets relative to ETH_BASE.
+                           // Register offsets relative to ETH_BASE.
 const MACMDIOAR: u32 = 0x0200; // MDIO address/control; MB (bit0) = busy, self-clears
 const DMAMR: u32 = 0x1000; // DMA mode; SWR (bit0) = soft reset, self-clears
 const DMAISR: u32 = 0x1008; // interrupt summary; dc0is (bit0) = channel-0 interrupt
@@ -102,11 +157,11 @@ const BUFSZ: u32 = 1536; // drv/stm32h7-eth ring::BUFSZ
 #[derive(Default)]
 struct EthDma {
     regs: std::collections::HashMap<u32, u32>,
-    rx_next: u32, // index into the RX descriptor ring
-    tx_frames: Vec<Vec<u8>>, // frames emitted by the SP, awaiting the host bridge
-    irq: bool, // ETH IRQ (61) pending (set on TX/RX completion)
+    rx_next: u32,             // index into the RX descriptor ring
+    tx_frames: Vec<Vec<u8>>,  // frames emitted by the SP, awaiting the host bridge
+    irq: bool,                // ETH IRQ (61) pending (set on TX/RX completion)
     pending_vid: Option<u16>, // VID from the last TX VLAN context descriptor
-    mdio_page: u16, // VSC85x2 PHY page selected via reg 31 (PAGE)
+    mdio_page: u16,           // VSC85x2 PHY page selected via reg 31 (PAGE)
 }
 
 const MACMDIODR: u32 = 0x0204; // MDIO data register (read/write payload)
@@ -145,14 +200,103 @@ impl Default for Bus {
 
 impl Bus {
     pub fn new() -> Self {
-        let watch = std::env::var("SP_EMU_WATCH").ok()
-            .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-        Bus { rams: Vec::new(), devs: Vec::new(), unmapped_reads: 0, unmapped_writes: 0, log_unmapped: true, watch, cur_pc: 0, cur_cyc: 0, mmio_hit: false, rec: false, writes: Vec::new(),
-            nvic_en: [0; 8], nvic_pend: [0; 8], nvic_prio: [0; 256], pend_pendsv: false,
-            dev_touched: false, eth: EthDma::default(),
+        let watch = crate::config::get().watch();
+        Bus {
+            rams: Vec::new(),
+            devs: Vec::new(),
+            unmapped_reads: 0,
+            unmapped_writes: 0,
+            log_unmapped: true,
+            watch,
+            cur_pc: 0,
+            cur_cyc: 0,
+            mmio_hit: false,
+            rec: false,
+            writes: Vec::new(),
+            nvic_en: [0; 8],
+            nvic_pend: [0; 8],
+            nvic_prio: [0; 256],
+            pend_pendsv: false,
+            dev_touched: false,
+            eth: EthDma::default(),
             uart_tx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
             uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
-            tim5_base: 0, tim5_regs: [0; TIM5_NREGS] }
+            tim5_base: 0,
+            tim5_regs: [0; TIM5_NREGS],
+            reset_pending: false,
+            flash: None,
+            rot_flash: None,
+            rom_enabled: false,
+            secure_alias: false,
+        }
+    }
+
+    /// The RoT flash model, if this is the RoT core (used by `crate::romapi`).
+    pub fn rot_flash(&self) -> Option<&crate::rot_flash::RotFlash> {
+        self.rot_flash.as_ref()
+    }
+
+    /// Fold a secure-alias address onto its non-secure image when secure aliasing is
+    /// on (bootleby): the CODE (flash) and SRAM secure aliases map onto the modeled
+    /// non-secure `RotFlash` and RAM. Secure == non-secure | `LPC55_SECURE_ALIAS_BIT`.
+    #[inline]
+    fn fold(&self, addr: u32) -> u32 {
+        // On the hot path (every fetch/load/store); do the least work when off.
+        if !self.secure_alias {
+            return addr;
+        }
+        let flash_secure =
+            LPC55_SECURE_ALIAS_BIT..(LPC55_SECURE_ALIAS_BIT | crate::rot_flash::SIZE as u32);
+        let sram_secure = (LPC55_SECURE_ALIAS_BIT | LPC55_SRAM_BASE)
+            ..(LPC55_SECURE_ALIAS_BIT | (LPC55_SRAM_BASE + LPC55_SRAM_SIZE));
+        if flash_secure.contains(&addr) || sram_secure.contains(&addr) {
+            addr & !LPC55_SECURE_ALIAS_BIT
+        } else {
+            addr
+        }
+    }
+
+    /// Install the STM32H7 flash model (SP core only). Replaces the flat flash
+    /// `add_ram` + FLASH RegFile stub with real program/erase/bank-swap semantics.
+    pub fn install_flash(&mut self, flash: crate::flash::Flash) {
+        self.flash = Some(flash);
+    }
+
+    /// Latch a committed bank swap into effect (called at each reset edge) and
+    /// flush flash contents to the backing file.
+    pub fn flash_reset_latch(&mut self) {
+        if let Some(f) = self.flash.as_mut() {
+            f.flush();
+            f.reset_latch();
+        }
+    }
+
+    /// Persist flash contents to the backing file (called on clean exit).
+    pub fn flush_flash(&mut self) {
+        if let Some(f) = self.flash.as_mut() {
+            f.flush();
+        }
+    }
+
+    /// Install the LPC55 RoT flash model (RoT core only). Replaces the flat flash
+    /// `add_ram` window and the read-only `LpcFlash` stub.
+    pub fn install_rot_flash(&mut self, flash: crate::rot_flash::RotFlash) {
+        self.rot_flash = Some(flash);
+    }
+
+    /// Load a bootleby image at the RoT flash base (0x0), so the core boots bootleby
+    /// rather than jumping straight to a slot image.
+    pub fn load_rot_bootleby(&mut self, bytes: &[u8]) {
+        if let Some(f) = self.rot_flash.as_mut() {
+            f.load_image_at(0, bytes);
+        }
+    }
+
+    /// Persist RoT flash contents to the backing file (called on clean exit).
+    pub fn flush_rot_flash(&mut self) {
+        if let Some(f) = self.rot_flash.as_mut() {
+            f.flush();
+        }
     }
 
     /// Consume a pending PendSV (the deferred context-switch request).
@@ -170,9 +314,34 @@ impl Bus {
         self.next_irq().is_some() || self.pend_pendsv
     }
 
+    /// Reset the exception sources, as a system reset (SYSRESETREQ or the external
+    /// reset pin) does on silicon: disable and unpend every NVIC IRQ, drop a pending
+    /// PendSV, and return SysTick (`SYST_CSR`/`RVR`/`CVR`) to its disabled reset
+    /// state. Paired with `Cpu::reset_for_reboot` at every reboot site.
+    ///
+    /// Without it, the enable bits the firmware set before the reset stay live across
+    /// a warm reset and an interrupt (notably the kernel SysTick) fires during early
+    /// boot; with `VTOR` still 0 that exception vectors through the flash table into
+    /// the SP firmware, which breaks the RoT's endoscope measurement: the injected
+    /// image runs before it configures its own vectors, so a stray SysTick leaves the
+    /// endoscope for the SP firmware and the measurement never completes. Firmware
+    /// re-enables what it needs during startup.
+    pub fn reset_exception_sources(&mut self) {
+        self.nvic_en = [0; 8];
+        self.nvic_pend = [0; 8];
+        self.pend_pendsv = false;
+        // SysTick lives in the SCS (refreshed into `Cpu::syst_csr`); clear the
+        // authoritative registers so the periodic refresh does not re-enable it.
+        self.write32(SYST_CSR, 0); // ENABLE | TICKINT | CLKSOURCE
+        self.write32(SYST_RVR, 0); // reload
+        self.write32(SYST_CVR, 0); // current value
+    }
+
     // ---- Ethernet MAC/DMA -------------------------------------------------
 
-    fn eth_reg(&self, off: u32) -> u32 { *self.eth.regs.get(&(off & !3)).unwrap_or(&0) }
+    fn eth_reg(&self, off: u32) -> u32 {
+        *self.eth.regs.get(&(off & !3)).unwrap_or(&0)
+    }
 
     fn eth_read(&mut self, off: u32) -> u32 {
         let v = self.eth_reg(off);
@@ -200,9 +369,20 @@ impl Bus {
             (1, 25) => 0x29e8, // VERIPHY_CTRL_REG2: 8051 CRC == EXPECTED_CRC -> skip patch
             // MICRO_PAGE: the driver writes a command (bit15=go) and polls until
             // bit15 clears (done) with bit14 clear (no error) -> mask both off.
-            (16, 18) => *self.eth.regs.get(&(0x1_0000 | (16u32 << 8) | 18)).unwrap_or(&0) as u16 & 0x3FFF,
+            (16, 18) => {
+                *self
+                    .eth
+                    .regs
+                    .get(&(0x1_0000 | (16u32 << 8) | 18))
+                    .unwrap_or(&0) as u16
+                    & 0x3FFF
+            }
             (16, 30) => 0x0001, // EXTENDED_REVISION: tesla_e == 1
-            _ => *self.eth.regs.get(&(0x1_0000 | (page as u32) << 8 | reg as u32)).unwrap_or(&0) as u16,
+            _ => *self
+                .eth
+                .regs
+                .get(&(0x1_0000 | (page as u32) << 8 | reg as u32))
+                .unwrap_or(&0) as u16,
         }
     }
 
@@ -211,20 +391,34 @@ impl Bus {
         // MDIO transaction: writing MACMDIOAR with MB performs a PHY read/write.
         if off == MACMDIOAR && val & 1 != 0 {
             let (goc, rda) = ((val >> 2) & 3, ((val >> 16) & 0x1F) as u8);
-            if goc == 0b11 { // read -> latch the result into MACMDIODR
+            if goc == 0b11 {
+                // read -> latch the result into MACMDIODR
                 let v = self.phy_read(self.eth.mdio_page, rda);
                 if crate::dbg::mdio() {
-                    eprintln!("[mdio] RD page={} reg={} -> {:#06x}", self.eth.mdio_page, rda, v);
+                    eprintln!(
+                        "[mdio] RD page={} reg={} -> {:#06x}",
+                        self.eth.mdio_page, rda, v
+                    );
                 }
                 self.eth.regs.insert(MACMDIODR, v as u32);
-            } else if goc == 0b01 { // write
+            } else if goc == 0b01 {
+                // write
                 let data = self.eth_reg(MACMDIODR) as u16;
-                if rda == 31 { self.eth.mdio_page = data; } // PAGE select
+                if rda == 31 {
+                    self.eth.mdio_page = data;
+                }
+                // PAGE select
                 else {
                     if crate::dbg::mdio() {
-                        eprintln!("[mdio] WR page={} reg={} <- {:#06x}", self.eth.mdio_page, rda, data);
+                        eprintln!(
+                            "[mdio] WR page={} reg={} <- {:#06x}",
+                            self.eth.mdio_page, rda, data
+                        );
                     }
-                    self.eth.regs.insert(0x1_0000 | (self.eth.mdio_page as u32) << 8 | rda as u32, data as u32);
+                    self.eth.regs.insert(
+                        0x1_0000 | (self.eth.mdio_page as u32) << 8 | rda as u32,
+                        data as u32,
+                    );
                 }
             }
             self.eth.regs.insert(MACMDIOAR, val & !1); // MB clears (op complete)
@@ -236,10 +430,14 @@ impl Bus {
                 let cur = self.eth_reg(DMACSR);
                 self.eth.regs.insert(DMACSR, cur & !val);
             }
-            _ => { self.eth.regs.insert(off, val); }
+            _ => {
+                self.eth.regs.insert(off, val);
+            }
         }
         // Writing the TX tail pointer hands new descriptors to the DMA -> transmit.
-        if off == DMACTXDTPR && !self.rec { self.eth_tx_walk(); }
+        if off == DMACTXDTPR && !self.rec {
+            self.eth_tx_walk();
+        }
     }
 
     /// Walk the TX descriptor ring from `tx_next`, emitting every descriptor the
@@ -256,22 +454,33 @@ impl Bus {
         for i in 0..ring_len {
             let d = base.wrapping_add(i.wrapping_mul(16));
             let tdes3 = self.read32(d + 12);
-            if tdes3 & (1 << 31) == 0 { continue; } // driver owns it: nothing to send
+            if tdes3 & (1 << 31) == 0 {
+                continue;
+            } // driver owns it: nothing to send
             self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN — back to the driver
-            // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
-            // insert into the following packet. Not a packet itself — don't emit.
+                                                      // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
+                                                      // insert into the following packet. Not a packet itself — don't emit.
             if tdes3 & (1 << 30) != 0 {
-                if tdes3 & (1 << 16) != 0 { self.eth.pending_vid = Some((tdes3 & 0xFFF) as u16); }
+                if tdes3 & (1 << 16) != 0 {
+                    self.eth.pending_vid = Some((tdes3 & 0xFFF) as u16);
+                }
                 continue;
             }
             let buf = self.read32(d);
             let len = (self.read32(d + 8) & 0x3FFF).min(BUFSZ);
             let mut frame = Vec::with_capacity(len as usize + 4);
-            for i in 0..len { frame.push(self.read8(buf.wrapping_add(i))); }
+            for i in 0..len {
+                frame.push(self.read8(buf.wrapping_add(i)));
+            }
             // The MAC inserts the 802.1Q tag from the context descriptor.
             if let Some(vid) = self.eth.pending_vid.take() {
                 if frame.len() >= 12 {
-                    let tag = [(VLAN_TPID >> 8) as u8, VLAN_TPID as u8, (vid >> 8) as u8, vid as u8];
+                    let tag = [
+                        (VLAN_TPID >> 8) as u8,
+                        VLAN_TPID as u8,
+                        (vid >> 8) as u8,
+                        vid as u8,
+                    ];
                     frame.splice(12..12, tag);
                 }
             }
@@ -287,7 +496,9 @@ impl Bus {
     }
 
     /// Drain frames the SP has transmitted (for the host bridge to forward).
-    pub fn eth_take_tx(&mut self) -> Vec<Vec<u8>> { std::mem::take(&mut self.eth.tx_frames) }
+    pub fn eth_take_tx(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.eth.tx_frames)
+    }
 
     /// Write a humility-`hydrate`-compatible raw memory dump into `dir`: each RAM
     /// region as `0x<base>.bin` plus a `dump.json`. Flash (0x08000000) is omitted
@@ -298,7 +509,9 @@ impl Bus {
     pub fn write_hydrate_dump(&self, dir: &str, archive_id: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         for r in &self.rams {
-            if r.base == 0x0800_0000 { continue; } // flash comes from the archive
+            if r.base == 0x0800_0000 {
+                continue;
+            } // flash comes from the archive
             std::fs::write(format!("{}/0x{:x}.bin", dir, r.base), &r.data)?;
         }
         let json = format!(
@@ -312,13 +525,17 @@ impl Bus {
     /// break its instruction batch as soon as a reply is ready, so a round-trip
     /// costs ~one small quantum instead of a full batch (the eth latency that,
     /// under rack contention, exceeds MGS's per-attempt budget).
-    pub fn eth_has_tx(&self) -> bool { !self.eth.tx_frames.is_empty() }
+    pub fn eth_has_tx(&self) -> bool {
+        !self.eth.tx_frames.is_empty()
+    }
 
     /// Glue between the ETH DMA and the host network bridge: forward transmitted
     /// frames out, and inject any frames the bridge has for us. Called
     /// periodically from the run/gdb loops.
     pub fn pump_eth(&mut self, host: &mut dyn crate::host::HostIo) {
-        for f in self.eth_take_tx() { host.eth_tx(&f); }
+        for f in self.eth_take_tx() {
+            host.eth_tx(&f);
+        }
         // Drain the host network into the bridge once, then deliver only as many
         // frames as the RX ring can accept right now. Checking ring space before
         // popping means a frame is never lost to a full ring — it stays queued in
@@ -327,7 +544,9 @@ impl Bus {
         host.eth_poll();
         while self.eth_rx_has_space() {
             match host.eth_rx() {
-                Some(f) => { self.eth_rx_inject(&f); }
+                Some(f) => {
+                    self.eth_rx_inject(&f);
+                }
                 None => break,
             }
         }
@@ -338,7 +557,9 @@ impl Bus {
     /// in `eth_rx_inject` so the pump can gate delivery without popping a frame.
     fn eth_rx_has_space(&mut self) -> bool {
         let base = self.eth_reg(DMACRXDLAR);
-        if base == 0 { return false; }
+        if base == 0 {
+            return false;
+        }
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
         self.read32(d + 12) & (1 << 31) != 0 // RDES3.OWN set -> DMA owns it -> free
     }
@@ -347,12 +568,15 @@ impl Bus {
     /// ETH IRQ. Returns false (frame dropped) if the RX ring is full.
     pub fn eth_rx_inject(&mut self, frame: &[u8]) -> bool {
         let base = self.eth_reg(DMACRXDLAR);
-        if base == 0 { return false; }
+        if base == 0 {
+            return false;
+        }
         let ring_len = (self.eth_reg(DMACRXRLR) & 0xFFFF) + 1;
         let ring_dbg = crate::dbg::rx();
         let d = base.wrapping_add(self.eth.rx_next.wrapping_mul(16));
         let rdes3 = self.read32(d + 12);
-        if rdes3 & (1 << 31) == 0 { // driver still owns it -> ring full (DMA can't write)
+        if rdes3 & (1 << 31) == 0 {
+            // driver still owns it -> ring full (DMA can't write)
             if ring_dbg {
                 eprintln!("[rx-drop] ring full: rx_next={} ringlen={} d={:#x} rdes3={:#x} (OWN clear) cyc={}",
                     self.eth.rx_next, ring_len, d, rdes3, self.cur_cyc);
@@ -360,25 +584,44 @@ impl Bus {
             return false;
         }
         if ring_dbg {
-            eprintln!("[rx-ok] rx_next={} ringlen={} d={:#x} cyc={}", self.eth.rx_next, ring_len, d, self.cur_cyc);
+            eprintln!(
+                "[rx-ok] rx_next={} ringlen={} d={:#x} cyc={}",
+                self.eth.rx_next, ring_len, d, self.cur_cyc
+            );
         }
         // The bridge supplies a tagged wire frame. The MAC strips the 802.1Q tag
         // and reports the VID in RDES0 (RS0V); net drops frames lacking a valid
         // VID, and reads the untagged frame from the buffer.
         let tagged = frame.len() >= 16 && u16::from_be_bytes([frame[12], frame[13]]) == VLAN_TPID;
-        let vid = if tagged { u16::from_be_bytes([frame[14], frame[15]]) & 0xFFF } else { 0 };
+        let vid = if tagged {
+            u16::from_be_bytes([frame[14], frame[15]]) & 0xFFF
+        } else {
+            0
+        };
         let untagged: Vec<u8>;
         let data: &[u8] = if tagged {
             untagged = [&frame[..12], &frame[16..]].concat();
             &untagged
-        } else { frame };
+        } else {
+            frame
+        };
         if crate::dbg::eth() {
-            eprintln!("[eth-rx] inject {} bytes vid={:#x} cyc={} d={:#x} untagged={}",
-                data.len(), vid, self.cur_cyc, d, data.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+            eprintln!(
+                "[eth-rx] inject {} bytes vid={:#x} cyc={} d={:#x} untagged={}",
+                data.len(),
+                vid,
+                self.cur_cyc,
+                d,
+                data.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
+            );
         }
         let buf = self.read32(d);
         let len = (data.len() as u32).min(BUFSZ);
-        for i in 0..len { self.write8(buf.wrapping_add(i), data[i as usize]); }
+        for i in 0..len {
+            self.write8(buf.wrapping_add(i), data[i as usize]);
+        }
         // Write back: clear OWN, FD|LD, RS0V (RDES0 valid), length; RDES0 = VID.
         let wb = (1 << 29) | (1 << 28) | (1 << 25) | (len & 0x7FFF);
         self.write32(d, vid as u32);
@@ -407,7 +650,9 @@ impl Bus {
             0xE000_E400..=0xE000_E4EF => {
                 let i = (addr - 0xE000_E400) as usize;
                 let mut v = 0;
-                for b in 0..4 { v |= (self.nvic_prio[i + b] as u32) << (8 * b); }
+                for b in 0..4 {
+                    v |= (self.nvic_prio[i + b] as u32) << (8 * b);
+                }
                 Some(v)
             }
             _ => None,
@@ -419,10 +664,14 @@ impl Bus {
             0xE000_E100..=0xE000_E11C => self.nvic_en[((addr - 0xE000_E100) / 4) as usize] |= val,
             0xE000_E180..=0xE000_E19C => self.nvic_en[((addr - 0xE000_E180) / 4) as usize] &= !val,
             0xE000_E200..=0xE000_E21C => self.nvic_pend[((addr - 0xE000_E200) / 4) as usize] |= val,
-            0xE000_E280..=0xE000_E29C => self.nvic_pend[((addr - 0xE000_E280) / 4) as usize] &= !val,
+            0xE000_E280..=0xE000_E29C => {
+                self.nvic_pend[((addr - 0xE000_E280) / 4) as usize] &= !val
+            }
             0xE000_E400..=0xE000_E4EF => {
                 let i = (addr - 0xE000_E400) as usize;
-                for b in 0..4 { self.nvic_prio[i + b] = (val >> (8 * b)) as u8; }
+                for b in 0..4 {
+                    self.nvic_prio[i + b] = (val >> (8 * b)) as u8;
+                }
             }
             _ => return false,
         }
@@ -434,7 +683,6 @@ impl Bus {
     pub fn pend_irq(&mut self, irq: u16) {
         self.nvic_pend[(irq / 32) as usize] |= 1 << (irq % 32);
     }
-
 
     /// Bridge the host-sp-comms UART (UART7) to the host: drain the SP's TX queue
     /// out to the host, then feed any host input into the SP's RX queue. Mirrors
@@ -448,6 +696,9 @@ impl Bus {
                 None => break,
             }
         }
+        // Deliver queued TX to the host, retrying anything the socket could not
+        // accept yet (an IPCC reply is bursty; dropping on WouldBlock truncates it).
+        host.host_uart_flush();
         while let Some(byte) = host.host_uart_rx() {
             self.uart_rx.borrow_mut().push_back(byte);
         }
@@ -463,7 +714,10 @@ impl Bus {
             let mut n = 0;
             for d in self.devs.iter_mut() {
                 if let Some(irq) = d.dev.take_irq() {
-                    if n < raised.len() { raised[n] = irq; n += 1; }
+                    if n < raised.len() {
+                        raised[n] = irq;
+                        n += 1;
+                    }
                 }
             }
             for &irq in &raised[..n] {
@@ -474,6 +728,15 @@ impl Bus {
         if self.eth.irq {
             self.eth.irq = false;
             self.nvic_pend[(ETH_IRQ / 32) as usize] |= 1 << (ETH_IRQ % 32);
+        }
+        // The FLASH controller raises IRQ 4 on erase completion (EOP); the update
+        // server's bank_erase() blocks on this notification. Like the eth DMA, the
+        // event is not gated by the dev-touched device poll.
+        if let Some(f) = self.flash.as_mut() {
+            if f.take_erase_irq() {
+                self.nvic_pend[(crate::flash::FLASH_IRQ / 32) as usize] |=
+                    1 << (crate::flash::FLASH_IRQ % 32);
+            }
         }
         // UART7 (host-sp-comms) RX: like the eth DMA, host input is asynchronous
         // (not gated by the dev-touched poll). Keep IRQ 82 pending while a host
@@ -497,13 +760,22 @@ impl Bus {
         None
     }
 
-    pub fn irq_prio(&self, irq: u16) -> u8 { self.nvic_prio[irq as usize] }
+    pub fn irq_prio(&self, irq: u16) -> u8 {
+        self.nvic_prio[irq as usize]
+    }
+    /// Whether the given NVIC IRQ is enabled (firmware called sys_irq_control).
+    pub fn irq_enabled(&self, irq: u16) -> bool {
+        self.nvic_en[(irq / 32) as usize] & (1 << (irq % 32)) != 0
+    }
     pub fn clear_pending(&mut self, irq: u16) {
         self.nvic_pend[(irq / 32) as usize] &= !(1 << (irq % 32));
     }
 
     pub fn add_ram(&mut self, base: u32, size: u32) {
-        self.rams.push(Ram { base, data: vec![0u8; size as usize] });
+        self.rams.push(Ram {
+            base,
+            data: vec![0u8; size as usize],
+        });
     }
 
     pub fn add_device(&mut self, base: u32, size: u32, dev: Box<dyn Mmio>) {
@@ -535,17 +807,69 @@ impl Bus {
 
     /// Bulk-load bytes into a backing RAM/flash region (used by the image loader).
     pub fn load(&mut self, addr: u32, bytes: &[u8]) -> Result<()> {
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_mut() {
+                f.load_image_at(addr, bytes);
+                return Ok(());
+            }
+        }
+        if let Some(f) = self.rot_flash.as_mut() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                f.load_image_at(addr, bytes);
+                return Ok(());
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, bytes.len() as u32) {
             r.data[off..off + bytes.len()].copy_from_slice(bytes);
             Ok(())
         } else {
-            bail!("load: no region covers {:#010x}..{:#010x}", addr, addr as usize + bytes.len());
+            bail!(
+                "load: no region covers {:#010x}..{:#010x}",
+                addr,
+                addr as usize + bytes.len()
+            );
         }
     }
 
     pub fn read32(&mut self, addr: u32) -> u32 {
+        let addr = self.fold(addr);
+        // Flash aperture (XIP): the hottest path — instruction fetch and constant
+        // loads — so it is checked first. A range test + one XOR (bank remap) +
+        // slice read, no device dispatch.
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                return f.read_mem32(addr);
+            }
+        }
+        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                self.mmio_hit = true;
+                return f.reg_read((addr & !3) - FLASH_REG_LO);
+            }
+        }
+        // LPC55 RoT flash window (XIP) + controller registers. `Some` only on the
+        // RoT core, so the Option check short-circuits on the SP core.
+        if let Some(f) = self.rot_flash.as_ref() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                return f.read_mem32(addr);
+            }
+            if (ROT_FLASH_REG_LO..ROT_FLASH_REG_HI).contains(&addr) {
+                self.mmio_hit = true;
+                return f.reg_read((addr & !3) - ROT_FLASH_REG_LO);
+            }
+        }
+        // Boot-ROM pointer graph (RoT core, config::rot_rom): synthesize the words
+        // the guest loads to reach `skboot_authenticate`. See `crate::romapi`.
+        if self.rom_enabled {
+            if let Some(v) = crate::romapi::rom_read32(addr & !3) {
+                return v;
+            }
+        }
         if (NVIC_LO..NVIC_HI).contains(&addr) {
-            if let Some(v) = self.nvic_read(addr & !3) { self.mmio_hit = true; return v; }
+            if let Some(v) = self.nvic_read(addr & !3) {
+                self.mmio_hit = true;
+                return v;
+            }
         }
         if addr & !3 == SCB_ICSR {
             self.mmio_hit = true;
@@ -572,20 +896,47 @@ impl Bus {
             d.dev.read(off & !3)
         } else {
             self.unmapped_reads += 1;
-            if self.log_unmapped { eprintln!("[mem] unmapped read32  @ {:#010x}", addr); }
+            if self.log_unmapped {
+                eprintln!("[mem] unmapped read32  @ {:#010x}", addr);
+            }
             0
         }
     }
 
     pub fn read16(&mut self, addr: u32) -> u16 {
+        let addr = self.fold(addr);
+        // Flash aperture fast path (instruction fetch reads halfwords).
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                return f.read_mem16(addr);
+            }
+        }
+        if let Some(f) = self.rot_flash.as_ref() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                return f.read_mem16(addr);
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, 2) {
             u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap())
         } else {
+            // `addr` is already folded; read32 re-folds it, which is an idempotent
+            // no-op here (only non-secure MMIO reaches this sub-word fallback).
             (self.read32(addr & !3) >> (8 * (addr & 2))) as u16
         }
     }
 
     pub fn read8(&mut self, addr: u32) -> u8 {
+        let addr = self.fold(addr);
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_ref() {
+                return f.read_mem8(addr);
+            }
+        }
+        if let Some(f) = self.rot_flash.as_ref() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                return f.read_mem8(addr);
+            }
+        }
         if let Some((r, off)) = self.ram_for(addr, 1) {
             r.data[off]
         } else {
@@ -594,14 +945,64 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, val: u32) {
-        if let Some(w) = self.watch { if addr == w { eprintln!("[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})", addr, val, self.cur_pc, self.cur_cyc); } }
-        if (NVIC_LO..NVIC_HI).contains(&addr)
-            && self.nvic_write(addr & !3, val) { self.mmio_hit = true; return; }
-        if addr & !3 == SCB_ICSR {
-            if val & (1 << 28) != 0 { self.pend_pendsv = true; }  // PENDSVSET
-            if val & (1 << 27) != 0 { self.pend_pendsv = false; } // PENDSVCLR
+        let addr = self.fold(addr);
+        if let Some(w) = self.watch {
+            if addr == w {
+                eprintln!(
+                    "[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})",
+                    addr, val, self.cur_pc, self.cur_cyc
+                );
+            }
+        }
+        // Flash aperture (program cycle) and FLASH controller registers.
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_mut() {
+                f.write_mem(addr, val, 4);
+                return;
+            }
+        }
+        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr) {
+            if let Some(f) = self.flash.as_mut() {
+                self.mmio_hit = true;
+                f.reg_write((addr & !3) - FLASH_REG_LO, val);
+                return;
+            }
+        }
+        // LPC55 RoT flash: a store into the window is ignored (flash is written
+        // only via the command engine); the register block drives that engine.
+        if let Some(f) = self.rot_flash.as_mut() {
+            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
+                f.write_mem(addr, val, 4);
+                return;
+            }
+            if (ROT_FLASH_REG_LO..ROT_FLASH_REG_HI).contains(&addr) {
+                self.mmio_hit = true;
+                f.reg_write((addr & !3) - ROT_FLASH_REG_LO, val);
+                return;
+            }
+        }
+        if (NVIC_LO..NVIC_HI).contains(&addr) && self.nvic_write(addr & !3, val) {
             self.mmio_hit = true;
             return;
+        }
+        if addr & !3 == SCB_ICSR {
+            if val & (1 << 28) != 0 {
+                self.pend_pendsv = true;
+            } // PENDSVSET
+            if val & (1 << 27) != 0 {
+                self.pend_pendsv = false;
+            } // PENDSVCLR
+            self.mmio_hit = true;
+            return;
+        }
+        // AIRCR.SYSRESETREQ with the correct write key: firmware self-reset. Flag it
+        // for the run loop to apply (a device write can't reach the Cpu); fall through
+        // so the SCS still stores the register for read-back.
+        if addr & !3 == SCB_AIRCR
+            && (val & 0xFFFF_0000) == 0x05FA_0000
+            && val & (1 << 2) != 0
+        {
+            self.reset_pending = true;
         }
         if (ETH_BASE..ETH_END).contains(&addr) {
             self.mmio_hit = true;
@@ -610,7 +1011,9 @@ impl Bus {
         }
         // Record only writes that actually land in RAM (the reference model can't
         // see emu's device/unmapped writes, so replaying them would desync it).
-        if self.rec && self.ram_for(addr, 4).is_some() { self.writes.push((addr, val, 4)); }
+        if self.rec && self.ram_for(addr, 4).is_some() {
+            self.writes.push((addr, val, 4));
+        }
         if let Some((r, off)) = self.ram_for(addr, 4) {
             r.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
         } else if (TIM5_BASE..TIM5_END).contains(&addr) {
@@ -621,19 +1024,28 @@ impl Bus {
             // regardless of CR1/PSC/ARR.
             match addr & !3 {
                 TIM5_CNT => self.tim5_base = self.cur_cyc.wrapping_sub(val as u64),
-                TIM5_EGR => if val & 1 != 0 { self.tim5_base = self.cur_cyc },
+                TIM5_EGR => {
+                    if val & 1 != 0 {
+                        self.tim5_base = self.cur_cyc
+                    }
+                }
                 a => self.tim5_regs[(a - TIM5_BASE) as usize / 4] = val,
             }
         } else if let Some((d, off)) = self.dev_for(addr) {
             d.dev.write(off & !3, val);
         } else {
             self.unmapped_writes += 1;
-            if self.log_unmapped { eprintln!("[mem] unmapped write32 @ {:#010x} = {:#010x}", addr, val); }
+            if self.log_unmapped {
+                eprintln!("[mem] unmapped write32 @ {:#010x} = {:#010x}", addr, val);
+            }
         }
     }
 
     pub fn write16(&mut self, addr: u32, val: u16) {
-        if self.rec && self.ram_for(addr, 2).is_some() { self.writes.push((addr, val as u32, 2)); }
+        let addr = self.fold(addr);
+        if self.rec && self.ram_for(addr, 2).is_some() {
+            self.writes.push((addr, val as u32, 2));
+        }
         if let Some((r, off)) = self.ram_for(addr, 2) {
             r.data[off..off + 2].copy_from_slice(&val.to_le_bytes());
         } else {
@@ -644,7 +1056,10 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, val: u8) {
-        if self.rec && self.ram_for(addr, 1).is_some() { self.writes.push((addr, val as u32, 1)); }
+        let addr = self.fold(addr);
+        if self.rec && self.ram_for(addr, 1).is_some() {
+            self.writes.push((addr, val as u32, 1));
+        }
         if let Some((r, off)) = self.ram_for(addr, 1) {
             r.data[off] = val;
         } else {
@@ -659,14 +1074,39 @@ impl Bus {
 mod tests {
     use super::*;
 
+    #[test]
+    fn secure_alias_fold() {
+        let mut bus = Bus::new();
+        // Off by default: nothing folds.
+        assert_eq!(bus.fold(0x1001_0000), 0x1001_0000);
+        assert_eq!(bus.fold(0x3000_4000), 0x3000_4000);
+
+        bus.secure_alias = true;
+        // Secure flash/SRAM aliases fold onto their non-secure images.
+        assert_eq!(bus.fold(0x1001_0000), 0x0001_0000); // slot A
+        assert_eq!(bus.fold(0x1000_0000), 0x0000_0000); // flash window start
+        assert_eq!(bus.fold(0x3000_4000), 0x2000_4000); // RAM (bootleby stack/bss)
+        assert_eq!(bus.fold(0x3007_ffff), 0x2007_ffff); // top of the SRAM window
+        // Just past each window: untouched (boundary check).
+        assert_eq!(bus.fold(0x1010_0000), 0x1010_0000);
+        assert_eq!(bus.fold(0x3008_0000), 0x3008_0000);
+        // Unrelated addresses (peripherals, the ROM table) are never folded.
+        assert_eq!(bus.fold(0x4003_4000), 0x4003_4000);
+        assert_eq!(bus.fold(0x1300_10f0), 0x1300_10f0);
+    }
+
     // Stands in for soc's RegFile catch-all (store/return over the whole
     // peripheral space). TIM5 must be served by the Bus interception, not this
     // device — the original bug was TIM5_CNT falling through to the catch-all and
     // reading back whatever was last written, so it never incremented.
     struct Sentinel;
     impl Mmio for Sentinel {
-        fn name(&self) -> &str { "sentinel" }
-        fn read(&mut self, _off: u32) -> u32 { 0xDEAD_BEEF }
+        fn name(&self) -> &str {
+            "sentinel"
+        }
+        fn read(&mut self, _off: u32) -> u32 {
+            0xDEAD_BEEF
+        }
         fn write(&mut self, _off: u32, _val: u32) {}
     }
 
@@ -682,10 +1122,18 @@ mod tests {
         let mut bus = bus_with_catchall();
         bus.cur_cyc = 0;
         bus.write32(TIM5_CNT, 0); // startup driver seeds CNT = 0
-        assert_eq!(bus.read32(TIM5_CNT), 0, "reads the counter, not the catch-all sentinel");
+        assert_eq!(
+            bus.read32(TIM5_CNT),
+            0,
+            "reads the counter, not the catch-all sentinel"
+        );
         assert_ne!(bus.read32(TIM5_CNT), 0xDEAD_BEEF);
         bus.cur_cyc = 500; // 500 retired instructions later
-        assert_eq!(bus.read32(TIM5_CNT), 500, "CNT advances 1:1 with the instruction count");
+        assert_eq!(
+            bus.read32(TIM5_CNT),
+            500,
+            "CNT advances 1:1 with the instruction count"
+        );
     }
 
     #[test]
@@ -727,8 +1175,13 @@ mod tests {
             bus.cur_cyc += 1; // retire one instruction per poll
             let now = bus.read32(TIM5_CNT);
             iters += 1;
-            if now.wrapping_sub(start) >= micros { break; }
-            assert!(iters < 10_000, "delay loop did not terminate — CNT not advancing");
+            if now.wrapping_sub(start) >= micros {
+                break;
+            }
+            assert!(
+                iters < 10_000,
+                "delay loop did not terminate — CNT not advancing"
+            );
         }
         assert!(iters >= micros);
     }
@@ -739,10 +1192,43 @@ mod tests {
         let (cr1, psc) = (TIM5_BASE, TIM5_BASE + 0x28);
         bus.write32(cr1, 1);
         bus.write32(psc, 63);
-        assert_eq!(bus.read32(cr1), 1, "config registers read back the last write");
+        assert_eq!(
+            bus.read32(cr1),
+            1,
+            "config registers read back the last write"
+        );
         assert_eq!(bus.read32(psc), 63);
         bus.write32(TIM5_EGR, 1);
         assert_eq!(bus.read32(TIM5_EGR), 0, "EGR is write-only");
+    }
+
+    /// A system reset clears the exception sources: an NVIC IRQ the firmware enabled
+    /// and pended, and SysTick, are all returned to their reset state so nothing fires
+    /// during the post-reset boot. Without this a stale interrupt (notably the kernel
+    /// SysTick) vectors through the flash table with VTOR still 0 and derails the RoT's
+    /// endoscope measurement after a warm reset.
+    #[test]
+    fn reset_exception_sources_clears_nvic_and_systick() {
+        let mut bus = bus_with_catchall();
+        // The SysTick registers live in the SCS device (absent from a bare test Bus).
+        bus.add_device(0xE000_E000, 0x1000, Box::new(crate::soc::Scs::new()));
+
+        bus.write32(0xE000_E100, 1 << 15); // NVIC ISER: enable IRQ 15
+        bus.pend_irq(15);
+        bus.write32(SYST_CSR, 0b011); // ENABLE | TICKINT
+        bus.write32(SYST_RVR, 479_999);
+        assert!(bus.any_pending_irq(), "IRQ 15 enabled+pending before reset");
+        assert_ne!(bus.read32(SYST_CSR) & 1, 0, "SysTick enabled before reset");
+
+        bus.reset_exception_sources();
+
+        assert!(
+            !bus.any_pending_irq(),
+            "reset drops the enabled+pending IRQ"
+        );
+        assert!(!bus.irq_enabled(15), "reset disables the IRQ");
+        assert_eq!(bus.read32(SYST_CSR) & 0b111, 0, "SYST_CSR cleared on reset");
+        assert_eq!(bus.read32(SYST_RVR), 0, "SYST_RVR cleared on reset");
     }
 
     #[test]
@@ -754,6 +1240,198 @@ mod tests {
         assert_eq!(start, u32::MAX - 5);
         bus.cur_cyc = 10; // ten ticks later, wrapped past zero
         let now = bus.read32(TIM5_CNT);
-        assert_eq!(now.wrapping_sub(start), 10, "the firmware's wrapping-sub delta is correct across rollover");
+        assert_eq!(
+            now.wrapping_sub(start),
+            10,
+            "the firmware's wrapping-sub delta is correct across rollover"
+        );
+    }
+
+    #[test]
+    fn aircr_sysresetreq_flags_reset() {
+        let mut bus = Bus::new();
+        assert!(!bus.reset_pending);
+        bus.write32(SCB_AIRCR, 0x05FA_0004); // VECTKEY | SYSRESETREQ
+        assert!(bus.reset_pending, "SYSRESETREQ with the key flags a reset");
+    }
+
+    #[test]
+    fn aircr_needs_key_and_req() {
+        let mut bus = Bus::new();
+        bus.write32(SCB_AIRCR, 0x0000_0004); // SYSRESETREQ but no write key
+        assert!(!bus.reset_pending);
+        bus.write32(SCB_AIRCR, 0x05FA_0000); // key but no SYSRESETREQ (e.g. PRIGROUP)
+        assert!(!bus.reset_pending);
+    }
+
+    /// Drive the exact STM32H7 update-server register sequence against the flash
+    /// model and assert bank erase (+ its IRQ), NOR word programming, the
+    /// option-byte bank swap (staged -> committed -> reset-latched), and that the
+    /// swap + programmed image survive a reload from the backing file.
+    #[test]
+    fn flash_update_and_bank_swap_persist() {
+        use crate::flash;
+        const REG: u32 = FLASH_REG_LO;
+        const BANK1_VEC: u32 = 0x1111_1111;
+        const BANK2_VEC: u32 = 0x2222_2222;
+
+        // A private backing file for this test (removed at the end).
+        let path = std::env::temp_dir()
+            .join(format!("sp-emu-flashtest-{}.bin", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let nv_file = flash::nv_state_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&nv_file);
+
+        // Image: bank1 (slot A) holds a vector, bank2 (slot B) is erased.
+        let mut img = vec![flash::ERASED; flash::TOTAL];
+        img[0..4].copy_from_slice(&BANK1_VEC.to_le_bytes());
+        let mut bus = Bus::new();
+        bus.install_flash(flash::Flash::new(&path, img, flash::NvState::default()));
+        bus.write32(0xE000_E100, 1 << flash::FLASH_IRQ); // NVIC enable IRQ 4
+
+        // 1. Unlock bank2 (KEYR2) and the option bytes (OPTKEYR).
+        bus.write32(REG + 0x104, 0x4567_0123);
+        bus.write32(REG + 0x104, 0xCDEF_89AB);
+        bus.write32(REG + 0x08, 0x0819_2A3B);
+        bus.write32(REG + 0x08, 0x4C5D_6E7F);
+
+        // 2. Whole-bank erase: CR2 = BER | START | EOPIE. EOP latches and IRQ 4
+        //    pends (the driver blocks on this notification).
+        bus.write32(REG + 0x10C, (1 << 3) | (1 << 7) | (1 << 16));
+        assert_ne!(
+            bus.read32(REG + 0x110) & (1 << 16),
+            0,
+            "SR2.EOP set after erase"
+        );
+        bus.collect_irqs();
+        assert_eq!(
+            bus.next_irq(),
+            Some(flash::FLASH_IRQ),
+            "erase pends FLASH IRQ 4"
+        );
+        bus.write32(REG + 0x114, 1 << 16); // CCR2: clear EOP (W1C)
+        assert_eq!(
+            bus.read32(REG + 0x110) & (1 << 16),
+            0,
+            "EOP cleared via CCR2"
+        );
+
+        // 3. Program a 256-bit word: CR2 = PSIZE(0b11) | PG, then store into the
+        //    bank2 aperture (0x0810_0000). NOR: 0xFF & value = value; QW reads 0.
+        bus.write32(REG + 0x10C, (0b11 << 4) | (1 << 1));
+        bus.write32(0x0810_0000, BANK2_VEC);
+        assert_eq!(
+            bus.read32(REG + 0x110) & (1 << 2),
+            0,
+            "SR2.QW reads 0 (instant)"
+        );
+        assert_eq!(bus.read32(0x0810_0000), BANK2_VEC, "bank2 programmed");
+        assert_eq!(
+            bus.read32(0x0800_0000),
+            BANK1_VEC,
+            "bank1 still active pre-swap"
+        );
+
+        // A store without PG must be ignored (flash is not RAM).
+        bus.write32(REG + 0x10C, 0); // clear PG
+        bus.write32(0x0810_0004, 0xDEAD_BEEF);
+        assert_eq!(bus.read32(0x0810_0004), u32::MAX, "no PG -> write dropped");
+
+        // 4. Bank swap: stage OPTSR_PRG.SWAP_BANK_OPT, commit via OPTCR.OPTSTART.
+        //    Committed (OPTSR_CUR) flips now; effective (OPTCR.SWAP_BANK) only at
+        //    reset, so the running image is not remapped underfoot.
+        bus.write32(REG + 0x20, 1 << 31);
+        bus.write32(REG + 0x18, 1 << 1);
+        assert_ne!(
+            bus.read32(REG + 0x1C) & (1 << 31),
+            0,
+            "OPTSR_CUR committed swap"
+        );
+        assert_eq!(
+            bus.read32(REG + 0x18) & (1 << 31),
+            0,
+            "OPTCR effective swap not yet"
+        );
+        assert_eq!(
+            bus.read32(0x0800_0000),
+            BANK1_VEC,
+            "still bank1 until reset"
+        );
+        assert!(
+            flash::load_nv(&nv_file).swap_bank,
+            "OPTSTART persisted the swap"
+        );
+
+        // 5. Reset latch: effective <- committed; the aperture now maps bank2.
+        bus.flash_reset_latch();
+        assert_ne!(
+            bus.read32(REG + 0x18) & (1 << 31),
+            0,
+            "OPTCR effective swap latched"
+        );
+        assert_eq!(
+            bus.read32(0x0800_0000),
+            BANK2_VEC,
+            "bank2 active after reset"
+        );
+
+        // 6. Reload from the backing file + state file: the swap and the programmed
+        //    image persist across a run.
+        let img2 = flash::load_nvm(&path).unwrap();
+        let nv2 = flash::load_nv(&nv_file);
+        let mut bus2 = Bus::new();
+        bus2.install_flash(flash::Flash::new(&path, img2, nv2));
+        assert_eq!(bus2.read32(0x0800_0000), BANK2_VEC, "swapped bank persists");
+        assert_eq!(
+            bus2.read32(0x0810_0000),
+            BANK1_VEC,
+            "old bank at inactive aperture"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&nv_file);
+    }
+
+    /// An access straddling the very top of the 2 MB flash window must not panic
+    /// (the dispatch range-checks only the base address): reads return erased
+    /// bytes and a program store drops the overrun. Regression guard for the
+    /// width handling in the aperture accessors.
+    #[test]
+    fn flash_boundary_access_does_not_panic() {
+        use crate::flash;
+        let path = std::env::temp_dir()
+            .join(format!("sp-emu-flashbound-{}.bin", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(flash::nv_state_path(&path));
+
+        let mut bus = Bus::new();
+        bus.install_flash(flash::Flash::new(
+            &path,
+            vec![flash::ERASED; flash::TOTAL],
+            flash::NvState::default(),
+        ));
+
+        // Last aligned word is fully in range; the straddling reads in the top
+        // few bytes must not panic and read as erased flash.
+        assert_eq!(bus.read32(FLASH_WIN_HI - 4), u32::MAX);
+        assert_eq!(bus.read32(FLASH_WIN_HI - 2), u32::MAX, "straddling read32");
+        assert_eq!(bus.read32(FLASH_WIN_HI - 1), u32::MAX);
+        assert_eq!(bus.read16(FLASH_WIN_HI - 1), u16::MAX, "straddling read16");
+
+        // A program store that straddles the end: unlock + PG, then write. Only
+        // the in-range bytes are programmed; the overrun is dropped (no panic).
+        bus.write32(FLASH_REG_LO + 0x104, 0x4567_0123);
+        bus.write32(FLASH_REG_LO + 0x104, 0xCDEF_89AB);
+        bus.write32(FLASH_REG_LO + 0x10C, (0b11 << 4) | (1 << 1)); // PSIZE|PG
+        bus.write32(FLASH_WIN_HI - 2, 0);
+        // Top two bytes cleared to 0, the two below them untouched (0xFF).
+        assert_eq!(bus.read32(FLASH_WIN_HI - 4), 0x0000_FFFF);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(flash::nv_state_path(&path));
     }
 }

@@ -1,0 +1,24 @@
+# RoT boot-path suite for sp-emu.
+#
+# Validates the emulated LPC55S69 RoT boot path against a running sp-emu (started
+# with SP_EMU_ROT_FLASH so the RoT is reachable over sprot). Tests that need
+# genuine bootleby selection are added as the serve-mode-bootleby enablers land;
+# see hwci/README.md.
+
+[suite]
+id = "rot-boot"
+name = "RoT boot path"
+description = "RoT boot-state reachability and (as enablers land) bootleby A/B/panic selection, transient override, and update flows"
+
+[[tests]]
+id = "rot-boot-state"
+
+# Planned, pending serve-mode bootleby + RoT reset re-run:
+# [[tests]]
+# id = "rot-ab-selection"
+# [[tests]]
+# id = "rot-transient-override"
+# [[tests]]
+# id = "rot-fw-update"
+# [[tests]]
+# id = "rot-stage0-update"
