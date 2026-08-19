@@ -10,9 +10,8 @@
 //! back so the RoT can actually read/write the SP.
 
 use crate::mem::Mmio;
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 // FLEXCOMM5 SPI register offsets.
 const STAT: u32 = 0x408; // MSTIDLE = bit8
@@ -36,8 +35,10 @@ pub struct SwdReq {
     pub wdata: u32,
 }
 
-/// Shared link between the RoT-side FLEXCOMM5 device and the serve loop, which
-/// owns the SP's cpu/bus and so can drive its `SwDp`.
+/// Shared link between the RoT-side FLEXCOMM5 device (RoT thread) and the SP
+/// serve loop (SP thread), which owns the SP's cpu/bus and so can drive its
+/// `SwDp`. SWD takes effect at SP instruction boundaries on hardware too, so
+/// servicing transactions from the SP loop preserves halt semantics.
 pub struct SwdLink {
     /// RoT -> serve loop: decoded transactions to run against the SP, in order
     /// (a burst may clock several writes before the serve loop drains them).
@@ -47,23 +48,30 @@ pub struct SwdLink {
     pub resp: Option<u32>,
 }
 
-thread_local! {
-    static SWD: RefCell<Option<Rc<RefCell<SwdLink>>>> = const { RefCell::new(None) };
+/// Mutex wrapper keeping the old `Rc<RefCell>` call-site shape.
+pub struct SwdCell(Mutex<SwdLink>);
+impl SwdCell {
+    pub fn borrow(&self) -> MutexGuard<'_, SwdLink> {
+        self.0.lock().unwrap()
+    }
+    pub fn borrow_mut(&self) -> MutexGuard<'_, SwdLink> {
+        self.0.lock().unwrap()
+    }
 }
+
+static SWD: OnceLock<Arc<SwdCell>> = OnceLock::new();
 
 /// Install the shared SWD link (once, before either bus is built).
 pub fn enable() {
-    SWD.with(|s| {
-        *s.borrow_mut() = Some(Rc::new(RefCell::new(SwdLink {
-            req: VecDeque::new(),
-            resp: None,
-        })))
-    });
+    let _ = SWD.set(Arc::new(SwdCell(Mutex::new(SwdLink {
+        req: VecDeque::new(),
+        resp: None,
+    }))));
 }
 
 /// A clone of the shared SWD link handle, if enabled.
-pub fn link() -> Option<Rc<RefCell<SwdLink>>> {
-    SWD.with(|s| s.borrow().clone())
+pub fn link() -> Option<Arc<SwdCell>> {
+    SWD.get().cloned()
 }
 
 /// Decoder phase across the frames of one SWD transaction.
@@ -78,7 +86,7 @@ enum Phase {
 
 /// FLEXCOMM5 SPI block: decodes the RoT's raw SWD and drives the SP's SwDp.
 pub struct RotSwdSpi {
-    link: Rc<RefCell<SwdLink>>,
+    link: Arc<SwdCell>,
     rx: VecDeque<u16>, // frames the RoT will pop via FIFORD
     phase: Phase,
     trace: bool,
@@ -86,7 +94,7 @@ pub struct RotSwdSpi {
 }
 
 impl RotSwdSpi {
-    pub fn new(link: Rc<RefCell<SwdLink>>) -> Self {
+    pub fn new(link: Arc<SwdCell>) -> Self {
         RotSwdSpi {
             link,
             rx: VecDeque::new(),
@@ -141,6 +149,10 @@ impl RotSwdSpi {
                     self.rx.push_back(ACK_OK);
                     if rnw {
                         self.link.borrow_mut().req.push_back(SwdReq { ap, rnw: true, a, wdata: 0 });
+                        // The SP thread drains SWD requests; it may be parked idle.
+                        if let Some(l) = crate::sprot::link() {
+                            l.wake_sp();
+                        }
                         self.phase = Phase::ReadData;
                     } else {
                         self.phase = Phase::WriteData { acc: 0, bits: 0, ap, a };
@@ -173,6 +185,9 @@ impl RotSwdSpi {
                         a,
                         wdata,
                     });
+                    if let Some(l) = crate::sprot::link() {
+                        l.wake_sp();
+                    }
                     if self.trace {
                         eprintln!("[swd] write ap={} a={:#x} data={:#010x}", ap as u8, a, wdata);
                     }

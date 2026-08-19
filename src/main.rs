@@ -685,12 +685,13 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
         rotswd::enable();
     }
     let (cpu, bus) = setup(&nvm, swap_override)?;
-    let rot = match (&rot_service, &rot_flash) {
+    // The RoT core itself is built on its own thread (gdb::rot_thread_main);
+    // only the image bytes cross.
+    let rot_image = match (&rot_service, &rot_flash) {
         (None, Some(p)) => {
             eprintln!("[rot] SP_EMU_ROT_FLASH={p}");
             record_rot_archives(p);
-            let img = flash::load_image(p)?;
-            Some(build_rot_core(&img)?)
+            Some(flash::load_image(p)?)
         }
         _ => None,
     };
@@ -699,7 +700,7 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
         rot_service::RotClient::connect(a)
     });
     let mut host = make_host();
-    gdb::serve(cpu, bus, rot, rot_client, host.as_mut(), preboot)
+    gdb::serve(cpu, bus, rot_image, rot_client, host.as_mut(), preboot)
 }
 
 /// Stow the RoT's Hubris archives into the instance base (the SP flash's directory,

@@ -1205,8 +1205,25 @@ impl Mmio for GpioBank {
                 let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
                 let new_cs = (odr >> 4) & 1 == 0;
                 let mut l = lk.borrow_mut();
-                if new_cs != l.cs {
+                let edge = new_cs != l.cs;
+                if edge {
                     if new_cs {
+                        // Transaction pacing (live RoT thread): a new transfer
+                        // must not start while the RoT still owes the previous
+                        // one an SSA/SSD ack, or its cleanup would race this
+                        // transfer's bytes (bounded; timeout proceeds).
+                        if l.rot_live {
+                            let mut budget = 400;
+                            while (l.ssa || l.ssd) && budget > 0 {
+                                l = lk.wait_sp(l, 5);
+                                budget -= 1;
+                            }
+                            // Unread request bytes belong to a dead transaction
+                            // (the firmware's start-of-transfer cleanup would
+                            // discard them); drop them so this transfer's first
+                            // frame carries the SOT.
+                            l.mosi.clear();
+                        }
                         // CS asserted: start of a transfer. Latch SSA + the SOT bit
                         // for the first FIFORD frame the RoT reads.
                         l.ssa = true;
@@ -1225,6 +1242,11 @@ impl Mmio for GpioBank {
                     }
                 }
                 l.cs = new_cs;
+                drop(l);
+                // A CS edge is the start/end of a transfer: wake a parked RoT.
+                if edge {
+                    lk.wake_rot();
+                }
             }
         }
         // GPIOB/GPIOI affect SPI2 CS; GPIOJ (port 9) affects the sidecar SPI5 CS.
