@@ -452,10 +452,16 @@ impl Mmio for Spi4 {
 ///   WRITE: [a23..16 (MSB=1), a15..8, a7..0] + 4 data bytes (BE)
 /// Master is modeled synchronously (each TXDR byte immediately yields its RXDR
 /// byte and SR reports TXP+RXP) so the spi-core transfer loop never sleeps
-/// on spi-irq — same model as the gimlet `Spi4`/KSZ8463. CHIP_ID (reg 0x71010000
-/// -> word addr 0x4000) must decode rev_id=0x3, part_id=0x7468, mfg_id=0x74,
-/// one=0x1 (= 0x374680E9), or `monorail` panics `BadChipId`. Every other register
-/// is store/return-0.
+/// on spi-irq — same model as the gimlet `Spi4`/KSZ8463.
+///
+/// The register plane is store/return with the values and behaviors the stock
+/// monorail init checks on top: CHIP_ID (0x374680E9, else BadChipId), PLL5G
+/// gain_stat, self-clearing RAM_INIT strobes and serdes1g/6g MCB one-shots,
+/// 10G serdes RCPLL lock/FSM status and APC offset-cal done, and the
+/// DEVCPU_GCB MIIM(0) controller bridging to a VSC8504 (Tesla) quad-PHY
+/// register model on MIIM addresses 4..=7 (identity, revision, port index,
+/// instant micro commands, and a patch CRC answer that skips the 8051
+/// firmware download).
 pub struct Vsc7448 {
     regs: std::collections::HashMap<u32, u32>,
     vsc: std::collections::HashMap<u32, u32>, // VSC7448 reg file, keyed by 24-bit word addr
@@ -466,6 +472,13 @@ pub struct Vsc7448 {
     rval: u32,    // register value being read out
     wval: u32,    // register value being assembled during a write
     vscdbg: bool, // SP_EMU_VSCDBG: trace every VSC7448 register read/write
+    // MIIM bridge to the on-board VSC8504 quad PHY (monorail drives it through
+    // DEVCPU_GCB MIIM(0): MII_CMD word 0x4034, MII_DATA 0x4035, MII_STATUS
+    // 0x4032). Register file keyed by (miim address, page, register); page
+    // per MIIM address via register 31.
+    phy_regs: std::collections::HashMap<(u8, u16, u8), u16>,
+    phy_page: std::collections::HashMap<u8, u16>,
+    mii_data: u32, // last MIIM read result (SUCCESS bits [17:16] = 0 = ok)
 }
 impl Vsc7448 {
     pub fn new() -> Self {
@@ -479,6 +492,9 @@ impl Vsc7448 {
             rval: 0,
             wval: 0,
             vscdbg: crate::config::get().vscdbg(),
+            phy_regs: std::collections::HashMap::new(),
+            phy_page: std::collections::HashMap::new(),
+            mii_data: 0,
         }
     }
     fn vsc_read(&self, waddr: u32) -> u32 {
@@ -491,8 +507,107 @@ impl Vsc7448 {
             // then errors LcPllInitFailed -> monorail BspInitFailed panic. Report a
             // locked PLL (gain_stat=5). See drv/vsc7448/src/lib.rs pll5g_setup.
             0x11800f => 5 << 14,
-            _ => *self.vsc.get(&waddr).unwrap_or(&0),
+            // MIIM(0) MII_STATUS (reg 0x710100c8): never pending or busy.
+            0x4032 => 0,
+            // MIIM(0) MII_DATA (reg 0x710100d4): last PHY read, SUCCESS = ok.
+            0x4035 => self.mii_data,
+            _ => {
+                let reg = 0x7100_0000 | (waddr << 2);
+                let stored = *self.vsc.get(&waddr).unwrap_or(&0);
+                // XGANA (0x71480000, 4 instances of 0x10000): the 10G serdes
+                // RCPLL status. STAT0 (TX +0x18c, RX +0xcc) reads
+                // pllf_lock_stat (bit 31) set; STAT1 (TX +0x190, RX +0xd0)
+                // reads pllf_fsm_stat (bits [3:0]) = 13. serdes10g apply
+                // checks both, else Tx/RxPllLockFailed / Tx/RxPllFsmFailed
+                // and monorail panics BspInitFailed.
+                if (0x7148_0000..0x714C_0000).contains(&reg) {
+                    match reg & 0xFFFF {
+                        0x18c | 0xcc => stored | 0x8000_0000,
+                        0x190 | 0xd0 => stored | 0xd,
+                        _ => stored,
+                    }
+                // XGDIG (0x714C0000, 4 instances of 0x10000):
+                // APC_IS_CAL_CFG1 (+0x20) reads offscal_done (bit 1) set;
+                // serdes10g apply polls it once after starting the offset
+                // calibration, else OffsetCalFailed.
+                } else if (0x714C_0000..0x7150_0000).contains(&reg) && reg & 0xFFFF == 0x20 {
+                    stored | 0x2
+                } else {
+                    stored
+                }
+            }
         }
+    }
+    /// MIIM(0) MII_CMD (reg 0x710100d0) written: run the PHY access. Fields:
+    /// VLD bit 31, PHYAD [29:25], REGAD [24:20], WRDATA [19:4], OPR [2:1]
+    /// (01 write, 10 read).
+    fn mii_cmd(&mut self, v: u32) {
+        if v >> 31 == 0 {
+            return;
+        }
+        let phy = ((v >> 25) & 0x1f) as u8;
+        let reg = ((v >> 20) & 0x1f) as u8;
+        match (v >> 1) & 0b11 {
+            0b01 => self.phy_write(phy, reg, ((v >> 4) & 0xffff) as u16),
+            0b10 => self.mii_data = self.phy_read(phy, reg) as u32,
+            _ => {}
+        }
+        if self.vscdbg {
+            eprintln!(
+                "[vsc] MIIM phy={} reg={} opr={} data={:#06x}",
+                phy,
+                reg,
+                (v >> 1) & 0b11,
+                self.mii_data
+            );
+        }
+    }
+    /// VSC8504 (Tesla) quad PHY on MIIM addresses 4..=7, port index = addr-4.
+    /// Store/return per (page, register), with the identity and status values
+    /// the vsc85xx driver checks on top. Register 31 selects the page.
+    fn phy_read(&self, phy: u8, reg: u8) -> u16 {
+        if reg == 31 {
+            return *self.phy_page.get(&phy).unwrap_or(&0);
+        }
+        let page = *self.phy_page.get(&phy).unwrap_or(&0);
+        let stored = *self.phy_regs.get(&(phy, page, reg)).unwrap_or(&0);
+        match (page, reg) {
+            (0, 2) => 0x0007, // IDENTIFIER_1: VSC8504_ID = 0x704c2
+            (0, 3) => 0x04c2, // IDENTIFIER_2
+            // EXTENDED_PHY_CONTROL_4: bits [15:11] = the PHY's own port index
+            // (get_port / the tesla patch base-port check).
+            (1, 23) => (stored & 0x07ff) | ((phy.wrapping_sub(4) as u16 & 0x1f) << 11),
+            // GPIO EXTENDED_REVISION: tesla_e (bit 0) set; the driver refuses
+            // non-rev-E parts (BadPhyRev).
+            (16, 30) => 0x0001,
+            _ => stored,
+        }
+    }
+    fn phy_write(&mut self, phy: u8, reg: u8, v: u16) {
+        if reg == 31 {
+            self.phy_page.insert(phy, v);
+            return;
+        }
+        let page = *self.phy_page.get(&phy).unwrap_or(&0);
+        let v = match (page, reg) {
+            // MODE_CONTROL: sw_reset (bit 15) self-clears (software_reset
+            // polls for it).
+            (0, 0) => v & !0x8000,
+            (16, 18) => {
+                // GPIO MICRO_PAGE: an 8051 micro command; completes at once.
+                // The driver's cmd() polls for bit 15 (busy) clear and fails
+                // on bit 14 (error), so both read back clear. Command 0x8008
+                // computes the firmware CRC into VERIPHY_CTRL_REG2; answer
+                // the Tesla patch's expected CRC so the (very long) 8051
+                // patch download is skipped as on an already-patched part.
+                if v == 0x8008 {
+                    self.phy_regs.insert((phy, 1, 25), 0x29E8);
+                }
+                v & !0xC000
+            }
+            _ => v,
+        };
+        self.phy_regs.insert((phy, page, reg), v);
     }
     /// Clock one byte out (and one in) of the VSC7448, by position in the xfer.
     fn xfer_byte(&mut self, b: u8) -> u8 {
@@ -545,12 +660,24 @@ impl Vsc7448 {
                         if RAM_INIT_REGS.contains(&(0x7100_0000 | (a << 2))) {
                             v &= !0x2;
                         }
+                        // HSIO MCB_SERDES1G_ADDR_CFG (0x714600e8) and
+                        // MCB_SERDES6G_ADDR_CFG (0x71460168): the wr/rd
+                        // one-shot strobes (bits 31/30) self-clear when the
+                        // MCB transfer completes; serdes1g/6g_read/write poll
+                        // them 32 times then error (Serdes*Timeout, a monorail
+                        // BspInitFailed panic).
+                        if a == 0x11803a || a == 0x11805a {
+                            v &= !0xC000_0000;
+                        }
                         if self.vscdbg {
                             eprintln!(
                                 "[vsc] W reg={:#010x} val={:#010x}",
                                 0x7100_0000 | (a << 2),
                                 v
                             );
+                        }
+                        if a == 0x4034 {
+                            self.mii_cmd(v); // MIIM(0) MII_CMD: PHY access
                         }
                         self.vsc.insert(a, v);
                     }
@@ -827,6 +954,15 @@ pub struct Spi5 {
     cs: Spi5Cs,    // user-design CS assert-generation; reset the command when it changes
     last_gen: u32,
     fpga: std::collections::HashMap<u16, u8>, // FPGA user-design register file (byte-addressed)
+    // Tofino debug port (TOFINO_DEBUG_PORT_BUFFER 0x200 / _STATE 0x201): the
+    // sequencer queues an opcode + address (+ data) into the buffer, sets
+    // REQUEST_IN_PROGRESS, polls for it to clear, then reads the response out
+    // of the buffer. Requests complete instantly against `tofino_regs`, a
+    // sparse register file of the Tofino behind the port, so the driver's
+    // read-modify-write-read-back sequences see their own writes.
+    dbg_req: Vec<u8>,
+    dbg_resp: std::collections::VecDeque<u8>,
+    tofino_regs: std::collections::HashMap<u32, u32>,
 }
 /// Seed the FPGA ignition-controller register block so the emulated sidecar SP
 /// answers MGS `ignition`. The sidecar is the rack's ignition hub: MGS issues
@@ -940,6 +1076,9 @@ impl Spi5 {
             (0x103, 0x00), // TOFINO_SEQ_ERROR = None
             (0x104, 0x00), // TOFINO_SEQ_ERROR_STATE = Init
             (0x105, 0x00),
+            // TOFINO_DEBUG_PORT_STATE: SEND_BUFFER_EMPTY | RECEIVE_BUFFER_EMPTY,
+            // else the sequencer's read_direct/write_direct bail InvalidState.
+            (0x201, 0x05),
         ]
         // TOFINO_SEQ_ERROR_STEP = Init
         {
@@ -958,7 +1097,36 @@ impl Spi5 {
             cs,
             last_gen: 0,
             fpga,
+            dbg_req: Vec::new(),
+            dbg_resp: std::collections::VecDeque::new(),
+            tofino_regs: std::collections::HashMap::new(),
         }
+    }
+    /// Run a queued Tofino debug-port request (REQUEST_IN_PROGRESS written to
+    /// TOFINO_DEBUG_PORT_STATE). Request layout: opcode, 4-byte LE address,
+    /// then for writes a 4-byte LE value. DirectRead (0xA0) queues the 4-byte
+    /// LE register value as the response; DirectWrite (0x80) stores it.
+    /// Unknown opcodes complete with no side effect. State returns to
+    /// buffers-empty / not-in-progress, so the driver's poll exits at once.
+    fn tofino_debug_request(&mut self) {
+        let req = std::mem::take(&mut self.dbg_req);
+        if req.len() >= 5 {
+            let addr = u32::from_le_bytes([req[1], req[2], req[3], req[4]]);
+            match req[0] {
+                0xA0 => {
+                    // DirectRead
+                    let v = *self.tofino_regs.get(&addr).unwrap_or(&0);
+                    self.dbg_resp.extend(v.to_le_bytes());
+                }
+                0x80 if req.len() >= 9 => {
+                    // DirectWrite
+                    let v = u32::from_le_bytes([req[5], req[6], req[7], req[8]]);
+                    self.tofino_regs.insert(addr, v);
+                }
+                _ => {}
+            }
+        }
+        self.fpga.insert(0x201, 0x05); // buffers empty, request complete
     }
     /// Reset per-command state on the CS deasserted->asserted edge — a command
     /// (header write + data read) spans two SPE cycles under one CS lock.
@@ -975,6 +1143,31 @@ impl Spi5 {
             self.last_gen = gen;
         }
     }
+    /// Tofino sequencing FSM, run after any write to TOFINO_SEQ_CTRL (0x100:
+    /// CLEAR_ERROR bit 0, EN bit 1, ACK_VID bit 2). EN set: the power-up
+    /// completes instantly; STATE (0x101) = A0(2), the VID (0x10c) reads
+    /// valid, and the six power rails (0x106..0x10b) read ENABLE|GOOD. EN
+    /// clear: back to A2(1), rails off, VID invalid. The command bits
+    /// CLEAR_ERROR and ACK_VID self-clear as on the real controller; ERROR
+    /// (0x103) never sets. The sequencer's power_up polls STATE for A0 after
+    /// its VID handshake (SequencerTimeoutNotInA0 otherwise), and its timer
+    /// tick powers up whenever policy is LatchOffOnFault and STATE reads A2.
+    fn tofino_seq_ctrl_written(&mut self) {
+        let ctrl = *self.fpga.get(&0x100).unwrap_or(&0);
+        let en = ctrl & 0x02 != 0;
+        // Command bits self-clear.
+        self.fpga.insert(0x100, ctrl & 0x02);
+        let (state, vid, rail) = if en {
+            (2u8, 0x80 | 0b1000, 0x03u8) // A0, VID_VALID | V0P759, ENABLE|GOOD
+        } else {
+            (1, 0, 0) // A2
+        };
+        self.fpga.insert(0x101, state);
+        self.fpga.insert(0x10c, vid);
+        for a in 0x106..=0x10bu16 {
+            self.fpga.insert(a, rail);
+        }
+    }
     /// The next data byte for the current (read) command, with address auto-increment.
     fn next_data(&mut self) -> u8 {
         let incr = self.op != 5 && self.op != 6; // No-AddrIncr variants hold addr
@@ -982,6 +1175,10 @@ impl Spi5 {
             .addr
             .wrapping_add(if incr { self.dpos } else { 0 } as u16);
         self.dpos += 1;
+        // Debug-port buffer reads pop response bytes.
+        if a == 0x200 {
+            return self.dbg_resp.pop_front().unwrap_or(0);
+        }
         *self.fpga.get(&a).unwrap_or(&0)
     }
     /// One TXDR byte (full-duplex). Header is the first 3 bytes [op, addr_be];
@@ -1016,13 +1213,28 @@ impl Spi5 {
                         .addr
                         .wrapping_add(if incr { self.dpos } else { 0 } as u16);
                     self.dpos += 1;
-                    let cur = *self.fpga.get(&a).unwrap_or(&0);
-                    let nv = match self.op {
-                        2 => cur | b,  // BitSet: read-modify-write OR
-                        3 => cur & !b, // BitClear: read-modify-write AND-NOT
-                        _ => b,        // Write / WriteNoAddrIncr: overwrite
-                    };
-                    self.fpga.insert(a, nv);
+                    // Debug-port buffer: writes queue request bytes, they do
+                    // not land in the register file.
+                    if a == 0x200 {
+                        self.dbg_req.push(b);
+                    } else {
+                        let cur = *self.fpga.get(&a).unwrap_or(&0);
+                        let nv = match self.op {
+                            2 => cur | b,  // BitSet: read-modify-write OR
+                            3 => cur & !b, // BitClear: read-modify-write AND-NOT
+                            _ => b,        // Write / WriteNoAddrIncr: overwrite
+                        };
+                        self.fpga.insert(a, nv);
+                        if a == 0x100 {
+                            self.tofino_seq_ctrl_written();
+                        }
+                        // Debug-port state: REQUEST_IN_PROGRESS runs the queued
+                        // request; other writes (e.g. reset to buffers-empty)
+                        // are plain stores.
+                        if a == 0x201 && nv & 0x10 != 0 {
+                            self.tofino_debug_request();
+                        }
+                    }
                     0
                 }
             }
@@ -1569,6 +1781,11 @@ pub struct I2c {
     eeprom: Rc<Vec<u8>>,                  // AT24CSW080 VPD/FRUID backing store (1024 bytes)
     bridge: crate::i2c_bridge::I2cBridge, // SP_EMU_I2C_BRIDGE sniff / _DEVICE delegate (no-op when off)
     bus: u8,                              // 1-based bus number (i2c1..i2c4) for the trace
+    // NACK every target on this controller. Sidecar I2C2 carries only the
+    // front IO board (front_io + frontgps ports); with no board modeled, the
+    // sequencer's FrontIOBoard::present probe must see NoDevice, not a false
+    // ACK that pulls in the whole front-IO bring-up (which then panics it).
+    nack_all: bool,
 }
 impl I2c {
     pub fn new(
@@ -1591,6 +1808,7 @@ impl I2c {
             eeprom,
             bridge,
             bus,
+            nack_all: crate::config::get().board().is_sidecar() && bus == 2,
         }
     }
     /// Accurate device-register model, keyed by I2C address. Returns the 16-bit
@@ -1638,7 +1856,16 @@ impl Mmio for I2c {
     }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x18 => (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6), // ISR: TXE|TXIS|RXNE|TC
+            0x18 => {
+                // ISR. An absent target NACKs: NACKF(4)|STOPF(5), no TXIS/RXNE,
+                // so the driver returns NoDevice (stm32xx-i2c checks NACKF
+                // before waiting on TXIS/RXNE/TC).
+                if self.nack_all && self.active {
+                    (1 << 4) | (1 << 5)
+                } else {
+                    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) // TXE|TXIS|RXNE|TC
+                }
+            }
             0x24 => {
                 // RXDR: serve the modeled device register / EEPROM byte
                 if crate::dbg::vpd() {
@@ -2501,6 +2728,98 @@ mod tests {
         let mut q = Qspi::with_backing(Some(path.clone()));
         assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x5A, 0xA5]);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- VSC7448 MIIM bridge + VSC8504 PHY model -----------------------------
+
+    /// MII_CMD encoding per DEVCPU_GCB MIIM: VLD bit 31, PHYAD [29:25],
+    /// REGAD [24:20], WRDATA [19:4], OPR [2:1] (01 write, 10 read).
+    fn miim(phy: u8, reg: u8, wr: Option<u16>) -> u32 {
+        (1 << 31)
+            | ((phy as u32) << 25)
+            | ((reg as u32) << 20)
+            | ((wr.unwrap_or(0) as u32) << 4)
+            | if wr.is_some() { 0b01 << 1 } else { 0b10 << 1 }
+    }
+
+    #[test]
+    fn vsc7448_miim_serves_vsc8504_identity_and_micro_commands() {
+        let mut v = Vsc7448::new();
+        // read_id: STANDARD (page 0) IDENTIFIER_1/2 must yield VSC8504_ID
+        // 0x704c2, else monorail panics BspInitFailed(BadPhyId).
+        v.mii_cmd(miim(4, 31, Some(0)));
+        v.mii_cmd(miim(4, 2, None));
+        assert_eq!(v.mii_data, 0x0007);
+        v.mii_cmd(miim(4, 3, None));
+        assert_eq!(v.mii_data, 0x04c2);
+
+        // GPIO page (0x10): EXTENDED_REVISION reads tesla_e (bit 0) set.
+        v.mii_cmd(miim(4, 31, Some(0x10)));
+        v.mii_cmd(miim(4, 30, None));
+        assert_eq!(v.mii_data & 1, 1);
+
+        // A micro command completes at once: busy (15) and error (14) clear.
+        // The CRC command leaves the Tesla patch's expected CRC in
+        // VERIPHY_CTRL_REG2 (EXTENDED page reg 25) so the download is skipped.
+        v.mii_cmd(miim(4, 18, Some(0x8008)));
+        v.mii_cmd(miim(4, 18, None));
+        assert_eq!(v.mii_data & 0xC000, 0);
+        v.mii_cmd(miim(4, 31, Some(1)));
+        v.mii_cmd(miim(4, 25, None));
+        assert_eq!(v.mii_data, 0x29E8);
+
+        // EXTENDED_PHY_CONTROL_4 bits [15:11]: the port index (MIIM addr - 4).
+        v.mii_cmd(miim(4, 23, None));
+        assert_eq!(v.mii_data >> 11, 0);
+        v.mii_cmd(miim(6, 31, Some(1)));
+        v.mii_cmd(miim(6, 23, None));
+        assert_eq!(v.mii_data >> 11, 2);
+    }
+
+    // ---- Mainboard FPGA: Tofino sequencing FSM + debug port ------------------
+
+    #[test]
+    fn spi5_tofino_power_up_and_down() {
+        let mut s = Spi5::new(Rc::new(Cell::new(0)));
+        assert_eq!(s.fpga[&0x101], 1, "resting state A2");
+
+        // EN set: A0, VID valid, all six rails ENABLE|GOOD.
+        s.fpga.insert(0x100, 0x02);
+        s.tofino_seq_ctrl_written();
+        assert_eq!(s.fpga[&0x101], 2, "A0");
+        assert_eq!(s.fpga[&0x10c], 0x88, "VID_VALID | V0P759");
+        for a in 0x106..=0x10bu16 {
+            assert_eq!(s.fpga[&a], 0x03);
+        }
+        // ACK_VID self-clears and does not disturb the state.
+        s.fpga.insert(0x100, 0x02 | 0x04);
+        s.tofino_seq_ctrl_written();
+        assert_eq!(s.fpga[&0x100], 0x02, "command bits self-clear");
+        assert_eq!(s.fpga[&0x101], 2);
+
+        // EN clear: back to A2, VID invalid, rails off.
+        s.fpga.insert(0x100, 0x00);
+        s.tofino_seq_ctrl_written();
+        assert_eq!(s.fpga[&0x101], 1);
+        assert_eq!(s.fpga[&0x10c], 0);
+    }
+
+    #[test]
+    fn spi5_tofino_debug_port_write_then_read_back() {
+        let mut s = Spi5::new(Rc::new(Cell::new(0)));
+        assert_eq!(s.fpga[&0x201], 0x05, "buffers empty at rest");
+
+        // DirectWrite 0xCAFEF00D to address 0x01234: opcode, LE addr, LE value.
+        s.dbg_req.extend([0x80, 0x34, 0x12, 0x00, 0x00]);
+        s.dbg_req.extend(0xCAFEF00Du32.to_le_bytes());
+        s.tofino_debug_request();
+        assert_eq!(s.fpga[&0x201], 0x05, "request complete, buffers empty");
+
+        // DirectRead of the same address returns the value, LE, via the buffer.
+        s.dbg_req.extend([0xA0, 0x34, 0x12, 0x00, 0x00]);
+        s.tofino_debug_request();
+        let resp: Vec<u8> = s.dbg_resp.drain(..).collect();
+        assert_eq!(resp, 0xCAFEF00Du32.to_le_bytes());
     }
 
     #[test]
