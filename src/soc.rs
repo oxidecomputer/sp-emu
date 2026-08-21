@@ -7,6 +7,7 @@
 //!   RCC.CFGR.SWS == PLL1.
 //! Everything else can start life as a stub (reads 0, swallows writes).
 
+use crate::flash::ERASED;
 use crate::mem::{Bus, Mmio};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -135,11 +136,11 @@ pub fn install_peripherals(bus: &mut Bus) {
     // polls get no reply and time out. Modeled below so entropy is always ready.
     bus.add_device(0x4802_1800, 0x400, Box::new(Rng::new()));
 
-    // QUADSPI (0x5200_5000): command-aware host-flash model for the `hf` task.
-    // Answers RDID with a recognized Micron 32 MiB chip + blank flash, so hf's
-    // init completes and it returns to its dispatch loop — which unblocks
-    // gimlet_seq's A0 host-power transition (it sends to hf) and thus the
-    // control_plane_agent get_state / MGS `state` path. See the Qspi impl.
+    // QUADSPI (0x5200_5000): writable NOR-flash model. On gimlet the `hf` task
+    // drives it (host flash: RDID must answer a recognized Micron 32 MiB chip or
+    // hf's init fails, blocking gimlet_seq's A0 transition and thus MGS `state`);
+    // on sidecar the `auxflash` task does (FPGA-blob slots: the MGS SP-update
+    // path erases + programs a slot and re-reads its CHCK). See the Qspi impl.
     bus.add_device(0x5200_5000, 0x400, Box::new(Qspi::new()));
 
     // SYSCFG (0x5800_0400): gimlet's kernel reads PKGR (+0x124) on boot and
@@ -1767,47 +1768,123 @@ impl Mmio for I2c {
     }
 }
 
-/// STM32H7 QUADSPI — minimal model so the host-flash driver's transfers finish.
-/// SR(+0x08) always reports TCF|FTF (transfer complete / FIFO ready), BUSY clear;
-/// DR(+0x20) reads 0xFF (erased flash); FCR(+0x0C) flag clears accepted.
-/// QUADSPI (0x5200_5000) — command-aware model of the gimlet host flash so the
-/// `hf` task's init completes (it reads the JEDEC ID and fails hard unless it
-/// recognizes the chip, then scans for persistent data). Answers:
+/// QUADSPI (0x5200_5000): writable model of the SPI NOR flash driven by the
+/// gimlet `hf` task (host flash) and the sidecar `auxflash` task (FPGA blob
+/// slots). 32 MiB array with real command semantics, so both the boot-time
+/// scans and the MGS update path (slot erase, program, CHCK read-back) work.
 ///
-/// * RDID (0x9F)  -> [0x20, 0xBA, 0x19, ...]  (Micron MT25Q, 32 MiB:
-///   byte0=Micron, byte1=3.3V, byte2=log2(capacity)=25)
-/// * RDSR (0x05)  -> 0x00  (status: not busy, WIP=0)
-/// * memory reads -> 0xFF  (blank flash => the hf persistent-data scan finds
-///   nothing => clean "initial power-on" path, no writes)
-/// * writes/erase -> accepted (discarded)
+/// * RDID (0x9F): [0x20, 0xBA, 0x19, ...], Micron MT25Q 32 MiB. byte0
+///   manufacturer, byte1 voltage, byte2 log2(capacity). hf's init fails
+///   unless it recognizes this id.
+/// * RDSR (0x05): WIP (bit 0) always 0, operations complete instantly.
+///   WEL (bit 1) from the write-enable latch. auxflash's
+///   set_and_check_write_enable fails the update if WEL does not read back.
+/// * WREN (0x06) / WRDI (0x04): set/clear WEL.
+/// * SectorErase (0xDC): 64 KiB sector at the 4-byte address to 0xFF.
+/// * BulkErase (0xC7): whole array to 0xFF.
+/// * PageProgram (0x12): AND the data into the array at the 4-byte address.
+/// * Any addressed read (Read 0x13, QuadRead 0x6C, ...): array contents.
 ///
-/// The driver (drv-stm32h7-qspi) drives transfers by polling SR.FLEVEL (FIFO
-/// level, bits 8..13) and SR.TCF (transfer complete, bit1), reading data one
-/// byte at a time from DR (offset 0x20) via byte-wide accesses. The whole
-/// response is presented immediately with a large FLEVEL, and TCF is set once it
-/// is drained, so the driver never waits on the qspi-irq — avoiding the
-/// busy-loop/irq-storm a plain stub caused.
+/// Program and erase require WEL and clear it on completion. Contents persist
+/// to `qspi-flash.bin` next to the SP flash NVM file, write-through like
+/// `Flash`. The file is created lazily on the first program or erase, so a
+/// gimlet that never writes its host flash creates no file.
+///
+/// The driver (drv-stm32h7-qspi) polls SR.FLEVEL (bits 8..13) and SR.TCF
+/// (bit 1), moving data one byte at a time through DR (offset 0x20). Reads
+/// are presented whole, with TCF set once drained. Writes report FLEVEL 0 and
+/// TCF as soon as the command's address and data have arrived, so the driver
+/// never waits on the qspi irq. None is raised; an irq-less model avoids the
+/// busy loop a plain stub caused.
+const QSPI_SIZE: usize = 32 * 1024 * 1024;
+const QSPI_SECTOR: usize = 65_536;
+
+/// An indirect transfer decoded from CCR that still needs its address (AR
+/// write) and/or data (DR writes) before it can execute.
+enum QspiXfer {
+    Idle,
+    /// Addressed read. The response is built once AR arrives.
+    ReadAtAddr { len: usize },
+    /// Addressed write. On the AR write, a data-less command (sector erase)
+    /// executes; `data: true` (page program) starts collecting data bytes.
+    WriteAtAddr { instruction: u8, data: bool },
+    /// Page program with AR seen, collecting `remaining` data bytes via DR.
+    WriteData { remaining: usize },
+}
+
 pub struct Qspi {
     dlr: u32,        // transfer length register (holds len-1)
+    ar: u32,         // address register (last AR write)
     resp: Vec<u8>,   // pending read response
     resp_pos: usize, // bytes drained from `resp`
     mode_read: bool, // current transfer is an indirect read
     tcf: bool,       // transfer-complete latch
     cr: u32,         // control register (stored, for EN bit etc.)
     dcr: u32,        // device config (stored)
+    wel: bool,       // write-enable latch (RDSR bit 1)
+    xfer: QspiXfer,  // multi-register transfer in progress
+    wr_buf: Vec<u8>, // page-program data collected so far
+    mem: Vec<u8>,    // the 32 MiB NOR array
+    /// Write-through handle to the backing file, as in `Flash::file`. Opened
+    /// at construction if a persisted image exists, else created and seeded on
+    /// the first program or erase. `None` before that, or after an I/O error;
+    /// the model then continues RAM-only.
+    file: Option<std::fs::File>,
+    /// Backing file path. `None` disables persistence (tests).
+    path: Option<String>,
 }
 impl Qspi {
     pub fn new() -> Self {
+        // Persist next to the SP flash NVM file, one array per instance.
+        let nvm = crate::config::instance_file("SP_EMU_FLASH", crate::config::get().flash_path());
+        let path = crate::flash::instance_base(&nvm)
+            .join("qspi-flash.bin")
+            .display()
+            .to_string();
+        Self::with_backing(Some(path))
+    }
+    /// Build the model, loading a persisted array from `path` if one exists.
+    fn with_backing(path: Option<String>) -> Self {
+        let mut mem = vec![ERASED; QSPI_SIZE];
+        let mut file = None;
+        if let Some(p) = path.as_deref() {
+            if std::path::Path::new(p).exists() {
+                match std::fs::OpenOptions::new().read(true).write(true).open(p) {
+                    Ok(mut f) => {
+                        use std::io::Read;
+                        let mut buf = Vec::new();
+                        match f.read_to_end(&mut buf) {
+                            Ok(_) => {
+                                let n = buf.len().min(QSPI_SIZE);
+                                mem[..n].copy_from_slice(&buf[..n]);
+                                eprintln!("[qspi] loaded persisted QSPI flash from {p}");
+                                file = Some(f);
+                            }
+                            Err(e) => eprintln!("[qspi] read {p} failed: {e}; starting erased"),
+                        }
+                    }
+                    Err(e) => eprintln!("[qspi] open {p} failed: {e}; running RAM-only"),
+                }
+            }
+        }
         Qspi {
             dlr: 0,
+            ar: 0,
             resp: Vec::new(),
             resp_pos: 0,
             mode_read: false,
             tcf: false,
             cr: 0,
             dcr: 0,
+            wel: false,
+            xfer: QspiXfer::Idle,
+            wr_buf: Vec::new(),
+            mem,
+            file,
+            path,
         }
     }
+    /// Response for a non-addressed read command (RDID, RDSR, unique id).
     fn build_response(&self, instruction: u8, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
         match instruction {
@@ -1820,8 +1897,13 @@ impl Qspi {
                     }
                 }
             }
-            0x05 => { /* ReadStatusReg: 0x00 (not busy) — zeros already */ }
-            // Read / QuadRead / DdrRead / page-data etc.: erased NOR flash.
+            0x05 => {
+                // ReadStatusReg: WIP (bit 0) always clear, WEL (bit 1) live.
+                if self.wel {
+                    v[0] = 0x02;
+                }
+            }
+            // Unknown non-addressed reads (e.g. Winbond unique id): 0xFF fill.
             _ => {
                 for b in v.iter_mut() {
                     *b = 0xFF;
@@ -1829,6 +1911,125 @@ impl Qspi {
             }
         }
         v
+    }
+    /// Response for an addressed read: the array contents (wrapping at 32 MiB).
+    fn read_mem(&self, addr: u32, len: usize) -> Vec<u8> {
+        let mut v = vec![ERASED; len];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = self.mem[(addr as usize + i) & (QSPI_SIZE - 1)];
+        }
+        v
+    }
+    /// Open (creating + seeding if needed) the backing file on first write.
+    /// A failure clears `path` so a broken target is not retried per write.
+    fn ensure_file(&mut self) {
+        if self.file.is_some() {
+            return;
+        }
+        let Some(p) = self.path.clone() else { return };
+        use std::io::{Seek, SeekFrom, Write};
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                let r = f
+                    .seek(SeekFrom::Start(0))
+                    .and_then(|_| f.write_all(&self.mem))
+                    .and_then(|_| f.set_len(QSPI_SIZE as u64));
+                match r {
+                    Ok(()) => {
+                        eprintln!("[qspi] created backing file {p}");
+                        self.file = Some(f);
+                    }
+                    Err(e) => {
+                        eprintln!("[qspi] seed {p} failed: {e}; RAM-only");
+                        self.path = None;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[qspi] create {p} failed: {e}; RAM-only");
+                self.path = None;
+            }
+        }
+    }
+    /// Write `mem[off..off+len]` through to the backing file (see
+    /// `Flash::write_through`).
+    fn write_through(&mut self, off: usize, len: usize) {
+        use std::io::{Seek, SeekFrom, Write};
+        if len == 0 {
+            return;
+        }
+        self.ensure_file();
+        if let Some(f) = self.file.as_mut() {
+            let r = f
+                .seek(SeekFrom::Start(off as u64))
+                .and_then(|_| f.write_all(&self.mem[off..off + len]));
+            if let Err(e) = r {
+                eprintln!(
+                    "[qspi] write-through to {} failed: {e}",
+                    self.path.as_deref().unwrap_or("?")
+                );
+                self.file = None; // stop retrying a broken handle
+                self.path = None;
+            }
+        }
+    }
+    /// Sector (or bulk) erase at `self.ar`. Requires WEL; consumes it.
+    fn do_erase(&mut self, instruction: u8) {
+        if !self.wel {
+            if crate::dbg::eth() {
+                eprintln!("[qspi] erase {:#04x} without WEL, ignored", instruction);
+            }
+            self.tcf = true;
+            return;
+        }
+        self.wel = false;
+        let (base, len) = match instruction {
+            0xC7 => (0, QSPI_SIZE), // BulkErase
+            // SectorErase (0xDC 4-byte / 0xD8 3-byte): 64 KiB, aligned down.
+            _ => (
+                self.ar as usize & (QSPI_SIZE - 1) & !(QSPI_SECTOR - 1),
+                QSPI_SECTOR,
+            ),
+        };
+        self.mem[base..base + len].fill(ERASED);
+        self.write_through(base, len);
+        self.tcf = true;
+        if crate::dbg::eth() {
+            eprintln!("[qspi] erase {:#04x} @ {:#010x} len={}", instruction, base, len);
+        }
+    }
+    /// Page program `self.wr_buf` at `self.ar`. Requires WEL; consumes it.
+    /// NOR semantics: programming only clears bits.
+    fn do_program(&mut self) {
+        let buf = std::mem::take(&mut self.wr_buf);
+        if !self.wel {
+            if crate::dbg::eth() {
+                eprintln!("[qspi] program without WEL, ignored");
+            }
+            self.tcf = true;
+            return;
+        }
+        self.wel = false;
+        let base = self.ar as usize & (QSPI_SIZE - 1);
+        for (i, b) in buf.iter().enumerate() {
+            self.mem[(base + i) & (QSPI_SIZE - 1)] &= *b;
+        }
+        // Write through both segments if the program wraps past the end.
+        let first = buf.len().min(QSPI_SIZE - base);
+        self.write_through(base, first);
+        if first < buf.len() {
+            self.write_through(0, buf.len() - first);
+        }
+        self.tcf = true;
+        if crate::dbg::eth() {
+            eprintln!("[qspi] program @ {:#010x} len={}", base, buf.len());
+        }
     }
 }
 impl Mmio for Qspi {
@@ -1861,6 +2062,7 @@ impl Mmio for Qspi {
                 sr
             }
             0x10 => self.dlr,
+            0x18 => self.ar,
             0x20 => {
                 // DR: pop one byte (driver reads the low byte via byte access)
                 if self.resp_pos < self.resp.len() {
@@ -1885,29 +2087,109 @@ impl Mmio for Qspi {
             } // FCR.CTCF
             0x10 => self.dlr = val, // DLR (len-1)
             0x14 => {
-                // CCR: instruction in bits[7:0], FMODE in bits[27:26]
+                // CCR: instruction bits[7:0], ADMODE bits[11:10], DMODE
+                // bits[25:24], FMODE bits[27:26]. The driver writes CCR first;
+                // for addressed commands AR follows immediately (nothing polls
+                // SR in between), then data moves through DR.
                 let instruction = (val & 0xFF) as u8;
+                let admode = (val >> 10) & 0b11;
+                let dmode = (val >> 24) & 0b11;
                 let fmode = (val >> 26) & 0b11;
+                let len = (self.dlr as usize).wrapping_add(1);
                 if fmode == 0b01 {
-                    // indirect read
-                    let len = (self.dlr as usize).wrapping_add(1);
-                    self.resp = self.build_response(instruction, len);
+                    // Indirect read. Addressed (memory) reads wait for AR; the
+                    // rest (RDID/RDSR/unique-id) answer from the command alone.
+                    if admode != 0 {
+                        self.resp.clear();
+                        self.xfer = QspiXfer::ReadAtAddr { len };
+                    } else {
+                        self.resp = self.build_response(instruction, len);
+                        self.xfer = QspiXfer::Idle;
+                    }
                     self.resp_pos = 0;
                     self.mode_read = true;
                     self.tcf = false;
                 } else {
-                    // indirect write (write-enable / program / erase): instant
+                    // Indirect write: write-enable / erase / program.
                     self.mode_read = false;
-                    self.tcf = true;
+                    self.wr_buf.clear();
+                    match instruction {
+                        0x06 => {
+                            // WREN
+                            self.wel = true;
+                            self.xfer = QspiXfer::Idle;
+                            self.tcf = true;
+                        }
+                        0x04 => {
+                            // WRDI
+                            self.wel = false;
+                            self.xfer = QspiXfer::Idle;
+                            self.tcf = true;
+                        }
+                        0xC7 => {
+                            // BulkErase: no address, executes now.
+                            self.xfer = QspiXfer::Idle;
+                            self.do_erase(instruction);
+                        }
+                        _ if admode != 0 => {
+                            // Addressed write: PageProgram (data follows) or
+                            // SectorErase (data-less); resolved at the AR write.
+                            self.xfer = QspiXfer::WriteAtAddr {
+                                instruction,
+                                data: dmode != 0,
+                            };
+                            self.tcf = false;
+                        }
+                        _ => {
+                            // Unknown address-less write command: accept, done.
+                            self.xfer = QspiXfer::Idle;
+                            self.tcf = true;
+                        }
+                    }
                 }
                 if crate::dbg::eth() {
                     eprintln!(
-                        "[qspi] CCR instr={:#04x} fmode={:#b} dlr={}",
-                        instruction, fmode, self.dlr
+                        "[qspi] CCR instr={:#04x} fmode={:#b} admode={:#b} dmode={:#b} dlr={}",
+                        instruction, fmode, admode, dmode, self.dlr
                     );
                 }
             }
-            _ => {} // AR, DR-writes, interrupt-enable bits in CR: accept/ignore
+            0x18 => {
+                // AR: completes the address phase of the pending transfer.
+                self.ar = val;
+                match self.xfer {
+                    QspiXfer::ReadAtAddr { len } => {
+                        self.resp = self.read_mem(val, len);
+                        self.resp_pos = 0;
+                        self.xfer = QspiXfer::Idle;
+                    }
+                    QspiXfer::WriteAtAddr { instruction, data } => {
+                        // Data-less (erase) commands execute here; a program
+                        // now collects its DLR+1 data bytes through DR.
+                        if data {
+                            self.xfer = QspiXfer::WriteData {
+                                remaining: (self.dlr as usize).wrapping_add(1),
+                            };
+                        } else {
+                            self.xfer = QspiXfer::Idle;
+                            self.do_erase(instruction);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            0x20 => {
+                // DR write: one data byte of a page program (byte-wide access,
+                // like DR reads).
+                if let QspiXfer::WriteData { remaining } = self.xfer {
+                    self.wr_buf.push((val & 0xFF) as u8);
+                    if self.wr_buf.len() >= remaining {
+                        self.xfer = QspiXfer::Idle;
+                        self.do_program();
+                    }
+                }
+            }
+            _ => {} // interrupt-enable bits in CR etc.: accept/ignore
         }
     }
     // No irq needed: the driver completes by polling FLEVEL/TCF, satisfied
@@ -2114,6 +2396,112 @@ impl Mmio for Scs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- QSPI: drive the register interface like drv-stm32h7-qspi does ----
+    // CCR first (instruction, ADMODE, DMODE, FMODE), then AR for addressed
+    // commands, then byte-wide DR traffic. SR.TCF is polled for completion.
+
+    fn qspi_ccr(instr: u8, fmode: u32, addressed: bool, data: bool) -> u32 {
+        let mut v = instr as u32 | (fmode << 26);
+        if addressed {
+            v |= (0b01 << 10) | (0b11 << 12); // ADMODE single line, ADSIZE 32-bit
+        }
+        if data {
+            v |= 0b01 << 24; // DMODE single line
+        }
+        v
+    }
+
+    fn qspi_read(q: &mut Qspi, instr: u8, addr: Option<u32>, len: usize) -> Vec<u8> {
+        q.write(0x10, (len - 1) as u32); // DLR
+        q.write(0x14, qspi_ccr(instr, 0b01, addr.is_some(), true));
+        if let Some(a) = addr {
+            q.write(0x18, a);
+        }
+        (0..len).map(|_| q.read(0x20) as u8).collect()
+    }
+
+    fn qspi_cmd(q: &mut Qspi, instr: u8, addr: Option<u32>, data: &[u8]) {
+        if !data.is_empty() {
+            q.write(0x10, (data.len() - 1) as u32); // DLR
+        }
+        q.write(0x14, qspi_ccr(instr, 0b00, addr.is_some(), !data.is_empty()));
+        if let Some(a) = addr {
+            q.write(0x18, a);
+        }
+        for b in data {
+            q.write(0x20, *b as u32);
+        }
+        // The driver ends every write by polling SR.TCF; the model must have
+        // completed by now (operations are instant).
+        assert_ne!(q.read(0x08) & (1 << 1), 0, "TCF after {instr:#04x}");
+    }
+
+    #[test]
+    fn qspi_write_enable_latch_reads_back_in_rdsr() {
+        let mut q = Qspi::with_backing(None);
+        // auxflash's set_and_check_write_enable: WREN then RDSR, bit 1 must
+        // set, else WriteEnableFailed (MGS "code 17"). WIP (bit 0) clear.
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x02);
+        // A program consumes WEL, as on a real part.
+        qspi_cmd(&mut q, 0x12, Some(0), &[0xAB]);
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
+        // RDID still answers the Micron MT25Q id the hf init check requires.
+        assert_eq!(qspi_read(&mut q, 0x9F, None, 3), vec![0x20, 0xBA, 0x19]);
+    }
+
+    #[test]
+    fn qspi_erase_program_readback() {
+        let mut q = Qspi::with_backing(None);
+        let base = 0x0002_0000u32; // slot-interior, sector-aligned
+        let data = [0xDE, 0xAD, 0xBE, 0xEF];
+
+        // The auxflash update sequence: write-enable + sector erase, then
+        // write-enable + page program, then read back (the CHCK scan).
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0xDC, Some(base), &[]);
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0x12, Some(base), &data);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 4), data.to_vec());
+        // Neighbors are untouched (erased).
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base + 4), 2), vec![0xFF; 2]);
+
+        // NOR semantics: a second program only clears bits (0xDE & 0x21 = 0x00).
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0x12, Some(base), &[0x21]);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 1), vec![0xDE & 0x21]);
+
+        // Sector erase clears the whole 64 KiB sector back to 0xFF.
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0xDC, Some(base + 7), &[]); // interior address: aligned down
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 4), vec![0xFF; 4]);
+
+        // Program/erase without a preceding WREN are ignored.
+        qspi_cmd(&mut q, 0x12, Some(base), &[0x00]);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 1), vec![0xFF]);
+    }
+
+    #[test]
+    fn qspi_persists_to_backing_file() {
+        let path = std::env::temp_dir()
+            .join(format!("sp-emu-qspi-test-{}.bin", std::process::id()))
+            .display()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let base = 0x0001_0000u32;
+        {
+            let mut q = Qspi::with_backing(Some(path.clone()));
+            qspi_cmd(&mut q, 0x06, None, &[]);
+            qspi_cmd(&mut q, 0x12, Some(base), &[0x5A, 0xA5]);
+        }
+        // A fresh instance (a new sp-emu run) sees the programmed bytes.
+        let mut q = Qspi::with_backing(Some(path.clone()));
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x5A, 0xA5]);
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn vpd_field_forces_printable_ascii_and_bounds_length() {
