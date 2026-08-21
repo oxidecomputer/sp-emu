@@ -645,6 +645,16 @@ pub fn serve(
     let mut endoscope_acc: u64 = 0;
     let mut prev_endo_couple = false; // coupledbg: edge-detect the coupling window
 
+    // Distinct pcs already reported by the unimplemented-instruction log.
+    let mut sp_unimpl: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    // Debug: SP_EMU_PCWIN pc windows for the instruction trace in the burst
+    // loop below.
+    let pcwin = crate::config::pcwin();
+    if pcwin.is_some() {
+        cpu.record_disasm = true;
+    }
+
     // Prompt-halt servicing: while an armed RoT is halting the SP after a self-reset,
     // freeze the SP (burst 0) and give the RoT the full budget so it halts the SP
     // before it runs significant reset-vector work. Bounded by `sp_reset_halt_iters`.
@@ -739,8 +749,31 @@ pub fn serve(
             if cpu.halted {
                 break;
             }
-            if cpu.step(&mut bus, host).is_err() {
+            let trace_pc = cpu.pc;
+            if let Err(t) = cpu.step(&mut bus, host) {
+                // An unimplemented instruction is skipped (pc already
+                // advanced), silently corrupting whatever it should have
+                // written. Log each distinct pc once so misdecodes surface
+                // instead of appearing as firmware bugs downstream.
+                if let crate::cpu::Trap::Unimplemented { pc, disasm, .. } = &t {
+                    if sp_unimpl.insert(*pc) {
+                        eprintln!("[sptrap] UNIMPL pc={:#010x}: {}", pc, disasm);
+                    }
+                }
                 break;
+            }
+            // Debug: SP_EMU_PCWIN=lo-hi[,lo-hi...] traces executed
+            // instructions whose pc falls in a window.
+            if let Some(wins) = &pcwin {
+                if wins.iter().any(|(lo, hi)| (*lo..=*hi).contains(&trace_pc)) {
+                    eprintln!(
+                        "[pcwin] {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} r8={:08x} r12={:08x} sp={:08x} lr={:08x}",
+                        trace_pc, cpu.last_disasm,
+                        cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4],
+                        cpu.r[5], cpu.r[6], cpu.r[7], cpu.r[8], cpu.r[12],
+                        cpu.r[13], cpu.r[14]
+                    );
+                }
             }
             // Firmware wrote AIRCR.SYSRESETREQ during that step: stop the burst so
             // the self-reset is applied below, outside the loop.
