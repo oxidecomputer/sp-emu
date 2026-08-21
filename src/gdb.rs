@@ -138,6 +138,9 @@ pub struct RotShared {
     endo_active: std::sync::atomic::AtomicBool,
     /// SP -> RoT: whole-ms endoscope credit for the RoT to drain into its tick.
     endo_credit_ms: std::sync::atomic::AtomicU32,
+    /// RoT -> SP: the RoT's pc, published each RoT iteration for the sprot
+    /// stuck-link watchdog's diagnostic line.
+    rot_pc: std::sync::atomic::AtomicU32,
 }
 impl RotShared {
     fn new() -> Self {
@@ -146,6 +149,7 @@ impl RotShared {
             tick_events: std::sync::atomic::AtomicU64::new(0),
             endo_active: std::sync::atomic::AtomicBool::new(false),
             endo_credit_ms: std::sync::atomic::AtomicU32::new(0),
+            rot_pc: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -406,6 +410,7 @@ fn rot_thread_main(
             }
         }
         shared.tick_events.store(rc.tick_events, Ordering::Relaxed);
+        shared.rot_pc.store(rc.pc, Ordering::Relaxed);
         // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions.
         if let Some(n) = rotpc_every {
             if rc.cycles >= rotpc_next {
@@ -645,6 +650,9 @@ pub fn serve(
     // before it runs significant reset-vector work. Bounded by `sp_reset_halt_iters`.
     let mut sp_reset_halt_pending = false;
     let mut sp_reset_halt_iters: u32 = 0;
+
+    // Stuck-link watchdog: logs when an sprot exchange stops making progress.
+    let mut sprot_wd = crate::sprot::Watchdog::new();
 
     loop {
         if let Some(swd_l) = &listeners {
@@ -940,6 +948,11 @@ pub fn serve(
                 cpu.sp_tick_credit = 0;
             }
             prev_req_dbg = req_in_flight;
+            crate::sprot::watchdog_tick(
+                &mut sprot_wd,
+                shared.rot_pc.load(Ordering::Relaxed),
+                cur_rot_ticks,
+            );
             // Clear prompt-halt servicing once the RoT has taken control of the SP
             // (halted it over SWD, or resumed it under debug to run endoscope), or
             // when the safety bound expires; then the SP resumes normal scheduling.
