@@ -138,6 +138,9 @@ pub struct RotShared {
     endo_active: std::sync::atomic::AtomicBool,
     /// SP -> RoT: whole-ms endoscope credit for the RoT to drain into its tick.
     endo_credit_ms: std::sync::atomic::AtomicU32,
+    /// RoT -> SP: the RoT's pc, published each RoT iteration for the sprot
+    /// stuck-link watchdog's diagnostic line.
+    rot_pc: std::sync::atomic::AtomicU32,
 }
 impl RotShared {
     fn new() -> Self {
@@ -146,6 +149,7 @@ impl RotShared {
             tick_events: std::sync::atomic::AtomicU64::new(0),
             endo_active: std::sync::atomic::AtomicBool::new(false),
             endo_credit_ms: std::sync::atomic::AtomicU32::new(0),
+            rot_pc: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -406,6 +410,7 @@ fn rot_thread_main(
             }
         }
         shared.tick_events.store(rc.tick_events, Ordering::Relaxed);
+        shared.rot_pc.store(rc.pc, Ordering::Relaxed);
         // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions.
         if let Some(n) = rotpc_every {
             if rc.cycles >= rotpc_next {
@@ -640,11 +645,24 @@ pub fn serve(
     let mut endoscope_acc: u64 = 0;
     let mut prev_endo_couple = false; // coupledbg: edge-detect the coupling window
 
+    // Distinct pcs already reported by the unimplemented-instruction log.
+    let mut sp_unimpl: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    // Debug: SP_EMU_PCWIN pc windows for the instruction trace in the burst
+    // loop below.
+    let pcwin = crate::config::pcwin();
+    if pcwin.is_some() {
+        cpu.record_disasm = true;
+    }
+
     // Prompt-halt servicing: while an armed RoT is halting the SP after a self-reset,
     // freeze the SP (burst 0) and give the RoT the full budget so it halts the SP
     // before it runs significant reset-vector work. Bounded by `sp_reset_halt_iters`.
     let mut sp_reset_halt_pending = false;
     let mut sp_reset_halt_iters: u32 = 0;
+
+    // Stuck-link watchdog: logs when an sprot exchange stops making progress.
+    let mut sprot_wd = crate::sprot::Watchdog::new();
 
     loop {
         if let Some(swd_l) = &listeners {
@@ -731,8 +749,31 @@ pub fn serve(
             if cpu.halted {
                 break;
             }
-            if cpu.step(&mut bus, host).is_err() {
+            let trace_pc = cpu.pc;
+            if let Err(t) = cpu.step(&mut bus, host) {
+                // An unimplemented instruction is skipped (pc already
+                // advanced), silently corrupting whatever it should have
+                // written. Log each distinct pc once so misdecodes surface
+                // instead of appearing as firmware bugs downstream.
+                if let crate::cpu::Trap::Unimplemented { pc, disasm, .. } = &t {
+                    if sp_unimpl.insert(*pc) {
+                        eprintln!("[sptrap] UNIMPL pc={:#010x}: {}", pc, disasm);
+                    }
+                }
                 break;
+            }
+            // Debug: SP_EMU_PCWIN=lo-hi[,lo-hi...] traces executed
+            // instructions whose pc falls in a window.
+            if let Some(wins) = &pcwin {
+                if wins.iter().any(|(lo, hi)| (*lo..=*hi).contains(&trace_pc)) {
+                    eprintln!(
+                        "[pcwin] {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} r8={:08x} r12={:08x} sp={:08x} lr={:08x}",
+                        trace_pc, cpu.last_disasm,
+                        cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4],
+                        cpu.r[5], cpu.r[6], cpu.r[7], cpu.r[8], cpu.r[12],
+                        cpu.r[13], cpu.r[14]
+                    );
+                }
             }
             // Firmware wrote AIRCR.SYSRESETREQ during that step: stop the burst so
             // the self-reset is applied below, outside the loop.
@@ -940,6 +981,11 @@ pub fn serve(
                 cpu.sp_tick_credit = 0;
             }
             prev_req_dbg = req_in_flight;
+            crate::sprot::watchdog_tick(
+                &mut sprot_wd,
+                shared.rot_pc.load(Ordering::Relaxed),
+                cur_rot_ticks,
+            );
             // Clear prompt-halt servicing once the RoT has taken control of the SP
             // (halted it over SWD, or resumed it under debug to run endoscope), or
             // when the safety bound expires; then the SP resumes normal scheduling.

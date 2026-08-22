@@ -309,6 +309,25 @@ pub fn is_set(name: &str) -> bool {
 
 /// Resolve an instance file path: the explicit knob value when it was set (or already
 /// absolute), otherwise `value` under the instance state directory (`state_dir`).
+/// Debug: SP-core pc-window instruction trace ranges, from
+/// `SP_EMU_PCWIN=lo-hi[,lo-hi...]` (hex, 0x prefix optional). An emulator
+/// bring-up tracing aid, not instance configuration, so it bypasses the
+/// config schema and is not recorded in bundles.
+pub fn pcwin() -> Option<Vec<(u32, u32)>> {
+    let s = std::env::var("SP_EMU_PCWIN").ok()?;
+    let v: Vec<(u32, u32)> = s
+        .split(',')
+        .filter_map(|w| {
+            let (lo, hi) = w.split_once('-')?;
+            Some((
+                u32::from_str_radix(lo.trim_start_matches("0x"), 16).ok()?,
+                u32::from_str_radix(hi.trim_start_matches("0x"), 16).ok()?,
+            ))
+        })
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
 pub fn instance_file(env_name: &str, value: &str) -> String {
     if is_set(env_name) || std::path::Path::new(value).is_absolute() {
         value.to_string()

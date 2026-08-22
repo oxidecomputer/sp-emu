@@ -234,6 +234,27 @@ impl Bridge {
                 ),
             }
         }
+        // faux-mgs --sp-sim-addr sends ereport requests to the SP's real snitch
+        // port (57005) on the same IP, not to the mgmt+EREPORT_OFFSET relay
+        // above. Bind it too, best effort: with several instances on one IP the
+        // first owns it, and the offset relay still serves the rest.
+        let mut ra = base;
+        ra.set_port(EREPORT_PORT);
+        match UdpSocket::bind(ra) {
+            Ok(rs) => {
+                let _ = rs.set_nonblocking(true);
+                eprintln!("[bridge] ereport also listening on {} (switch0 view)", ra);
+                socks.push(BoundSock {
+                    sock: rs,
+                    vid: vid0,
+                    sp_port: EREPORT_PORT,
+                });
+            }
+            Err(e) => eprintln!(
+                "[bridge] ereport bind {} skipped: {} (another instance owns it)",
+                ra, e
+            ),
+        }
         eprintln!(
             "[bridge] point MGS/faux-mgs at {} (switch0) or its +1 port (switch1)",
             base

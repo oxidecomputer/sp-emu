@@ -83,6 +83,12 @@ pub struct SprotLink {
     // waits: in the shared-RoT IPC mode (SP_EMU_ROT_SERVICE) the SP serve loop is
     // the link peer and fills `miso` itself, so waiting on a RoT would deadlock.
     pub rot_live: bool,
+    // Activity counters for the stuck-link watchdog: frames the RoT read from
+    // its RX FIFO, frames it queued to TX, and bytes the SP clocked out. A busy
+    // link whose counters stop moving is wedged.
+    pub rx_frames: u64,
+    pub tx_frames: u64,
+    pub sp_txdr: u64,
 }
 
 /// The wires between the two cores: link state under one mutex, plus a condvar
@@ -303,6 +309,7 @@ impl Mmio for SpiMaster {
                 if lk.mosi.len() < SPROT_FIFO_BYTES {
                     lk.mosi.push_back((val & 0xFF) as u8);
                 }
+                lk.sp_txdr = lk.sp_txdr.wrapping_add(1);
                 let inb = lk.miso.pop_front().unwrap_or(0);
                 drop(lk);
                 self.link.wake_rot();
@@ -377,6 +384,7 @@ impl Mmio for RotSpiSlave {
                     // A request is now being received; stays in flight (keeping the
                     // host full-speed) until the RoT asserts rot-irq with the reply.
                     lk.request_in_flight = true;
+                    lk.rx_frames = lk.rx_frames.wrapping_add(1);
                     let hi = lk.mosi.pop_front().unwrap_or(0) as u32;
                     let lo = lk.mosi.pop_front().unwrap_or(0) as u32;
                     // SOT is latched on CS assert (soc.rs) and consumed by the first
@@ -447,6 +455,7 @@ impl Mmio for RotSpiSlave {
                 // FIFOWR: 16-bit frame, upper byte first on the wire (get_u16)
                 let frame = (val & 0xFFFF) as u16;
                 let mut lk = self.link.borrow_mut();
+                lk.tx_frames = lk.tx_frames.wrapping_add(1);
                 lk.miso.push_back((frame >> 8) as u8);
                 lk.miso.push_back((frame & 0xFF) as u8);
                 drop(lk);
@@ -646,6 +655,70 @@ impl Mmio for SpExti {
             return;
         }
         self.regs.insert(off, val);
+    }
+}
+
+// ---- Stuck-link watchdog ----------------------------------------------------
+//
+// Detects the wedge class seen on voxel: an sprot exchange starts (ssa latched,
+// a request in flight, or rot-irq held) and then nothing moves again, leaving
+// every later sprot op to time out until the instance is restarted. The SP
+// serve loop calls `watchdog_tick` once per iteration; when the link has been
+// busy with no counter movement for `WATCHDOG_FIRST`, it logs one line of link
+// state plus the RoT's pc, then repeats every `WATCHDOG_REPEAT` while stuck.
+// Diagnostic only: it never mutates the link.
+
+const WATCHDOG_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+const WATCHDOG_REPEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub struct Watchdog {
+    counters: (u64, u64, u64),
+    since: std::time::Instant,
+    next_log: std::time::Duration,
+}
+impl Watchdog {
+    pub fn new() -> Self {
+        Watchdog {
+            counters: (0, 0, 0),
+            since: std::time::Instant::now(),
+            next_log: WATCHDOG_FIRST,
+        }
+    }
+}
+
+/// Sample the link; log if it has been busy without progress. `rot_pc` and
+/// `rot_ticks` come from the RoT thread's published state.
+pub fn watchdog_tick(wd: &mut Watchdog, rot_pc: u32, rot_ticks: u64) {
+    let Some(lk) = link() else { return };
+    let l = lk.borrow();
+    let busy = l.ssa || l.ssd || l.rot_irq || l.request_in_flight;
+    let counters = (l.rx_frames, l.tx_frames, l.sp_txdr);
+    if !busy || counters != wd.counters {
+        wd.counters = counters;
+        wd.since = std::time::Instant::now();
+        wd.next_log = WATCHDOG_FIRST;
+        return;
+    }
+    let stuck = wd.since.elapsed();
+    if stuck >= wd.next_log {
+        eprintln!(
+            "[sprotwd] link stuck {}s: cs={} ssa={} ssd={} rot_irq={} req_in_flight={} \
+             mosi={} miso={} rx_frames={} tx_frames={} sp_txdr={} rot_pc={:#010x} rot_ticks={}",
+            stuck.as_secs(),
+            l.cs,
+            l.ssa,
+            l.ssd,
+            l.rot_irq,
+            l.request_in_flight,
+            l.mosi.len(),
+            l.miso.len(),
+            l.rx_frames,
+            l.tx_frames,
+            l.sp_txdr,
+            rot_pc,
+            rot_ticks,
+        );
+        wd.next_log = stuck + WATCHDOG_REPEAT;
     }
 }
 
