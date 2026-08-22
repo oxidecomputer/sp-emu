@@ -33,6 +33,13 @@ pub fn synthetic_stage0() -> Vec<u8> {
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"NAME", b"bootleby"));
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"GITC", b"0000000000000000000000000000000000000000"));
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"VERS", b"0.0.0-sp-emu"));
+    // SIGN: the staging/devel RKTH sp-sim compiles in for its RoT/stage0
+    // cabooses, so one update payload repo's artifact tags match both fleets.
+    // The update planner string-compares it; nothing verifies it cryptographically.
+    tlvc.extend_from_slice(&crate::soc::tlvc_chunk(
+        b"SIGN",
+        b"11594bb5548a757e918e6fe056e2ad9e084297c9555417a025d8788eacf55daf",
+    ));
     // Caboose blob at the image tail: [MAGIC(4)] [tlvc] [size(4)]; `caboose_size`
     // is the whole blob length. Keep `image_end` well within the 0x2000 region.
     let caboose_size = (4 + tlvc.len() + 4) as u32;

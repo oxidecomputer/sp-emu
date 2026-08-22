@@ -7,6 +7,7 @@
 //!   RCC.CFGR.SWS == PLL1.
 //! Everything else can start life as a stub (reads 0, swallows writes).
 
+use crate::flash::ERASED;
 use crate::mem::{Bus, Mmio};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -135,11 +136,11 @@ pub fn install_peripherals(bus: &mut Bus) {
     // polls get no reply and time out. Modeled below so entropy is always ready.
     bus.add_device(0x4802_1800, 0x400, Box::new(Rng::new()));
 
-    // QUADSPI (0x5200_5000): command-aware host-flash model for the `hf` task.
-    // Answers RDID with a recognized Micron 32 MiB chip + blank flash, so hf's
-    // init completes and it returns to its dispatch loop — which unblocks
-    // gimlet_seq's A0 host-power transition (it sends to hf) and thus the
-    // control_plane_agent get_state / MGS `state` path. See the Qspi impl.
+    // QUADSPI (0x5200_5000): writable NOR-flash model. On gimlet the `hf` task
+    // drives it (host flash: RDID must answer a recognized Micron 32 MiB chip or
+    // hf's init fails, blocking gimlet_seq's A0 transition and thus MGS `state`);
+    // on sidecar the `auxflash` task does (FPGA-blob slots: the MGS SP-update
+    // path erases + programs a slot and re-reads its CHCK). See the Qspi impl.
     bus.add_device(0x5200_5000, 0x400, Box::new(Qspi::new()));
 
     // SYSCFG (0x5800_0400): gimlet's kernel reads PKGR (+0x124) on boot and
@@ -451,10 +452,16 @@ impl Mmio for Spi4 {
 ///   WRITE: [a23..16 (MSB=1), a15..8, a7..0] + 4 data bytes (BE)
 /// Master is modeled synchronously (each TXDR byte immediately yields its RXDR
 /// byte and SR reports TXP+RXP) so the spi-core transfer loop never sleeps
-/// on spi-irq — same model as the gimlet `Spi4`/KSZ8463. CHIP_ID (reg 0x71010000
-/// -> word addr 0x4000) must decode rev_id=0x3, part_id=0x7468, mfg_id=0x74,
-/// one=0x1 (= 0x374680E9), or `monorail` panics `BadChipId`. Every other register
-/// is store/return-0.
+/// on spi-irq — same model as the gimlet `Spi4`/KSZ8463.
+///
+/// The register plane is store/return with the values and behaviors the stock
+/// monorail init checks on top: CHIP_ID (0x374680E9, else BadChipId), PLL5G
+/// gain_stat, self-clearing RAM_INIT strobes and serdes1g/6g MCB one-shots,
+/// 10G serdes RCPLL lock/FSM status and APC offset-cal done, and the
+/// DEVCPU_GCB MIIM(0) controller bridging to a VSC8504 (Tesla) quad-PHY
+/// register model on MIIM addresses 4..=7 (identity, revision, port index,
+/// instant micro commands, and a patch CRC answer that skips the 8051
+/// firmware download).
 pub struct Vsc7448 {
     regs: std::collections::HashMap<u32, u32>,
     vsc: std::collections::HashMap<u32, u32>, // VSC7448 reg file, keyed by 24-bit word addr
@@ -465,6 +472,13 @@ pub struct Vsc7448 {
     rval: u32,    // register value being read out
     wval: u32,    // register value being assembled during a write
     vscdbg: bool, // SP_EMU_VSCDBG: trace every VSC7448 register read/write
+    // MIIM bridge to the on-board VSC8504 quad PHY (monorail drives it through
+    // DEVCPU_GCB MIIM(0): MII_CMD word 0x4034, MII_DATA 0x4035, MII_STATUS
+    // 0x4032). Register file keyed by (miim address, page, register); page
+    // per MIIM address via register 31.
+    phy_regs: std::collections::HashMap<(u8, u16, u8), u16>,
+    phy_page: std::collections::HashMap<u8, u16>,
+    mii_data: u32, // last MIIM read result (SUCCESS bits [17:16] = 0 = ok)
 }
 impl Vsc7448 {
     pub fn new() -> Self {
@@ -478,6 +492,9 @@ impl Vsc7448 {
             rval: 0,
             wval: 0,
             vscdbg: crate::config::get().vscdbg(),
+            phy_regs: std::collections::HashMap::new(),
+            phy_page: std::collections::HashMap::new(),
+            mii_data: 0,
         }
     }
     fn vsc_read(&self, waddr: u32) -> u32 {
@@ -490,8 +507,107 @@ impl Vsc7448 {
             // then errors LcPllInitFailed -> monorail BspInitFailed panic. Report a
             // locked PLL (gain_stat=5). See drv/vsc7448/src/lib.rs pll5g_setup.
             0x11800f => 5 << 14,
-            _ => *self.vsc.get(&waddr).unwrap_or(&0),
+            // MIIM(0) MII_STATUS (reg 0x710100c8): never pending or busy.
+            0x4032 => 0,
+            // MIIM(0) MII_DATA (reg 0x710100d4): last PHY read, SUCCESS = ok.
+            0x4035 => self.mii_data,
+            _ => {
+                let reg = 0x7100_0000 | (waddr << 2);
+                let stored = *self.vsc.get(&waddr).unwrap_or(&0);
+                // XGANA (0x71480000, 4 instances of 0x10000): the 10G serdes
+                // RCPLL status. STAT0 (TX +0x18c, RX +0xcc) reads
+                // pllf_lock_stat (bit 31) set; STAT1 (TX +0x190, RX +0xd0)
+                // reads pllf_fsm_stat (bits [3:0]) = 13. serdes10g apply
+                // checks both, else Tx/RxPllLockFailed / Tx/RxPllFsmFailed
+                // and monorail panics BspInitFailed.
+                if (0x7148_0000..0x714C_0000).contains(&reg) {
+                    match reg & 0xFFFF {
+                        0x18c | 0xcc => stored | 0x8000_0000,
+                        0x190 | 0xd0 => stored | 0xd,
+                        _ => stored,
+                    }
+                // XGDIG (0x714C0000, 4 instances of 0x10000):
+                // APC_IS_CAL_CFG1 (+0x20) reads offscal_done (bit 1) set;
+                // serdes10g apply polls it once after starting the offset
+                // calibration, else OffsetCalFailed.
+                } else if (0x714C_0000..0x7150_0000).contains(&reg) && reg & 0xFFFF == 0x20 {
+                    stored | 0x2
+                } else {
+                    stored
+                }
+            }
         }
+    }
+    /// MIIM(0) MII_CMD (reg 0x710100d0) written: run the PHY access. Fields:
+    /// VLD bit 31, PHYAD [29:25], REGAD [24:20], WRDATA [19:4], OPR [2:1]
+    /// (01 write, 10 read).
+    fn mii_cmd(&mut self, v: u32) {
+        if v >> 31 == 0 {
+            return;
+        }
+        let phy = ((v >> 25) & 0x1f) as u8;
+        let reg = ((v >> 20) & 0x1f) as u8;
+        match (v >> 1) & 0b11 {
+            0b01 => self.phy_write(phy, reg, ((v >> 4) & 0xffff) as u16),
+            0b10 => self.mii_data = self.phy_read(phy, reg) as u32,
+            _ => {}
+        }
+        if self.vscdbg {
+            eprintln!(
+                "[vsc] MIIM phy={} reg={} opr={} data={:#06x}",
+                phy,
+                reg,
+                (v >> 1) & 0b11,
+                self.mii_data
+            );
+        }
+    }
+    /// VSC8504 (Tesla) quad PHY on MIIM addresses 4..=7, port index = addr-4.
+    /// Store/return per (page, register), with the identity and status values
+    /// the vsc85xx driver checks on top. Register 31 selects the page.
+    fn phy_read(&self, phy: u8, reg: u8) -> u16 {
+        if reg == 31 {
+            return *self.phy_page.get(&phy).unwrap_or(&0);
+        }
+        let page = *self.phy_page.get(&phy).unwrap_or(&0);
+        let stored = *self.phy_regs.get(&(phy, page, reg)).unwrap_or(&0);
+        match (page, reg) {
+            (0, 2) => 0x0007, // IDENTIFIER_1: VSC8504_ID = 0x704c2
+            (0, 3) => 0x04c2, // IDENTIFIER_2
+            // EXTENDED_PHY_CONTROL_4: bits [15:11] = the PHY's own port index
+            // (get_port / the tesla patch base-port check).
+            (1, 23) => (stored & 0x07ff) | ((phy.wrapping_sub(4) as u16 & 0x1f) << 11),
+            // GPIO EXTENDED_REVISION: tesla_e (bit 0) set; the driver refuses
+            // non-rev-E parts (BadPhyRev).
+            (16, 30) => 0x0001,
+            _ => stored,
+        }
+    }
+    fn phy_write(&mut self, phy: u8, reg: u8, v: u16) {
+        if reg == 31 {
+            self.phy_page.insert(phy, v);
+            return;
+        }
+        let page = *self.phy_page.get(&phy).unwrap_or(&0);
+        let v = match (page, reg) {
+            // MODE_CONTROL: sw_reset (bit 15) self-clears (software_reset
+            // polls for it).
+            (0, 0) => v & !0x8000,
+            (16, 18) => {
+                // GPIO MICRO_PAGE: an 8051 micro command; completes at once.
+                // The driver's cmd() polls for bit 15 (busy) clear and fails
+                // on bit 14 (error), so both read back clear. Command 0x8008
+                // computes the firmware CRC into VERIPHY_CTRL_REG2; answer
+                // the Tesla patch's expected CRC so the (very long) 8051
+                // patch download is skipped as on an already-patched part.
+                if v == 0x8008 {
+                    self.phy_regs.insert((phy, 1, 25), 0x29E8);
+                }
+                v & !0xC000
+            }
+            _ => v,
+        };
+        self.phy_regs.insert((phy, page, reg), v);
     }
     /// Clock one byte out (and one in) of the VSC7448, by position in the xfer.
     fn xfer_byte(&mut self, b: u8) -> u8 {
@@ -544,12 +660,24 @@ impl Vsc7448 {
                         if RAM_INIT_REGS.contains(&(0x7100_0000 | (a << 2))) {
                             v &= !0x2;
                         }
+                        // HSIO MCB_SERDES1G_ADDR_CFG (0x714600e8) and
+                        // MCB_SERDES6G_ADDR_CFG (0x71460168): the wr/rd
+                        // one-shot strobes (bits 31/30) self-clear when the
+                        // MCB transfer completes; serdes1g/6g_read/write poll
+                        // them 32 times then error (Serdes*Timeout, a monorail
+                        // BspInitFailed panic).
+                        if a == 0x11803a || a == 0x11805a {
+                            v &= !0xC000_0000;
+                        }
                         if self.vscdbg {
                             eprintln!(
                                 "[vsc] W reg={:#010x} val={:#010x}",
                                 0x7100_0000 | (a << 2),
                                 v
                             );
+                        }
+                        if a == 0x4034 {
+                            self.mii_cmd(v); // MIIM(0) MII_CMD: PHY access
                         }
                         self.vsc.insert(a, v);
                     }
@@ -826,6 +954,15 @@ pub struct Spi5 {
     cs: Spi5Cs,    // user-design CS assert-generation; reset the command when it changes
     last_gen: u32,
     fpga: std::collections::HashMap<u16, u8>, // FPGA user-design register file (byte-addressed)
+    // Tofino debug port (TOFINO_DEBUG_PORT_BUFFER 0x200 / _STATE 0x201): the
+    // sequencer queues an opcode + address (+ data) into the buffer, sets
+    // REQUEST_IN_PROGRESS, polls for it to clear, then reads the response out
+    // of the buffer. Requests complete instantly against `tofino_regs`, a
+    // sparse register file of the Tofino behind the port, so the driver's
+    // read-modify-write-read-back sequences see their own writes.
+    dbg_req: Vec<u8>,
+    dbg_resp: std::collections::VecDeque<u8>,
+    tofino_regs: std::collections::HashMap<u32, u32>,
 }
 /// Seed the FPGA ignition-controller register block so the emulated sidecar SP
 /// answers MGS `ignition`. The sidecar is the rack's ignition hub: MGS issues
@@ -939,6 +1076,9 @@ impl Spi5 {
             (0x103, 0x00), // TOFINO_SEQ_ERROR = None
             (0x104, 0x00), // TOFINO_SEQ_ERROR_STATE = Init
             (0x105, 0x00),
+            // TOFINO_DEBUG_PORT_STATE: SEND_BUFFER_EMPTY | RECEIVE_BUFFER_EMPTY,
+            // else the sequencer's read_direct/write_direct bail InvalidState.
+            (0x201, 0x05),
         ]
         // TOFINO_SEQ_ERROR_STEP = Init
         {
@@ -957,7 +1097,36 @@ impl Spi5 {
             cs,
             last_gen: 0,
             fpga,
+            dbg_req: Vec::new(),
+            dbg_resp: std::collections::VecDeque::new(),
+            tofino_regs: std::collections::HashMap::new(),
         }
+    }
+    /// Run a queued Tofino debug-port request (REQUEST_IN_PROGRESS written to
+    /// TOFINO_DEBUG_PORT_STATE). Request layout: opcode, 4-byte LE address,
+    /// then for writes a 4-byte LE value. DirectRead (0xA0) queues the 4-byte
+    /// LE register value as the response; DirectWrite (0x80) stores it.
+    /// Unknown opcodes complete with no side effect. State returns to
+    /// buffers-empty / not-in-progress, so the driver's poll exits at once.
+    fn tofino_debug_request(&mut self) {
+        let req = std::mem::take(&mut self.dbg_req);
+        if req.len() >= 5 {
+            let addr = u32::from_le_bytes([req[1], req[2], req[3], req[4]]);
+            match req[0] {
+                0xA0 => {
+                    // DirectRead
+                    let v = *self.tofino_regs.get(&addr).unwrap_or(&0);
+                    self.dbg_resp.extend(v.to_le_bytes());
+                }
+                0x80 if req.len() >= 9 => {
+                    // DirectWrite
+                    let v = u32::from_le_bytes([req[5], req[6], req[7], req[8]]);
+                    self.tofino_regs.insert(addr, v);
+                }
+                _ => {}
+            }
+        }
+        self.fpga.insert(0x201, 0x05); // buffers empty, request complete
     }
     /// Reset per-command state on the CS deasserted->asserted edge — a command
     /// (header write + data read) spans two SPE cycles under one CS lock.
@@ -974,6 +1143,31 @@ impl Spi5 {
             self.last_gen = gen;
         }
     }
+    /// Tofino sequencing FSM, run after any write to TOFINO_SEQ_CTRL (0x100:
+    /// CLEAR_ERROR bit 0, EN bit 1, ACK_VID bit 2). EN set: the power-up
+    /// completes instantly; STATE (0x101) = A0(2), the VID (0x10c) reads
+    /// valid, and the six power rails (0x106..0x10b) read ENABLE|GOOD. EN
+    /// clear: back to A2(1), rails off, VID invalid. The command bits
+    /// CLEAR_ERROR and ACK_VID self-clear as on the real controller; ERROR
+    /// (0x103) never sets. The sequencer's power_up polls STATE for A0 after
+    /// its VID handshake (SequencerTimeoutNotInA0 otherwise), and its timer
+    /// tick powers up whenever policy is LatchOffOnFault and STATE reads A2.
+    fn tofino_seq_ctrl_written(&mut self) {
+        let ctrl = *self.fpga.get(&0x100).unwrap_or(&0);
+        let en = ctrl & 0x02 != 0;
+        // Command bits self-clear.
+        self.fpga.insert(0x100, ctrl & 0x02);
+        let (state, vid, rail) = if en {
+            (2u8, 0x80 | 0b1000, 0x03u8) // A0, VID_VALID | V0P759, ENABLE|GOOD
+        } else {
+            (1, 0, 0) // A2
+        };
+        self.fpga.insert(0x101, state);
+        self.fpga.insert(0x10c, vid);
+        for a in 0x106..=0x10bu16 {
+            self.fpga.insert(a, rail);
+        }
+    }
     /// The next data byte for the current (read) command, with address auto-increment.
     fn next_data(&mut self) -> u8 {
         let incr = self.op != 5 && self.op != 6; // No-AddrIncr variants hold addr
@@ -981,6 +1175,10 @@ impl Spi5 {
             .addr
             .wrapping_add(if incr { self.dpos } else { 0 } as u16);
         self.dpos += 1;
+        // Debug-port buffer reads pop response bytes.
+        if a == 0x200 {
+            return self.dbg_resp.pop_front().unwrap_or(0);
+        }
         *self.fpga.get(&a).unwrap_or(&0)
     }
     /// One TXDR byte (full-duplex). Header is the first 3 bytes [op, addr_be];
@@ -1015,13 +1213,28 @@ impl Spi5 {
                         .addr
                         .wrapping_add(if incr { self.dpos } else { 0 } as u16);
                     self.dpos += 1;
-                    let cur = *self.fpga.get(&a).unwrap_or(&0);
-                    let nv = match self.op {
-                        2 => cur | b,  // BitSet: read-modify-write OR
-                        3 => cur & !b, // BitClear: read-modify-write AND-NOT
-                        _ => b,        // Write / WriteNoAddrIncr: overwrite
-                    };
-                    self.fpga.insert(a, nv);
+                    // Debug-port buffer: writes queue request bytes, they do
+                    // not land in the register file.
+                    if a == 0x200 {
+                        self.dbg_req.push(b);
+                    } else {
+                        let cur = *self.fpga.get(&a).unwrap_or(&0);
+                        let nv = match self.op {
+                            2 => cur | b,  // BitSet: read-modify-write OR
+                            3 => cur & !b, // BitClear: read-modify-write AND-NOT
+                            _ => b,        // Write / WriteNoAddrIncr: overwrite
+                        };
+                        self.fpga.insert(a, nv);
+                        if a == 0x100 {
+                            self.tofino_seq_ctrl_written();
+                        }
+                        // Debug-port state: REQUEST_IN_PROGRESS runs the queued
+                        // request; other writes (e.g. reset to buffers-empty)
+                        // are plain stores.
+                        if a == 0x201 && nv & 0x10 != 0 {
+                            self.tofino_debug_request();
+                        }
+                    }
                     0
                 }
             }
@@ -1205,8 +1418,25 @@ impl Mmio for GpioBank {
                 let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
                 let new_cs = (odr >> 4) & 1 == 0;
                 let mut l = lk.borrow_mut();
-                if new_cs != l.cs {
+                let edge = new_cs != l.cs;
+                if edge {
                     if new_cs {
+                        // Transaction pacing (live RoT thread): a new transfer
+                        // must not start while the RoT still owes the previous
+                        // one an SSA/SSD ack, or its cleanup would race this
+                        // transfer's bytes (bounded; timeout proceeds).
+                        if l.rot_live {
+                            let mut budget = 400;
+                            while (l.ssa || l.ssd) && budget > 0 {
+                                l = lk.wait_sp(l, 5);
+                                budget -= 1;
+                            }
+                            // Unread request bytes belong to a dead transaction
+                            // (the firmware's start-of-transfer cleanup would
+                            // discard them); drop them so this transfer's first
+                            // frame carries the SOT.
+                            l.mosi.clear();
+                        }
                         // CS asserted: start of a transfer. Latch SSA + the SOT bit
                         // for the first FIFORD frame the RoT reads.
                         l.ssa = true;
@@ -1225,6 +1455,11 @@ impl Mmio for GpioBank {
                     }
                 }
                 l.cs = new_cs;
+                drop(l);
+                // A CS edge is the start/end of a transfer: wake a parked RoT.
+                if edge {
+                    lk.wake_rot();
+                }
             }
         }
         // GPIOB/GPIOI affect SPI2 CS; GPIOJ (port 9) affects the sidecar SPI5 CS.
@@ -1546,6 +1781,11 @@ pub struct I2c {
     eeprom: Rc<Vec<u8>>,                  // AT24CSW080 VPD/FRUID backing store (1024 bytes)
     bridge: crate::i2c_bridge::I2cBridge, // SP_EMU_I2C_BRIDGE sniff / _DEVICE delegate (no-op when off)
     bus: u8,                              // 1-based bus number (i2c1..i2c4) for the trace
+    // NACK every target on this controller. Sidecar I2C2 carries only the
+    // front IO board (front_io + frontgps ports); with no board modeled, the
+    // sequencer's FrontIOBoard::present probe must see NoDevice, not a false
+    // ACK that pulls in the whole front-IO bring-up (which then panics it).
+    nack_all: bool,
 }
 impl I2c {
     pub fn new(
@@ -1568,6 +1808,7 @@ impl I2c {
             eeprom,
             bridge,
             bus,
+            nack_all: crate::config::get().board().is_sidecar() && bus == 2,
         }
     }
     /// Accurate device-register model, keyed by I2C address. Returns the 16-bit
@@ -1615,7 +1856,16 @@ impl Mmio for I2c {
     }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
-            0x18 => (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6), // ISR: TXE|TXIS|RXNE|TC
+            0x18 => {
+                // ISR. An absent target NACKs: NACKF(4)|STOPF(5), no TXIS/RXNE,
+                // so the driver returns NoDevice (stm32xx-i2c checks NACKF
+                // before waiting on TXIS/RXNE/TC).
+                if self.nack_all && self.active {
+                    (1 << 4) | (1 << 5)
+                } else {
+                    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 6) // TXE|TXIS|RXNE|TC
+                }
+            }
             0x24 => {
                 // RXDR: serve the modeled device register / EEPROM byte
                 if crate::dbg::vpd() {
@@ -1745,47 +1995,123 @@ impl Mmio for I2c {
     }
 }
 
-/// STM32H7 QUADSPI — minimal model so the host-flash driver's transfers finish.
-/// SR(+0x08) always reports TCF|FTF (transfer complete / FIFO ready), BUSY clear;
-/// DR(+0x20) reads 0xFF (erased flash); FCR(+0x0C) flag clears accepted.
-/// QUADSPI (0x5200_5000) — command-aware model of the gimlet host flash so the
-/// `hf` task's init completes (it reads the JEDEC ID and fails hard unless it
-/// recognizes the chip, then scans for persistent data). Answers:
+/// QUADSPI (0x5200_5000): writable model of the SPI NOR flash driven by the
+/// gimlet `hf` task (host flash) and the sidecar `auxflash` task (FPGA blob
+/// slots). 32 MiB array with real command semantics, so both the boot-time
+/// scans and the MGS update path (slot erase, program, CHCK read-back) work.
 ///
-/// * RDID (0x9F)  -> [0x20, 0xBA, 0x19, ...]  (Micron MT25Q, 32 MiB:
-///   byte0=Micron, byte1=3.3V, byte2=log2(capacity)=25)
-/// * RDSR (0x05)  -> 0x00  (status: not busy, WIP=0)
-/// * memory reads -> 0xFF  (blank flash => the hf persistent-data scan finds
-///   nothing => clean "initial power-on" path, no writes)
-/// * writes/erase -> accepted (discarded)
+/// * RDID (0x9F): [0x20, 0xBA, 0x19, ...], Micron MT25Q 32 MiB. byte0
+///   manufacturer, byte1 voltage, byte2 log2(capacity). hf's init fails
+///   unless it recognizes this id.
+/// * RDSR (0x05): WIP (bit 0) always 0, operations complete instantly.
+///   WEL (bit 1) from the write-enable latch. auxflash's
+///   set_and_check_write_enable fails the update if WEL does not read back.
+/// * WREN (0x06) / WRDI (0x04): set/clear WEL.
+/// * SectorErase (0xDC): 64 KiB sector at the 4-byte address to 0xFF.
+/// * BulkErase (0xC7): whole array to 0xFF.
+/// * PageProgram (0x12): AND the data into the array at the 4-byte address.
+/// * Any addressed read (Read 0x13, QuadRead 0x6C, ...): array contents.
 ///
-/// The driver (drv-stm32h7-qspi) drives transfers by polling SR.FLEVEL (FIFO
-/// level, bits 8..13) and SR.TCF (transfer complete, bit1), reading data one
-/// byte at a time from DR (offset 0x20) via byte-wide accesses. The whole
-/// response is presented immediately with a large FLEVEL, and TCF is set once it
-/// is drained, so the driver never waits on the qspi-irq — avoiding the
-/// busy-loop/irq-storm a plain stub caused.
+/// Program and erase require WEL and clear it on completion. Contents persist
+/// to `qspi-flash.bin` next to the SP flash NVM file, write-through like
+/// `Flash`. The file is created lazily on the first program or erase, so a
+/// gimlet that never writes its host flash creates no file.
+///
+/// The driver (drv-stm32h7-qspi) polls SR.FLEVEL (bits 8..13) and SR.TCF
+/// (bit 1), moving data one byte at a time through DR (offset 0x20). Reads
+/// are presented whole, with TCF set once drained. Writes report FLEVEL 0 and
+/// TCF as soon as the command's address and data have arrived, so the driver
+/// never waits on the qspi irq. None is raised; an irq-less model avoids the
+/// busy loop a plain stub caused.
+const QSPI_SIZE: usize = 32 * 1024 * 1024;
+const QSPI_SECTOR: usize = 65_536;
+
+/// An indirect transfer decoded from CCR that still needs its address (AR
+/// write) and/or data (DR writes) before it can execute.
+enum QspiXfer {
+    Idle,
+    /// Addressed read. The response is built once AR arrives.
+    ReadAtAddr { len: usize },
+    /// Addressed write. On the AR write, a data-less command (sector erase)
+    /// executes; `data: true` (page program) starts collecting data bytes.
+    WriteAtAddr { instruction: u8, data: bool },
+    /// Page program with AR seen, collecting `remaining` data bytes via DR.
+    WriteData { remaining: usize },
+}
+
 pub struct Qspi {
     dlr: u32,        // transfer length register (holds len-1)
+    ar: u32,         // address register (last AR write)
     resp: Vec<u8>,   // pending read response
     resp_pos: usize, // bytes drained from `resp`
     mode_read: bool, // current transfer is an indirect read
     tcf: bool,       // transfer-complete latch
     cr: u32,         // control register (stored, for EN bit etc.)
     dcr: u32,        // device config (stored)
+    wel: bool,       // write-enable latch (RDSR bit 1)
+    xfer: QspiXfer,  // multi-register transfer in progress
+    wr_buf: Vec<u8>, // page-program data collected so far
+    mem: Vec<u8>,    // the 32 MiB NOR array
+    /// Write-through handle to the backing file, as in `Flash::file`. Opened
+    /// at construction if a persisted image exists, else created and seeded on
+    /// the first program or erase. `None` before that, or after an I/O error;
+    /// the model then continues RAM-only.
+    file: Option<std::fs::File>,
+    /// Backing file path. `None` disables persistence (tests).
+    path: Option<String>,
 }
 impl Qspi {
     pub fn new() -> Self {
+        // Persist next to the SP flash NVM file, one array per instance.
+        let nvm = crate::config::instance_file("SP_EMU_FLASH", crate::config::get().flash_path());
+        let path = crate::flash::instance_base(&nvm)
+            .join("qspi-flash.bin")
+            .display()
+            .to_string();
+        Self::with_backing(Some(path))
+    }
+    /// Build the model, loading a persisted array from `path` if one exists.
+    fn with_backing(path: Option<String>) -> Self {
+        let mut mem = vec![ERASED; QSPI_SIZE];
+        let mut file = None;
+        if let Some(p) = path.as_deref() {
+            if std::path::Path::new(p).exists() {
+                match std::fs::OpenOptions::new().read(true).write(true).open(p) {
+                    Ok(mut f) => {
+                        use std::io::Read;
+                        let mut buf = Vec::new();
+                        match f.read_to_end(&mut buf) {
+                            Ok(_) => {
+                                let n = buf.len().min(QSPI_SIZE);
+                                mem[..n].copy_from_slice(&buf[..n]);
+                                eprintln!("[qspi] loaded persisted QSPI flash from {p}");
+                                file = Some(f);
+                            }
+                            Err(e) => eprintln!("[qspi] read {p} failed: {e}; starting erased"),
+                        }
+                    }
+                    Err(e) => eprintln!("[qspi] open {p} failed: {e}; running RAM-only"),
+                }
+            }
+        }
         Qspi {
             dlr: 0,
+            ar: 0,
             resp: Vec::new(),
             resp_pos: 0,
             mode_read: false,
             tcf: false,
             cr: 0,
             dcr: 0,
+            wel: false,
+            xfer: QspiXfer::Idle,
+            wr_buf: Vec::new(),
+            mem,
+            file,
+            path,
         }
     }
+    /// Response for a non-addressed read command (RDID, RDSR, unique id).
     fn build_response(&self, instruction: u8, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
         match instruction {
@@ -1798,8 +2124,13 @@ impl Qspi {
                     }
                 }
             }
-            0x05 => { /* ReadStatusReg: 0x00 (not busy) — zeros already */ }
-            // Read / QuadRead / DdrRead / page-data etc.: erased NOR flash.
+            0x05 => {
+                // ReadStatusReg: WIP (bit 0) always clear, WEL (bit 1) live.
+                if self.wel {
+                    v[0] = 0x02;
+                }
+            }
+            // Unknown non-addressed reads (e.g. Winbond unique id): 0xFF fill.
             _ => {
                 for b in v.iter_mut() {
                     *b = 0xFF;
@@ -1807,6 +2138,125 @@ impl Qspi {
             }
         }
         v
+    }
+    /// Response for an addressed read: the array contents (wrapping at 32 MiB).
+    fn read_mem(&self, addr: u32, len: usize) -> Vec<u8> {
+        let mut v = vec![ERASED; len];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = self.mem[(addr as usize + i) & (QSPI_SIZE - 1)];
+        }
+        v
+    }
+    /// Open (creating + seeding if needed) the backing file on first write.
+    /// A failure clears `path` so a broken target is not retried per write.
+    fn ensure_file(&mut self) {
+        if self.file.is_some() {
+            return;
+        }
+        let Some(p) = self.path.clone() else { return };
+        use std::io::{Seek, SeekFrom, Write};
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                let r = f
+                    .seek(SeekFrom::Start(0))
+                    .and_then(|_| f.write_all(&self.mem))
+                    .and_then(|_| f.set_len(QSPI_SIZE as u64));
+                match r {
+                    Ok(()) => {
+                        eprintln!("[qspi] created backing file {p}");
+                        self.file = Some(f);
+                    }
+                    Err(e) => {
+                        eprintln!("[qspi] seed {p} failed: {e}; RAM-only");
+                        self.path = None;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[qspi] create {p} failed: {e}; RAM-only");
+                self.path = None;
+            }
+        }
+    }
+    /// Write `mem[off..off+len]` through to the backing file (see
+    /// `Flash::write_through`).
+    fn write_through(&mut self, off: usize, len: usize) {
+        use std::io::{Seek, SeekFrom, Write};
+        if len == 0 {
+            return;
+        }
+        self.ensure_file();
+        if let Some(f) = self.file.as_mut() {
+            let r = f
+                .seek(SeekFrom::Start(off as u64))
+                .and_then(|_| f.write_all(&self.mem[off..off + len]));
+            if let Err(e) = r {
+                eprintln!(
+                    "[qspi] write-through to {} failed: {e}",
+                    self.path.as_deref().unwrap_or("?")
+                );
+                self.file = None; // stop retrying a broken handle
+                self.path = None;
+            }
+        }
+    }
+    /// Sector (or bulk) erase at `self.ar`. Requires WEL; consumes it.
+    fn do_erase(&mut self, instruction: u8) {
+        if !self.wel {
+            if crate::dbg::eth() {
+                eprintln!("[qspi] erase {:#04x} without WEL, ignored", instruction);
+            }
+            self.tcf = true;
+            return;
+        }
+        self.wel = false;
+        let (base, len) = match instruction {
+            0xC7 => (0, QSPI_SIZE), // BulkErase
+            // SectorErase (0xDC 4-byte / 0xD8 3-byte): 64 KiB, aligned down.
+            _ => (
+                self.ar as usize & (QSPI_SIZE - 1) & !(QSPI_SECTOR - 1),
+                QSPI_SECTOR,
+            ),
+        };
+        self.mem[base..base + len].fill(ERASED);
+        self.write_through(base, len);
+        self.tcf = true;
+        if crate::dbg::eth() {
+            eprintln!("[qspi] erase {:#04x} @ {:#010x} len={}", instruction, base, len);
+        }
+    }
+    /// Page program `self.wr_buf` at `self.ar`. Requires WEL; consumes it.
+    /// NOR semantics: programming only clears bits.
+    fn do_program(&mut self) {
+        let buf = std::mem::take(&mut self.wr_buf);
+        if !self.wel {
+            if crate::dbg::eth() {
+                eprintln!("[qspi] program without WEL, ignored");
+            }
+            self.tcf = true;
+            return;
+        }
+        self.wel = false;
+        let base = self.ar as usize & (QSPI_SIZE - 1);
+        for (i, b) in buf.iter().enumerate() {
+            self.mem[(base + i) & (QSPI_SIZE - 1)] &= *b;
+        }
+        // Write through both segments if the program wraps past the end.
+        let first = buf.len().min(QSPI_SIZE - base);
+        self.write_through(base, first);
+        if first < buf.len() {
+            self.write_through(0, buf.len() - first);
+        }
+        self.tcf = true;
+        if crate::dbg::eth() {
+            eprintln!("[qspi] program @ {:#010x} len={}", base, buf.len());
+        }
     }
 }
 impl Mmio for Qspi {
@@ -1839,6 +2289,7 @@ impl Mmio for Qspi {
                 sr
             }
             0x10 => self.dlr,
+            0x18 => self.ar,
             0x20 => {
                 // DR: pop one byte (driver reads the low byte via byte access)
                 if self.resp_pos < self.resp.len() {
@@ -1863,29 +2314,109 @@ impl Mmio for Qspi {
             } // FCR.CTCF
             0x10 => self.dlr = val, // DLR (len-1)
             0x14 => {
-                // CCR: instruction in bits[7:0], FMODE in bits[27:26]
+                // CCR: instruction bits[7:0], ADMODE bits[11:10], DMODE
+                // bits[25:24], FMODE bits[27:26]. The driver writes CCR first;
+                // for addressed commands AR follows immediately (nothing polls
+                // SR in between), then data moves through DR.
                 let instruction = (val & 0xFF) as u8;
+                let admode = (val >> 10) & 0b11;
+                let dmode = (val >> 24) & 0b11;
                 let fmode = (val >> 26) & 0b11;
+                let len = (self.dlr as usize).wrapping_add(1);
                 if fmode == 0b01 {
-                    // indirect read
-                    let len = (self.dlr as usize).wrapping_add(1);
-                    self.resp = self.build_response(instruction, len);
+                    // Indirect read. Addressed (memory) reads wait for AR; the
+                    // rest (RDID/RDSR/unique-id) answer from the command alone.
+                    if admode != 0 {
+                        self.resp.clear();
+                        self.xfer = QspiXfer::ReadAtAddr { len };
+                    } else {
+                        self.resp = self.build_response(instruction, len);
+                        self.xfer = QspiXfer::Idle;
+                    }
                     self.resp_pos = 0;
                     self.mode_read = true;
                     self.tcf = false;
                 } else {
-                    // indirect write (write-enable / program / erase): instant
+                    // Indirect write: write-enable / erase / program.
                     self.mode_read = false;
-                    self.tcf = true;
+                    self.wr_buf.clear();
+                    match instruction {
+                        0x06 => {
+                            // WREN
+                            self.wel = true;
+                            self.xfer = QspiXfer::Idle;
+                            self.tcf = true;
+                        }
+                        0x04 => {
+                            // WRDI
+                            self.wel = false;
+                            self.xfer = QspiXfer::Idle;
+                            self.tcf = true;
+                        }
+                        0xC7 => {
+                            // BulkErase: no address, executes now.
+                            self.xfer = QspiXfer::Idle;
+                            self.do_erase(instruction);
+                        }
+                        _ if admode != 0 => {
+                            // Addressed write: PageProgram (data follows) or
+                            // SectorErase (data-less); resolved at the AR write.
+                            self.xfer = QspiXfer::WriteAtAddr {
+                                instruction,
+                                data: dmode != 0,
+                            };
+                            self.tcf = false;
+                        }
+                        _ => {
+                            // Unknown address-less write command: accept, done.
+                            self.xfer = QspiXfer::Idle;
+                            self.tcf = true;
+                        }
+                    }
                 }
                 if crate::dbg::eth() {
                     eprintln!(
-                        "[qspi] CCR instr={:#04x} fmode={:#b} dlr={}",
-                        instruction, fmode, self.dlr
+                        "[qspi] CCR instr={:#04x} fmode={:#b} admode={:#b} dmode={:#b} dlr={}",
+                        instruction, fmode, admode, dmode, self.dlr
                     );
                 }
             }
-            _ => {} // AR, DR-writes, interrupt-enable bits in CR: accept/ignore
+            0x18 => {
+                // AR: completes the address phase of the pending transfer.
+                self.ar = val;
+                match self.xfer {
+                    QspiXfer::ReadAtAddr { len } => {
+                        self.resp = self.read_mem(val, len);
+                        self.resp_pos = 0;
+                        self.xfer = QspiXfer::Idle;
+                    }
+                    QspiXfer::WriteAtAddr { instruction, data } => {
+                        // Data-less (erase) commands execute here; a program
+                        // now collects its DLR+1 data bytes through DR.
+                        if data {
+                            self.xfer = QspiXfer::WriteData {
+                                remaining: (self.dlr as usize).wrapping_add(1),
+                            };
+                        } else {
+                            self.xfer = QspiXfer::Idle;
+                            self.do_erase(instruction);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            0x20 => {
+                // DR write: one data byte of a page program (byte-wide access,
+                // like DR reads).
+                if let QspiXfer::WriteData { remaining } = self.xfer {
+                    self.wr_buf.push((val & 0xFF) as u8);
+                    if self.wr_buf.len() >= remaining {
+                        self.xfer = QspiXfer::Idle;
+                        self.do_program();
+                    }
+                }
+            }
+            _ => {} // interrupt-enable bits in CR etc.: accept/ignore
         }
     }
     // No irq needed: the driver completes by polling FLEVEL/TCF, satisfied
@@ -2092,6 +2623,204 @@ impl Mmio for Scs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- QSPI: drive the register interface like drv-stm32h7-qspi does ----
+    // CCR first (instruction, ADMODE, DMODE, FMODE), then AR for addressed
+    // commands, then byte-wide DR traffic. SR.TCF is polled for completion.
+
+    fn qspi_ccr(instr: u8, fmode: u32, addressed: bool, data: bool) -> u32 {
+        let mut v = instr as u32 | (fmode << 26);
+        if addressed {
+            v |= (0b01 << 10) | (0b11 << 12); // ADMODE single line, ADSIZE 32-bit
+        }
+        if data {
+            v |= 0b01 << 24; // DMODE single line
+        }
+        v
+    }
+
+    fn qspi_read(q: &mut Qspi, instr: u8, addr: Option<u32>, len: usize) -> Vec<u8> {
+        q.write(0x10, (len - 1) as u32); // DLR
+        q.write(0x14, qspi_ccr(instr, 0b01, addr.is_some(), true));
+        if let Some(a) = addr {
+            q.write(0x18, a);
+        }
+        (0..len).map(|_| q.read(0x20) as u8).collect()
+    }
+
+    fn qspi_cmd(q: &mut Qspi, instr: u8, addr: Option<u32>, data: &[u8]) {
+        if !data.is_empty() {
+            q.write(0x10, (data.len() - 1) as u32); // DLR
+        }
+        q.write(0x14, qspi_ccr(instr, 0b00, addr.is_some(), !data.is_empty()));
+        if let Some(a) = addr {
+            q.write(0x18, a);
+        }
+        for b in data {
+            q.write(0x20, *b as u32);
+        }
+        // The driver ends every write by polling SR.TCF; the model must have
+        // completed by now (operations are instant).
+        assert_ne!(q.read(0x08) & (1 << 1), 0, "TCF after {instr:#04x}");
+    }
+
+    #[test]
+    fn qspi_write_enable_latch_reads_back_in_rdsr() {
+        let mut q = Qspi::with_backing(None);
+        // auxflash's set_and_check_write_enable: WREN then RDSR, bit 1 must
+        // set, else WriteEnableFailed (MGS "code 17"). WIP (bit 0) clear.
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x02);
+        // A program consumes WEL, as on a real part.
+        qspi_cmd(&mut q, 0x12, Some(0), &[0xAB]);
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
+        // RDID still answers the Micron MT25Q id the hf init check requires.
+        assert_eq!(qspi_read(&mut q, 0x9F, None, 3), vec![0x20, 0xBA, 0x19]);
+    }
+
+    #[test]
+    fn qspi_erase_program_readback() {
+        let mut q = Qspi::with_backing(None);
+        let base = 0x0002_0000u32; // slot-interior, sector-aligned
+        let data = [0xDE, 0xAD, 0xBE, 0xEF];
+
+        // The auxflash update sequence: write-enable + sector erase, then
+        // write-enable + page program, then read back (the CHCK scan).
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0xDC, Some(base), &[]);
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0x12, Some(base), &data);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 4), data.to_vec());
+        // Neighbors are untouched (erased).
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base + 4), 2), vec![0xFF; 2]);
+
+        // NOR semantics: a second program only clears bits (0xDE & 0x21 = 0x00).
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0x12, Some(base), &[0x21]);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 1), vec![0xDE & 0x21]);
+
+        // Sector erase clears the whole 64 KiB sector back to 0xFF.
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0xDC, Some(base + 7), &[]); // interior address: aligned down
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 4), vec![0xFF; 4]);
+
+        // Program/erase without a preceding WREN are ignored.
+        qspi_cmd(&mut q, 0x12, Some(base), &[0x00]);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 1), vec![0xFF]);
+    }
+
+    #[test]
+    fn qspi_persists_to_backing_file() {
+        let path = std::env::temp_dir()
+            .join(format!("sp-emu-qspi-test-{}.bin", std::process::id()))
+            .display()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let base = 0x0001_0000u32;
+        {
+            let mut q = Qspi::with_backing(Some(path.clone()));
+            qspi_cmd(&mut q, 0x06, None, &[]);
+            qspi_cmd(&mut q, 0x12, Some(base), &[0x5A, 0xA5]);
+        }
+        // A fresh instance (a new sp-emu run) sees the programmed bytes.
+        let mut q = Qspi::with_backing(Some(path.clone()));
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x5A, 0xA5]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- VSC7448 MIIM bridge + VSC8504 PHY model -----------------------------
+
+    /// MII_CMD encoding per DEVCPU_GCB MIIM: VLD bit 31, PHYAD [29:25],
+    /// REGAD [24:20], WRDATA [19:4], OPR [2:1] (01 write, 10 read).
+    fn miim(phy: u8, reg: u8, wr: Option<u16>) -> u32 {
+        (1 << 31)
+            | ((phy as u32) << 25)
+            | ((reg as u32) << 20)
+            | ((wr.unwrap_or(0) as u32) << 4)
+            | if wr.is_some() { 0b01 << 1 } else { 0b10 << 1 }
+    }
+
+    #[test]
+    fn vsc7448_miim_serves_vsc8504_identity_and_micro_commands() {
+        let mut v = Vsc7448::new();
+        // read_id: STANDARD (page 0) IDENTIFIER_1/2 must yield VSC8504_ID
+        // 0x704c2, else monorail panics BspInitFailed(BadPhyId).
+        v.mii_cmd(miim(4, 31, Some(0)));
+        v.mii_cmd(miim(4, 2, None));
+        assert_eq!(v.mii_data, 0x0007);
+        v.mii_cmd(miim(4, 3, None));
+        assert_eq!(v.mii_data, 0x04c2);
+
+        // GPIO page (0x10): EXTENDED_REVISION reads tesla_e (bit 0) set.
+        v.mii_cmd(miim(4, 31, Some(0x10)));
+        v.mii_cmd(miim(4, 30, None));
+        assert_eq!(v.mii_data & 1, 1);
+
+        // A micro command completes at once: busy (15) and error (14) clear.
+        // The CRC command leaves the Tesla patch's expected CRC in
+        // VERIPHY_CTRL_REG2 (EXTENDED page reg 25) so the download is skipped.
+        v.mii_cmd(miim(4, 18, Some(0x8008)));
+        v.mii_cmd(miim(4, 18, None));
+        assert_eq!(v.mii_data & 0xC000, 0);
+        v.mii_cmd(miim(4, 31, Some(1)));
+        v.mii_cmd(miim(4, 25, None));
+        assert_eq!(v.mii_data, 0x29E8);
+
+        // EXTENDED_PHY_CONTROL_4 bits [15:11]: the port index (MIIM addr - 4).
+        v.mii_cmd(miim(4, 23, None));
+        assert_eq!(v.mii_data >> 11, 0);
+        v.mii_cmd(miim(6, 31, Some(1)));
+        v.mii_cmd(miim(6, 23, None));
+        assert_eq!(v.mii_data >> 11, 2);
+    }
+
+    // ---- Mainboard FPGA: Tofino sequencing FSM + debug port ------------------
+
+    #[test]
+    fn spi5_tofino_power_up_and_down() {
+        let mut s = Spi5::new(Rc::new(Cell::new(0)));
+        assert_eq!(s.fpga[&0x101], 1, "resting state A2");
+
+        // EN set: A0, VID valid, all six rails ENABLE|GOOD.
+        s.fpga.insert(0x100, 0x02);
+        s.tofino_seq_ctrl_written();
+        assert_eq!(s.fpga[&0x101], 2, "A0");
+        assert_eq!(s.fpga[&0x10c], 0x88, "VID_VALID | V0P759");
+        for a in 0x106..=0x10bu16 {
+            assert_eq!(s.fpga[&a], 0x03);
+        }
+        // ACK_VID self-clears and does not disturb the state.
+        s.fpga.insert(0x100, 0x02 | 0x04);
+        s.tofino_seq_ctrl_written();
+        assert_eq!(s.fpga[&0x100], 0x02, "command bits self-clear");
+        assert_eq!(s.fpga[&0x101], 2);
+
+        // EN clear: back to A2, VID invalid, rails off.
+        s.fpga.insert(0x100, 0x00);
+        s.tofino_seq_ctrl_written();
+        assert_eq!(s.fpga[&0x101], 1);
+        assert_eq!(s.fpga[&0x10c], 0);
+    }
+
+    #[test]
+    fn spi5_tofino_debug_port_write_then_read_back() {
+        let mut s = Spi5::new(Rc::new(Cell::new(0)));
+        assert_eq!(s.fpga[&0x201], 0x05, "buffers empty at rest");
+
+        // DirectWrite 0xCAFEF00D to address 0x01234: opcode, LE addr, LE value.
+        s.dbg_req.extend([0x80, 0x34, 0x12, 0x00, 0x00]);
+        s.dbg_req.extend(0xCAFEF00Du32.to_le_bytes());
+        s.tofino_debug_request();
+        assert_eq!(s.fpga[&0x201], 0x05, "request complete, buffers empty");
+
+        // DirectRead of the same address returns the value, LE, via the buffer.
+        s.dbg_req.extend([0xA0, 0x34, 0x12, 0x00, 0x00]);
+        s.tofino_debug_request();
+        let resp: Vec<u8> = s.dbg_resp.drain(..).collect();
+        assert_eq!(resp, 0xCAFEF00Du32.to_le_bytes());
+    }
 
     #[test]
     fn vpd_field_forces_printable_ascii_and_bounds_length() {

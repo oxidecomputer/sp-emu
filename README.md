@@ -204,7 +204,9 @@ The ones you reach for most:
   `~/.local/state/sp-emu` and prints a warning, so a bare run never writes into the
   working directory. Give each instance in a fleet its own.
 - `SP_EMU_FLASH`: path to the NVM (flash) image file. Defaults to `sp-flash.bin`
-  under `SP_EMU_STATE_DIR`; set it to place the flash somewhere specific.
+  under `SP_EMU_STATE_DIR`; set it to place the flash somewhere specific. The
+  QSPI NOR array (gimlet host flash / sidecar aux flash) persists next to it as
+  `qspi-flash.bin`, created on the first program or erase.
 - `SP_EMU_BOARD`: `gimlet` (default) or `sidecar`. Selects the SoC model and identity.
 - `SP_EMU_BRIDGE`: loopback address for the MGS UDP surface, for example
   `[::1]:33310`. The two switch ports are this one and the next.

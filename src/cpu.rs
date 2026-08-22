@@ -761,6 +761,20 @@ impl Cpu {
                 self.shift_op(ops, t2_reg_shift_style(raw, len).unwrap_or(dflt))
             }
 
+            Opcode::RRX => {
+                // RRX rd, rm: rotate right by one through carry. The S form
+                // sets N/Z from the result and C from the shifted-out bit.
+                let rd = reg(&ops[0])?;
+                let v = self.read_reg(reg(&ops[1])?);
+                let res = ((self.c as u32) << 31) | (v >> 1);
+                self.write_reg(rd, res);
+                if self.cur_setflags {
+                    self.set_nz(res);
+                    self.c = v & 1 != 0;
+                }
+                Ok(())
+            }
+
             Opcode::CMP => {
                 let a = self.read_reg(reg(&ops[0])?);
                 let b = self.opval(&ops[1])?;
@@ -795,6 +809,10 @@ impl Cpu {
             Opcode::UXTAH => self.extend(ops, 16, false, true, raw, len),
             Opcode::SXTAB => self.extend(ops, 8, true, true, raw, len),
             Opcode::SXTAH => self.extend(ops, 16, true, true, raw, len),
+            Opcode::UXTB16 => self.extend16(ops, false, false, raw),
+            Opcode::SXTB16 => self.extend16(ops, true, false, raw),
+            Opcode::UXTAB16 => self.extend16(ops, false, true, raw),
+            Opcode::SXTAB16 => self.extend16(ops, true, true, raw),
 
             Opcode::MUL => {
                 let a = self.read_reg(reg(&ops[1])?);
@@ -1314,6 +1332,42 @@ impl Cpu {
             masked
         };
         self.write_reg(rd, acc.wrapping_add(ext));
+        Ok(())
+    }
+
+    /// The dual-halfword byte extends: UXTB16 / SXTB16 / UXTAB16 / SXTAB16.
+    /// Each halfword lane of rd is filled from one byte of the (rotated)
+    /// source: lane0 from byte 0, lane1 from byte 2. The A forms add the
+    /// matching lane of rn, wrapping within the lane. These are 32-bit
+    /// encodings only; the rotation field is the same as `extend`'s.
+    fn extend16(
+        &mut self,
+        ops: &[Operand; 4],
+        signed: bool,
+        add: bool,
+        raw: u32,
+    ) -> Result<(), ()> {
+        let rd = reg(&ops[0])?;
+        let (acc, rm_op) = if add {
+            (self.read_reg(reg(&ops[1])?), &ops[2])
+        } else {
+            (0u32, &ops[1])
+        };
+        let rot = ((raw >> 20) & 3) * 8;
+        let mut v = self.opval(rm_op)?;
+        if rot != 0 {
+            v = v.rotate_right(rot);
+        }
+        let ext = |b: u32| -> u32 {
+            if signed {
+                (b as u8 as i8 as i32 as u32) & 0xFFFF
+            } else {
+                b & 0xFF
+            }
+        };
+        let lo = ext(v & 0xFF).wrapping_add(acc & 0xFFFF) & 0xFFFF;
+        let hi = ext((v >> 16) & 0xFF).wrapping_add((acc >> 16) & 0xFFFF) & 0xFFFF;
+        self.write_reg(rd, (hi << 16) | lo);
         Ok(())
     }
 
@@ -2811,5 +2865,42 @@ mod tests {
         assert!(cpu.step(&mut bus, &mut host).is_ok());
         assert!(cpu.wfi_idle, "an idle WFI is signalled regardless of throttle");
         assert_eq!(cpu.idle_skip, 0, "throttle path did not run");
+    }
+
+    /// UXTB16 fills each halfword lane of rd from one byte of rm: lane 0 from
+    /// byte 0, lane 1 from byte 2. Silently skipping it (the pre-fix behavior)
+    /// left the stale rd corrupting a computed register address in monorail's
+    /// serdes10g setup.
+    #[test]
+    fn uxtb16_extends_bytes_zero_and_two() {
+        let mut bus = ram_bus();
+        // T1 UXTB16 r10, r0 = fa3f fa80.
+        bus.write16(RAM, 0xfa3f);
+        bus.write16(RAM + 2, 0xfa80);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.r[0] = 0x1122_3344;
+        cpu.r[10] = 0xDEAD_BEEF;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.r[10], 0x0022_0044);
+    }
+
+    /// RRX rotates right by one through carry; the plain form leaves flags
+    /// untouched.
+    #[test]
+    fn rrx_rotates_through_carry() {
+        let mut bus = ram_bus();
+        // T3 MOV.W r2, r8, RRX = ea4f 0238.
+        bus.write16(RAM, 0xea4f);
+        bus.write16(RAM + 2, 0x0238);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.r[8] = 0x0000_0003;
+        cpu.c = true;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.r[2], 0x8000_0001);
+        assert!(cpu.c, "non-S form leaves carry unchanged");
     }
 }

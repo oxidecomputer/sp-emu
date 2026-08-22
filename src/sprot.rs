@@ -10,12 +10,16 @@
 //!     reads it on GPIO PE3 (the SP's sprot waits on a timer and re-reads the pin,
 //!     so no EXTI model is needed for correctness, just for low latency).
 //!
-//! The link is a process-global (thread-local) so the SP-bus and RoT-bus device
-//! models can share it without threading a handle through every constructor.
+//! The link is a process-global so the SP-bus and RoT-bus device models can
+//! share it without threading a handle through every constructor. The SP and
+//! RoT cores run on separate threads; the link models the wires between them
+//! as a mutex-guarded state block plus one condvar per waiting side. Silicon
+//! guarantees the RoT services its FIFO IRQ ahead of the SP's SPI clock;
+//! thread scheduling does not, so the SP side blocks briefly on RoT progress
+//! (`SpiMaster`), the bridge's one non-physical mechanism.
 use crate::mem::Mmio;
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The RoT's FLEXCOMM8 RX FIFO depth in bytes (8 frames × 2 bytes); the SP-side
 /// SPI master mirrors the same TX-FIFO depth. Bytes clocked past it are dropped on
@@ -70,8 +74,78 @@ pub struct SprotLink {
     // assertion to invalidate the attestation log. Set/cleared by the serve loop on
     // the probe's connect/disconnect; read by `LpcGpio` to synthesize the pin level.
     pub jtag_detect: bool,
+    // SP thread -> RoT thread events, modeling the PINT edge lines. The SP loop
+    // sets these; the RoT thread consumes them and pends its own PINT/NVIC state
+    // (it owns the RoT bus, the SP thread must not touch it).
+    pub sp_reset_pint: bool, // SP self-reset edge (SP_RESET slot 0 -> IRQ 4)
+    pub jtag_pint: bool,     // probe-attach edge (JTAG_DETECT slot 1 -> IRQ 5)
+    // True once the in-process RoT thread is running. Gates the SP-side blocking
+    // waits: in the shared-RoT IPC mode (SP_EMU_ROT_SERVICE) the SP serve loop is
+    // the link peer and fills `miso` itself, so waiting on a RoT would deadlock.
+    pub rot_live: bool,
+    // Activity counters for the stuck-link watchdog: frames the RoT read from
+    // its RX FIFO, frames it queued to TX, and bytes the SP clocked out. A busy
+    // link whose counters stop moving is wedged.
+    pub rx_frames: u64,
+    pub tx_frames: u64,
+    pub sp_txdr: u64,
 }
-pub type Link = Rc<RefCell<SprotLink>>;
+
+/// The wires between the two cores: link state under one mutex, plus a condvar
+/// per waiting side. `sp_cv` parks the SP thread (waiting on RoT progress:
+/// a `miso` refill, a `mosi` drain, a rot-irq edge, an SWD read result);
+/// `rot_cv` parks the idle RoT thread (woken by CS edges, request bytes, and
+/// the PINT edge events above).
+pub struct LinkCell {
+    inner: Mutex<SprotLink>,
+    sp_cv: Condvar,
+    rot_cv: Condvar,
+}
+impl LinkCell {
+    pub fn new() -> Self {
+        LinkCell {
+            inner: Mutex::new(SprotLink::default()),
+            sp_cv: Condvar::new(),
+            rot_cv: Condvar::new(),
+        }
+    }
+    /// Lock the link state. Named to match the old `Rc<RefCell>` call sites.
+    pub fn borrow(&self) -> MutexGuard<'_, SprotLink> {
+        self.inner.lock().unwrap()
+    }
+    pub fn borrow_mut(&self) -> MutexGuard<'_, SprotLink> {
+        self.inner.lock().unwrap()
+    }
+    /// Park the calling (SP) thread until the RoT signals progress or `ms` pass.
+    pub fn wait_sp<'a>(
+        &'a self,
+        g: MutexGuard<'a, SprotLink>,
+        ms: u64,
+    ) -> MutexGuard<'a, SprotLink> {
+        self.sp_cv
+            .wait_timeout(g, std::time::Duration::from_millis(ms))
+            .unwrap()
+            .0
+    }
+    /// Park the calling (RoT) thread until the SP signals work or `ms` pass.
+    pub fn wait_rot<'a>(
+        &'a self,
+        g: MutexGuard<'a, SprotLink>,
+        ms: u64,
+    ) -> MutexGuard<'a, SprotLink> {
+        self.rot_cv
+            .wait_timeout(g, std::time::Duration::from_millis(ms))
+            .unwrap()
+            .0
+    }
+    pub fn wake_sp(&self) {
+        self.sp_cv.notify_all();
+    }
+    pub fn wake_rot(&self) {
+        self.rot_cv.notify_all();
+    }
+}
+pub type Link = Arc<LinkCell>;
 
 // The sprot debug flag (memoized in `dbg.rs`); re-exported so the existing
 // `crate::sprot::dbg()` call sites (lpc55/soc/gdb) and this module keep working.
@@ -99,16 +173,16 @@ pub fn rot_trace_tick() -> bool {
     }
 }
 
-thread_local! {
-    static LINK: RefCell<Option<Link>> = const { RefCell::new(None) };
-}
+static LINK: OnceLock<Link> = OnceLock::new();
 /// Enable the bridge for this run (called once, before building the buses).
+/// Process-global so the SP thread, the RoT thread, and both buses' device
+/// models all see the same wires.
 pub fn enable() {
-    LINK.with(|l| *l.borrow_mut() = Some(Rc::new(RefCell::new(SprotLink::default()))));
+    let _ = LINK.set(Arc::new(LinkCell::new()));
 }
 /// The shared link, if the bridge is enabled.
 pub fn link() -> Option<Link> {
-    LINK.with(|l| l.borrow().clone())
+    LINK.get().cloned()
 }
 
 // ---- SP side: STM32H7 SPI4 master ------------------------------------------
@@ -206,6 +280,26 @@ impl Mmio for SpiMaster {
             0x20 => {
                 // TXDR: clock one byte out + one in
                 let mut lk = self.link.borrow_mut();
+                // With a live RoT thread, pace the master on RoT progress
+                // (bounded; a timeout falls through to the drop/zero-fill
+                // below, a normal sprot timeout + retry to the firmware).
+                if lk.rot_live {
+                    // Phase 2: an empty `miso` mid-reply would clock a zero
+                    // into the response and corrupt its CRC; wait for refill.
+                    let mut budget = 400;
+                    while lk.rot_irq && lk.cs && lk.miso.is_empty() && budget > 0 {
+                        lk = self.link.wait_sp(lk, 5);
+                        budget -= 1;
+                    }
+                    // Phase 1: RoT RX FIFO full; wait for its drain. Gated on
+                    // !rot_irq: during a reply the SP's dummy clock-outs land
+                    // in `mosi` but the RoT is sending, not draining.
+                    budget = 400;
+                    while !lk.rot_irq && lk.mosi.len() >= SPROT_FIFO_BYTES && budget > 0 {
+                        lk = self.link.wait_sp(lk, 5);
+                        budget -= 1;
+                    }
+                }
                 // The RoT's FLEXCOMM8 RX FIFO is 8 frames (16 bytes) deep. On real
                 // hardware, bytes clocked in while the FIFO is full are dropped
                 // (overrun). Model that bound: without it, the SP's rapid retries
@@ -215,8 +309,10 @@ impl Mmio for SpiMaster {
                 if lk.mosi.len() < SPROT_FIFO_BYTES {
                     lk.mosi.push_back((val & 0xFF) as u8);
                 }
+                lk.sp_txdr = lk.sp_txdr.wrapping_add(1);
                 let inb = lk.miso.pop_front().unwrap_or(0);
                 drop(lk);
+                self.link.wake_rot();
                 self.rx.push_back(inb);
                 self.sent = self.sent.wrapping_add(1);
                 if dbg() {
@@ -288,6 +384,7 @@ impl Mmio for RotSpiSlave {
                     // A request is now being received; stays in flight (keeping the
                     // host full-speed) until the RoT asserts rot-irq with the reply.
                     lk.request_in_flight = true;
+                    lk.rx_frames = lk.rx_frames.wrapping_add(1);
                     let hi = lk.mosi.pop_front().unwrap_or(0) as u32;
                     let lo = lk.mosi.pop_front().unwrap_or(0) as u32;
                     // SOT is latched on CS assert (soc.rs) and consumed by the first
@@ -302,6 +399,8 @@ impl Mmio for RotSpiSlave {
                     (hi, lo, sot)
                 };
                 let frame = (hi << 8) | lo;
+                // Drained two request bytes: a full-FIFO SP master may be waiting.
+                self.link.wake_sp();
                 self.n_ford += 1;
                 if self.n_ford == 1 && dbg() {
                     arm_rot_trace(40000);
@@ -336,6 +435,9 @@ impl Mmio for RotSpiSlave {
                         val, lk.ssa, lk.ssd
                     );
                 }
+                drop(lk);
+                // The SSA/SSD ack is what CS-assert transaction pacing waits on.
+                self.link.wake_sp();
             }
             0xE00 => {
                 // FIFOCFG: EMPTYTX(16) drains TX (miso), EMPTYRX(17) drains RX (mosi)
@@ -346,13 +448,19 @@ impl Mmio for RotSpiSlave {
                 if val & (1 << 17) != 0 {
                     lk.mosi.clear();
                 }
+                drop(lk);
+                self.link.wake_sp();
             }
             0xE20 => {
                 // FIFOWR: 16-bit frame, upper byte first on the wire (get_u16)
                 let frame = (val & 0xFFFF) as u16;
                 let mut lk = self.link.borrow_mut();
+                lk.tx_frames = lk.tx_frames.wrapping_add(1);
                 lk.miso.push_back((frame >> 8) as u8);
                 lk.miso.push_back((frame & 0xFF) as u8);
+                drop(lk);
+                // Refilled the reply: an SP master mid-phase-2 may be waiting.
+                self.link.wake_sp();
                 self.n_fwr += 1;
                 if dbg() && self.n_fwr <= 64 {
                     eprintln!("[rot] FIFOWR#{} <- {:#06x}", self.n_fwr, frame);
@@ -406,7 +514,13 @@ impl LpcGpio {
         if asserted {
             lk.request_in_flight = false;
         }
+        let changed = asserted != lk.rot_irq || reset_released;
         lk.rot_irq = asserted;
+        drop(lk);
+        // A rot-irq edge or reset release is exactly what a parked SP waits on.
+        if changed {
+            self.link.wake_sp();
+        }
     }
 }
 impl Mmio for LpcGpio {
@@ -544,6 +658,70 @@ impl Mmio for SpExti {
     }
 }
 
+// ---- Stuck-link watchdog ----------------------------------------------------
+//
+// Detects the wedge class seen on voxel: an sprot exchange starts (ssa latched,
+// a request in flight, or rot-irq held) and then nothing moves again, leaving
+// every later sprot op to time out until the instance is restarted. The SP
+// serve loop calls `watchdog_tick` once per iteration; when the link has been
+// busy with no counter movement for `WATCHDOG_FIRST`, it logs one line of link
+// state plus the RoT's pc, then repeats every `WATCHDOG_REPEAT` while stuck.
+// Diagnostic only: it never mutates the link.
+
+const WATCHDOG_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+const WATCHDOG_REPEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub struct Watchdog {
+    counters: (u64, u64, u64),
+    since: std::time::Instant,
+    next_log: std::time::Duration,
+}
+impl Watchdog {
+    pub fn new() -> Self {
+        Watchdog {
+            counters: (0, 0, 0),
+            since: std::time::Instant::now(),
+            next_log: WATCHDOG_FIRST,
+        }
+    }
+}
+
+/// Sample the link; log if it has been busy without progress. `rot_pc` and
+/// `rot_ticks` come from the RoT thread's published state.
+pub fn watchdog_tick(wd: &mut Watchdog, rot_pc: u32, rot_ticks: u64) {
+    let Some(lk) = link() else { return };
+    let l = lk.borrow();
+    let busy = l.ssa || l.ssd || l.rot_irq || l.request_in_flight;
+    let counters = (l.rx_frames, l.tx_frames, l.sp_txdr);
+    if !busy || counters != wd.counters {
+        wd.counters = counters;
+        wd.since = std::time::Instant::now();
+        wd.next_log = WATCHDOG_FIRST;
+        return;
+    }
+    let stuck = wd.since.elapsed();
+    if stuck >= wd.next_log {
+        eprintln!(
+            "[sprotwd] link stuck {}s: cs={} ssa={} ssd={} rot_irq={} req_in_flight={} \
+             mosi={} miso={} rx_frames={} tx_frames={} sp_txdr={} rot_pc={:#010x} rot_ticks={}",
+            stuck.as_secs(),
+            l.cs,
+            l.ssa,
+            l.ssd,
+            l.rot_irq,
+            l.request_in_flight,
+            l.mosi.len(),
+            l.miso.len(),
+            l.rx_frames,
+            l.tx_frames,
+            l.sp_txdr,
+            rot_pc,
+            rot_ticks,
+        );
+        wd.next_log = stuck + WATCHDOG_REPEAT;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,7 +731,7 @@ mod tests {
     // low (asserted) while one is attached, without disturbing other port-0 pins.
     #[test]
     fn jtag_detect_level_synthesized_on_pio0_20() {
-        let link = Rc::new(RefCell::new(SprotLink::default()));
+        let link = Arc::new(LinkCell::new());
         let mut g = LpcGpio::new(link.clone());
 
         // No probe: PIO0_20 reads high (p0 defaults all-high), SWD path unaffected.
