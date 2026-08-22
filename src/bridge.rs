@@ -525,10 +525,9 @@ impl Bridge {
         }
         if let Some(bs) =
             self.socks.iter().find(|s| s.vid == vid && s.sp_port == src_port)
+            && bs.sock.send_to(payload, peer).is_err()
         {
-            if bs.sock.send_to(payload, peer).is_err() {
-                self.n_send_err += 1;
-            }
+            self.n_send_err += 1;
         }
         // Round-trip latency through the emulator: request-injected -> reply-sent.
         if let Some(t) = self.last_req_at.take() {

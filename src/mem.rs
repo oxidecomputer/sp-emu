@@ -490,16 +490,16 @@ impl Bus {
                 frame.push(self.read8(buf.wrapping_add(i)));
             }
             // The MAC inserts the 802.1Q tag from the context descriptor.
-            if let Some(vid) = self.eth.pending_vid.take() {
-                if frame.len() >= 12 {
-                    let tag = [
-                        (VLAN_TPID >> 8) as u8,
-                        VLAN_TPID as u8,
-                        (vid >> 8) as u8,
-                        vid as u8,
-                    ];
-                    frame.splice(12..12, tag);
-                }
+            if let Some(vid) = self.eth.pending_vid.take()
+                && frame.len() >= 12
+            {
+                let tag = [
+                    (VLAN_TPID >> 8) as u8,
+                    VLAN_TPID as u8,
+                    (vid >> 8) as u8,
+                    vid as u8,
+                ];
+                frame.splice(12..12, tag);
             }
             self.eth.tx_frames.push(frame);
             sent = true;
@@ -758,11 +758,11 @@ impl Bus {
             let mut raised = [0u16; 8];
             let mut n = 0;
             for d in self.devs.iter_mut() {
-                if let Some(irq) = d.dev.take_irq() {
-                    if n < raised.len() {
-                        raised[n] = irq;
-                        n += 1;
-                    }
+                if let Some(irq) = d.dev.take_irq()
+                    && n < raised.len()
+                {
+                    raised[n] = irq;
+                    n += 1;
                 }
             }
             for &irq in &raised[..n] {
@@ -777,11 +777,11 @@ impl Bus {
         // The FLASH controller raises IRQ 4 on erase completion (EOP); the update
         // server's bank_erase() blocks on this notification. Like the eth DMA, the
         // event is not gated by the dev-touched device poll.
-        if let Some(f) = self.flash.as_mut() {
-            if f.take_erase_irq() {
-                self.nvic_pend[(crate::flash::FLASH_IRQ / 32) as usize] |=
-                    1 << (crate::flash::FLASH_IRQ % 32);
-            }
+        if let Some(f) = self.flash.as_mut()
+            && f.take_erase_irq()
+        {
+            self.nvic_pend[(crate::flash::FLASH_IRQ / 32) as usize] |=
+                1 << (crate::flash::FLASH_IRQ % 32);
         }
         // UART7 (host-sp-comms) RX: like the eth DMA, host input is asynchronous
         // (not gated by the dev-touched poll). Keep IRQ 82 pending while a host
@@ -849,17 +849,17 @@ impl Bus {
 
     /// Bulk-load bytes into a backing RAM/flash region (used by the image loader).
     pub fn load(&mut self, addr: u32, bytes: &[u8]) -> Result<()> {
-        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_mut() {
-                f.load_image_at(addr, bytes);
-                return Ok(());
-            }
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr)
+            && let Some(f) = self.flash.as_mut()
+        {
+            f.load_image_at(addr, bytes);
+            return Ok(());
         }
-        if let Some(f) = self.rot_flash.as_mut() {
-            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
-                f.load_image_at(addr, bytes);
-                return Ok(());
-            }
+        if let Some(f) = self.rot_flash.as_mut()
+            && (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr)
+        {
+            f.load_image_at(addr, bytes);
+            return Ok(());
         }
         if let Some((r, off)) = self.ram_for(addr, bytes.len() as u32) {
             r.data[off..off + bytes.len()].copy_from_slice(bytes);
@@ -878,16 +878,16 @@ impl Bus {
         // Flash aperture (XIP): the hottest path (instruction fetch and constant
         // loads), so it is checked first. A range test + one XOR (bank remap) +
         // slice read, no device dispatch.
-        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_ref() {
-                return f.read_mem32(addr);
-            }
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr)
+            && let Some(f) = self.flash.as_ref()
+        {
+            return f.read_mem32(addr);
         }
-        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_ref() {
-                self.mmio_hit = true;
-                return f.reg_read((addr & !3) - FLASH_REG_LO);
-            }
+        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr)
+            && let Some(f) = self.flash.as_ref()
+        {
+            self.mmio_hit = true;
+            return f.reg_read((addr & !3) - FLASH_REG_LO);
         }
         // LPC55 RoT flash window (XIP) + controller registers. `Some` only on the
         // RoT core, so the Option check short-circuits on the SP core.
@@ -902,16 +902,16 @@ impl Bus {
         }
         // Boot-ROM pointer graph (RoT core, config::rot_rom): synthesize the words
         // the guest loads to reach `skboot_authenticate`. See `crate::romapi`.
-        if self.rom_enabled {
-            if let Some(v) = crate::romapi::rom_read32(addr & !3) {
-                return v;
-            }
+        if self.rom_enabled
+            && let Some(v) = crate::romapi::rom_read32(addr & !3)
+        {
+            return v;
         }
-        if (NVIC_LO..NVIC_HI).contains(&addr) {
-            if let Some(v) = self.nvic_read(addr & !3) {
-                self.mmio_hit = true;
-                return v;
-            }
+        if (NVIC_LO..NVIC_HI).contains(&addr)
+            && let Some(v) = self.nvic_read(addr & !3)
+        {
+            self.mmio_hit = true;
+            return v;
         }
         if addr & !3 == SCB_ICSR {
             self.mmio_hit = true;
@@ -948,15 +948,15 @@ impl Bus {
     pub fn read16(&mut self, addr: u32) -> u16 {
         let addr = self.fold(addr);
         // Flash aperture fast path (instruction fetch reads halfwords).
-        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_ref() {
-                return f.read_mem16(addr);
-            }
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr)
+            && let Some(f) = self.flash.as_ref()
+        {
+            return f.read_mem16(addr);
         }
-        if let Some(f) = self.rot_flash.as_ref() {
-            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
-                return f.read_mem16(addr);
-            }
+        if let Some(f) = self.rot_flash.as_ref()
+            && (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr)
+        {
+            return f.read_mem16(addr);
         }
         if let Some((r, off)) = self.ram_for(addr, 2) {
             u16::from_le_bytes(r.data[off..off + 2].try_into().unwrap())
@@ -969,15 +969,15 @@ impl Bus {
 
     pub fn read8(&mut self, addr: u32) -> u8 {
         let addr = self.fold(addr);
-        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_ref() {
-                return f.read_mem8(addr);
-            }
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr)
+            && let Some(f) = self.flash.as_ref()
+        {
+            return f.read_mem8(addr);
         }
-        if let Some(f) = self.rot_flash.as_ref() {
-            if (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr) {
-                return f.read_mem8(addr);
-            }
+        if let Some(f) = self.rot_flash.as_ref()
+            && (ROT_FLASH_WIN_LO..ROT_FLASH_WIN_HI).contains(&addr)
+        {
+            return f.read_mem8(addr);
         }
         if let Some((r, off)) = self.ram_for(addr, 1) {
             r.data[off]
@@ -988,27 +988,27 @@ impl Bus {
 
     pub fn write32(&mut self, addr: u32, val: u32) {
         let addr = self.fold(addr);
-        if let Some(w) = self.watch {
-            if addr == w {
-                eprintln!(
-                    "[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})",
-                    addr, val, self.cur_pc, self.cur_cyc
-                );
-            }
+        if let Some(w) = self.watch
+            && addr == w
+        {
+            eprintln!(
+                "[watch] write32 {:#010x} = {:#010x} (pc={:#010x} cyc={})",
+                addr, val, self.cur_pc, self.cur_cyc
+            );
         }
         // Flash aperture (program cycle) and FLASH controller registers.
-        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_mut() {
-                f.write_mem(addr, val, 4);
-                return;
-            }
+        if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr)
+            && let Some(f) = self.flash.as_mut()
+        {
+            f.write_mem(addr, val, 4);
+            return;
         }
-        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr) {
-            if let Some(f) = self.flash.as_mut() {
-                self.mmio_hit = true;
-                f.reg_write((addr & !3) - FLASH_REG_LO, val);
-                return;
-            }
+        if (FLASH_REG_LO..FLASH_REG_HI).contains(&addr)
+            && let Some(f) = self.flash.as_mut()
+        {
+            self.mmio_hit = true;
+            f.reg_write((addr & !3) - FLASH_REG_LO, val);
+            return;
         }
         // LPC55 RoT flash: a store into the window is ignored (flash is written
         // only via the command engine); the register block drives that engine.

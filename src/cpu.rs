@@ -933,7 +933,7 @@ impl Cpu {
             Opcode::UDIV => {
                 let a = self.read_reg(reg(&ops[1])?);
                 let b = self.read_reg(reg(&ops[2])?);
-                self.write_reg(reg(&ops[0])?, if b == 0 { 0 } else { a / b });
+                self.write_reg(reg(&ops[0])?, a.checked_div(b).unwrap_or(0));
                 Ok(())
             }
             Opcode::SDIV => {

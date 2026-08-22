@@ -671,22 +671,22 @@ impl RotFlash {
     /// Persist the erased bitset. It is load-bearing state (blank-check and
     /// erased-read ECC), so a failure is reported, once.
     fn persist_bitset(&mut self) {
-        if let Err(e) = std::fs::write(bitset_path(&self.path), &self.erased) {
-            if !self.bitset_write_failed {
-                self.bitset_write_failed = true;
-                eprintln!(
-                    "[rotflash] erased-bitset write to {} failed: {e}",
-                    bitset_path(&self.path)
-                );
-            }
+        if let Err(e) = std::fs::write(bitset_path(&self.path), &self.erased)
+            && !self.bitset_write_failed
+        {
+            self.bitset_write_failed = true;
+            eprintln!(
+                "[rotflash] erased-bitset write to {} failed: {e}",
+                bitset_path(&self.path)
+            );
         }
     }
 
     pub fn flush(&mut self) {
-        if let Some(f) = self.file.as_mut() {
-            if let Err(e) = f.sync_all() {
-                eprintln!("[rotflash] sync {} failed: {e}", self.path);
-            }
+        if let Some(f) = self.file.as_mut()
+            && let Err(e) = f.sync_all()
+        {
+            eprintln!("[rotflash] sync {} failed: {e}", self.path);
         }
     }
 }
@@ -833,8 +833,7 @@ mod tests {
         assert_eq!(f.boot_pref_slot(), 'a', "fresh device boots slot A");
 
         // Make pong the higher version with boot-pref B; it should win.
-        let mut c = lpc55_areas::CFPAPage::default();
-        c.version = 9;
+        let mut c = lpc55_areas::CFPAPage { version: 9, ..Default::default() };
         c.customer_defined0[0] = 1; // boot preference = Slot B
         f.mem[CFPA_PONG..CFPA_PONG + PAGE]
             .copy_from_slice(&c.to_vec().unwrap());

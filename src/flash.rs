@@ -739,10 +739,10 @@ impl Flash {
     /// Sync the backing file to disk. Program/erase already write through, so this
     /// only forces the OS to flush its buffers; called at reset and on exit.
     pub fn flush(&mut self) {
-        if let Some(f) = self.file.as_mut() {
-            if let Err(e) = f.sync_all() {
-                eprintln!("[flash] sync {} failed: {e}", self.path);
-            }
+        if let Some(f) = self.file.as_mut()
+            && let Err(e) = f.sync_all()
+        {
+            eprintln!("[flash] sync {} failed: {e}", self.path);
         }
     }
 }

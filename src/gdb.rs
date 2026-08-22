@@ -223,20 +223,20 @@ fn rot_thread_main(
         if rc.wfi_idle {
             break;
         }
-        if let (Some(f), Some(t)) = (pb_from, pb_to) {
-            if (f..=t).contains(&pc_before) {
-                eprintln!(
-                    "[rotpb] {:#010x}: {:<24} r0={:08x} r1={:08x} r2={:08x} r4={:08x} r5={:08x} r6={:08x}",
-                    pc_before,
-                    rc.last_disasm,
-                    rc.r[0],
-                    rc.r[1],
-                    rc.r[2],
-                    rc.r[4],
-                    rc.r[5],
-                    rc.r[6]
-                );
-            }
+        if let (Some(f), Some(t)) = (pb_from, pb_to)
+            && (f..=t).contains(&pc_before)
+        {
+            eprintln!(
+                "[rotpb] {:#010x}: {:<24} r0={:08x} r1={:08x} r2={:08x} r4={:08x} r5={:08x} r6={:08x}",
+                pc_before,
+                rc.last_disasm,
+                rc.r[0],
+                rc.r[1],
+                rc.r[2],
+                rc.r[4],
+                rc.r[5],
+                rc.r[6]
+            );
         }
         // Spin detector: a `b .` self-branch (pc unchanged after a step) with
         // no boot-ROM call in flight is Hubris's panic/fault loop. A healthy
@@ -413,19 +413,19 @@ fn rot_thread_main(
                 }
                 break;
             }
-            if let (Some(f), Some(t)) = (rot_trace_from, rot_trace_to) {
-                if (f..=t).contains(&rpc) {
-                    eprintln!(
-                        "[rottrace] {:#010x}: {:<26} r0={:08x} r1={:08x} r2={:08x} r3={:08x} r6={:08x}",
-                        rpc,
-                        rc.last_disasm,
-                        rc.r[0],
-                        rc.r[1],
-                        rc.r[2],
-                        rc.r[3],
-                        rc.r[6]
-                    );
-                }
+            if let (Some(f), Some(t)) = (rot_trace_from, rot_trace_to)
+                && (f..=t).contains(&rpc)
+            {
+                eprintln!(
+                    "[rottrace] {:#010x}: {:<26} r0={:08x} r1={:08x} r2={:08x} r3={:08x} r6={:08x}",
+                    rpc,
+                    rc.last_disasm,
+                    rc.r[0],
+                    rc.r[1],
+                    rc.r[2],
+                    rc.r[3],
+                    rc.r[6]
+                );
             }
             if crate::sprot::rot_trace_tick() {
                 eprintln!("[rottr] {:#010x}", rc.pc);
@@ -441,30 +441,30 @@ fn rot_thread_main(
         shared.tick_events.store(rc.tick_events, Ordering::Relaxed);
         shared.rot_pc.store(rc.pc, Ordering::Relaxed);
         // RoT PC sampling (SP_EMU_ROTPC=N): log the RoT pc every N instructions.
-        if let Some(n) = rotpc_every {
-            if rc.cycles >= rotpc_next {
-                rotpc_next = rc.cycles + n;
-                eprintln!(
-                    "[rotpc] pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
-                    rc.pc, rc.r[14], rc.r[13], rc.cycles
-                );
-            }
+        if let Some(n) = rotpc_every
+            && rc.cycles >= rotpc_next
+        {
+            rotpc_next = rc.cycles + n;
+            eprintln!(
+                "[rotpc] pc={:#010x} lr={:#010x} sp={:#010x} cyc={}",
+                rc.pc, rc.r[14], rc.r[13], rc.cycles
+            );
         }
-        if let Some((addr, len)) = rotdump {
-            if rotdump_last.elapsed().as_secs() >= 8 {
-                rotdump_last = std::time::Instant::now();
-                let mut a = addr;
-                while a < addr + len {
-                    eprintln!(
-                        "[rotdump] {:08x}: {:08x} {:08x} {:08x} {:08x}",
-                        a,
-                        rb.read32(a),
-                        rb.read32(a + 4),
-                        rb.read32(a + 8),
-                        rb.read32(a + 12)
-                    );
-                    a += 16;
-                }
+        if let Some((addr, len)) = rotdump
+            && rotdump_last.elapsed().as_secs() >= 8
+        {
+            rotdump_last = std::time::Instant::now();
+            let mut a = addr;
+            while a < addr + len {
+                eprintln!(
+                    "[rotdump] {:08x}: {:08x} {:08x} {:08x} {:08x}",
+                    a,
+                    rb.read32(a),
+                    rb.read32(a + 4),
+                    rb.read32(a + 8),
+                    rb.read32(a + 12)
+                );
+                a += 16;
             }
         }
         // Park when idle with nothing owed. Checked and waited under one guard
@@ -509,25 +509,26 @@ pub fn serve(
         if cpu.step(&mut bus, host).is_err() {
             break;
         }
-        if let (Some(lo), Some(hi)) = (twin_from, twin_to) {
-            if cpu.cycles >= lo && cpu.cycles <= hi {
-                eprintln!(
-                    "c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
-                    cpu.cycles,
-                    pc,
-                    cpu.last_disasm,
-                    cpu.r[0],
-                    cpu.r[1],
-                    cpu.r[2],
-                    cpu.r[3],
-                    cpu.r[4],
-                    cpu.r[5],
-                    cpu.r[6],
-                    cpu.r[7],
-                    cpu.r[13],
-                    cpu.r[14]
-                );
-            }
+        if let (Some(lo), Some(hi)) = (twin_from, twin_to)
+            && cpu.cycles >= lo
+            && cpu.cycles <= hi
+        {
+            eprintln!(
+                "c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
+                cpu.cycles,
+                pc,
+                cpu.last_disasm,
+                cpu.r[0],
+                cpu.r[1],
+                cpu.r[2],
+                cpu.r[3],
+                cpu.r[4],
+                cpu.r[5],
+                cpu.r[6],
+                cpu.r[7],
+                cpu.r[13],
+                cpu.r[14]
+            );
         }
         cpu.maybe_tick(&mut bus);
         cpu.maybe_interrupt(&mut bus);
@@ -584,7 +585,7 @@ pub fn serve(
     // probe is 4444 + off; the RoT probe (below) is 4544 + off. Pair with the
     // matching selector.
     let swd_off: u16 = match crate::config::get().bridge() {
-        Some(b) => crate::bridge::a4x2_offset(&b).unwrap_or_else(|| {
+        Some(b) => crate::bridge::a4x2_offset(b).unwrap_or_else(|| {
             // The "1" well-known-port shorthand and ad-hoc addresses are not
             // in the a4x2 layout; only a host:port outside it merits a note.
             if b.contains(':') {
@@ -810,38 +811,35 @@ pub fn serve(
                 // advanced), silently corrupting whatever it should have
                 // written. Log each distinct pc once so misdecodes surface
                 // instead of appearing as firmware bugs downstream.
-                if let crate::cpu::Trap::Unimplemented { pc, disasm, .. } = &t {
-                    if sp_unimpl.insert(*pc) {
-                        eprintln!(
-                            "[sptrap] UNIMPL pc={:#010x}: {}",
-                            pc, disasm
-                        );
-                    }
+                if let crate::cpu::Trap::Unimplemented { pc, disasm, .. } = &t
+                    && sp_unimpl.insert(*pc)
+                {
+                    eprintln!("[sptrap] UNIMPL pc={:#010x}: {}", pc, disasm);
                 }
                 break;
             }
             // Debug: SP_EMU_PCWIN=lo-hi[,lo-hi...] traces executed
             // instructions whose pc falls in a window.
-            if let Some(wins) = &pcwin {
-                if wins.iter().any(|(lo, hi)| (*lo..=*hi).contains(&trace_pc)) {
-                    eprintln!(
-                        "[pcwin] {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} r8={:08x} r12={:08x} sp={:08x} lr={:08x}",
-                        trace_pc,
-                        cpu.last_disasm,
-                        cpu.r[0],
-                        cpu.r[1],
-                        cpu.r[2],
-                        cpu.r[3],
-                        cpu.r[4],
-                        cpu.r[5],
-                        cpu.r[6],
-                        cpu.r[7],
-                        cpu.r[8],
-                        cpu.r[12],
-                        cpu.r[13],
-                        cpu.r[14]
-                    );
-                }
+            if let Some(wins) = &pcwin
+                && wins.iter().any(|(lo, hi)| (*lo..=*hi).contains(&trace_pc))
+            {
+                eprintln!(
+                    "[pcwin] {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} r8={:08x} r12={:08x} sp={:08x} lr={:08x}",
+                    trace_pc,
+                    cpu.last_disasm,
+                    cpu.r[0],
+                    cpu.r[1],
+                    cpu.r[2],
+                    cpu.r[3],
+                    cpu.r[4],
+                    cpu.r[5],
+                    cpu.r[6],
+                    cpu.r[7],
+                    cpu.r[8],
+                    cpu.r[12],
+                    cpu.r[13],
+                    cpu.r[14]
+                );
             }
             // Firmware wrote AIRCR.SYSRESETREQ during that step: stop the burst so
             // the self-reset is applied below, outside the loop.
@@ -909,11 +907,9 @@ pub fn serve(
         if has_rot {
             // Hand a self-reset edge to the RoT thread (it pends its own PINT),
             // then freeze the SP at its reset vector while an armed RoT halts it.
-            if sp_reset_edge {
-                if let Some(l) = crate::sprot::link() {
-                    l.borrow_mut().sp_reset_pint = true;
-                    l.wake_rot();
-                }
+            if sp_reset_edge && let Some(l) = crate::sprot::link() {
+                l.borrow_mut().sp_reset_pint = true;
+                l.wake_rot();
             }
             let rot_armed = shared.armed_sp_reset.load(Ordering::Relaxed);
             if enter_sp_reset_service(sp_reset_edge, rot_armed, cpu.halted) {
@@ -1163,29 +1159,27 @@ pub fn serve(
                 bus.pend_irq(9);
             }
         }
-        if let Some(ddir) = dump_dir {
-            if dump_last.elapsed().as_millis() >= 500 {
-                dump_last = std::time::Instant::now();
-                let trig = format!("{}/.trigger", ddir);
-                if std::path::Path::new(&trig).exists() {
-                    match bus.write_hydrate_dump(ddir, dump_archive_id) {
-                        Ok(_) => eprintln!(
-                            "[dump] wrote hydrate RAM dump to {}",
-                            ddir
-                        ),
-                        Err(e) => eprintln!("[dump] FAILED: {}", e),
+        if let Some(ddir) = dump_dir
+            && dump_last.elapsed().as_millis() >= 500
+        {
+            dump_last = std::time::Instant::now();
+            let trig = format!("{}/.trigger", ddir);
+            if std::path::Path::new(&trig).exists() {
+                match bus.write_hydrate_dump(ddir, dump_archive_id) {
+                    Ok(_) => {
+                        eprintln!("[dump] wrote hydrate RAM dump to {}", ddir)
                     }
-                    if let Err(e) = std::fs::remove_file(&trig) {
-                        // Can't consume the trigger: it would re-fire every poll.
-                        // Warn once and disarm the poller for the rest of the run.
-                        eprintln!(
-                            "[dump] cannot remove trigger {trig}: {e}; disarming"
-                        );
-                        dump_dir = None;
-                    }
-                    let _ =
-                        std::fs::write(format!("{}/.done", ddir), b"done\n");
+                    Err(e) => eprintln!("[dump] FAILED: {}", e),
                 }
+                if let Err(e) = std::fs::remove_file(&trig) {
+                    // Can't consume the trigger: it would re-fire every poll.
+                    // Warn once and disarm the poller for the rest of the run.
+                    eprintln!(
+                        "[dump] cannot remove trigger {trig}: {e}; disarming"
+                    );
+                    dump_dir = None;
+                }
+                let _ = std::fs::write(format!("{}/.done", ddir), b"done\n");
             }
         }
         if pumpstats {
@@ -1205,7 +1199,7 @@ pub fn serve(
             let total: u64 = pchist.values().sum();
             let mut v: Vec<(u64, u32)> =
                 pchist.iter().map(|(&pc, &c)| (c, pc)).collect();
-            v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            v.sort_unstable_by_key(|&(c, _)| std::cmp::Reverse(c));
             eprintln!(
                 "[pcprof] total_samples={} (every 256th instr) top:",
                 total

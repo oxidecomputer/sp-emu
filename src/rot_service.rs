@@ -171,37 +171,37 @@ fn rot_exchange(
         // first nonzero byte (the protocol version, 0x06). Find that start, then
         // header = version(u32) + body_size(u16); reply spans
         // start .. start+6+body_size+CRC(2).
-        if phase2 && total.is_none() {
-            if let Some(start) = first_nonzero(&resp) {
-                if resp.len() >= start + 6 {
-                    let body_size =
-                        u16::from_le_bytes([resp[start + 4], resp[start + 5]])
-                            as usize;
-                    let t = start + 6 + body_size + 2;
-                    if body_size + 8 <= MAX_RESP {
-                        total = Some(t);
-                    }
-                }
+        if phase2
+            && total.is_none()
+            && let Some(start) = first_nonzero(&resp)
+            && resp.len() >= start + 6
+        {
+            let body_size =
+                u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
+            let t = start + 6 + body_size + 2;
+            if body_size + 8 <= MAX_RESP {
+                total = Some(t);
             }
         }
-        if let Some(t) = total {
-            if resp.len() >= t && !done {
-                // Strip the leading dummy frames so the returned reply starts at the
-                // protocol version, as the SP's sprot driver expects.
-                let start = first_nonzero(&resp).unwrap_or(0);
-                resp.drain(..start);
-                resp.truncate(t - start);
-                // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
-                // SSD (FLEXCOMM8 STAT bit5), completes, and deasserts rot-irq,
-                // returning it to idle, ready for the next request. Without the
-                // deassert the RoT spins on the SSD poll forever and never services
-                // the following request.
-                let mut lk = link.borrow_mut();
-                lk.cs = false;
-                lk.ssa = false;
-                lk.ssd = true;
-                done = true;
-            }
+        if let Some(t) = total
+            && resp.len() >= t
+            && !done
+        {
+            // Strip the leading dummy frames so the returned reply starts at the
+            // protocol version, as the SP's sprot driver expects.
+            let start = first_nonzero(&resp).unwrap_or(0);
+            resp.drain(..start);
+            resp.truncate(t - start);
+            // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
+            // SSD (FLEXCOMM8 STAT bit5), completes, and deasserts rot-irq,
+            // returning it to idle, ready for the next request. Without the
+            // deassert the RoT spins on the SSD poll forever and never services
+            // the following request.
+            let mut lk = link.borrow_mut();
+            lk.cs = false;
+            lk.ssa = false;
+            lk.ssd = true;
+            done = true;
         }
         // After signalling end-of-transfer, let the RoT observe SSD and finish
         // (deassert rot-irq), then stop. The pend_irq above keeps stepping it while

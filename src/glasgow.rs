@@ -132,13 +132,13 @@ pub fn serve(
             if payload.is_empty() {
                 continue;
             }
-            if let Some(dec) = cobs_decode(payload) {
-                if let Some((&tgt, data)) = dec.split_first() {
-                    match tgt {
-                        TGT_ROOT => root_in.extend_from_slice(data),
-                        TGT_SWD => swd_in.extend_from_slice(data),
-                        _ => {}
-                    }
+            if let Some(dec) = cobs_decode(payload)
+                && let Some((&tgt, data)) = dec.split_first()
+            {
+                match tgt {
+                    TGT_ROOT => root_in.extend_from_slice(data),
+                    TGT_SWD => swd_in.extend_from_slice(data),
+                    _ => {}
                 }
             }
         }

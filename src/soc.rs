@@ -276,10 +276,10 @@ impl Mmio for Uart7 {
             // RDR: pop one received byte (clears RXNE for the next ISR read).
             0x24 => {
                 let b = self.rx.borrow_mut().pop_front();
-                if self.dbg {
-                    if let Some(b) = b {
-                        eprintln!("[uart7] RX {:#04x}", b);
-                    }
+                if self.dbg
+                    && let Some(b) = b
+                {
+                    eprintln!("[uart7] RX {:#04x}", b);
                 }
                 b.map(|b| b as u32).unwrap_or(0)
             }
@@ -1607,11 +1607,9 @@ impl Mmio for Hash {
                     self.dcis = false;
                 }
             } // CR.INIT
-            0x08 => {
-                if val & (1 << 8) != 0 {
-                    self.dcis = true;
-                    self.irq_pending = true;
-                }
+            0x08 if val & (1 << 8) != 0 => {
+                self.dcis = true;
+                self.irq_pending = true;
             } // STR.DCAL
             _ => {}
         }
@@ -1710,7 +1708,7 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     // collisions that intermittently drop management-net traffic.
     let idx: u8 = crate::config::get()
         .bridge()
-        .and_then(|b| crate::bridge::a4x2_offset(&b))
+        .and_then(crate::bridge::a4x2_offset)
         .map(|off| (off / 10) as u8)
         .unwrap_or(0);
     // MAC0: 128-MAC block. sidecar base ...45:30; gimlet k gets ...45:(20+k).
@@ -2090,30 +2088,29 @@ impl Qspi {
     fn with_backing(path: Option<String>) -> Self {
         let mut mem = vec![ERASED; QSPI_SIZE];
         let mut file = None;
-        if let Some(p) = path.as_deref() {
-            if std::path::Path::new(p).exists() {
-                match std::fs::OpenOptions::new().read(true).write(true).open(p)
-                {
-                    Ok(mut f) => {
-                        use std::io::Read;
-                        let mut buf = Vec::new();
-                        match f.read_to_end(&mut buf) {
-                            Ok(_) => {
-                                let n = buf.len().min(QSPI_SIZE);
-                                mem[..n].copy_from_slice(&buf[..n]);
-                                eprintln!(
-                                    "[qspi] loaded persisted QSPI flash from {p}"
-                                );
-                                file = Some(f);
-                            }
-                            Err(e) => eprintln!(
-                                "[qspi] read {p} failed: {e}; starting erased"
-                            ),
+        if let Some(p) = path.as_deref()
+            && std::path::Path::new(p).exists()
+        {
+            match std::fs::OpenOptions::new().read(true).write(true).open(p) {
+                Ok(mut f) => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    match f.read_to_end(&mut buf) {
+                        Ok(_) => {
+                            let n = buf.len().min(QSPI_SIZE);
+                            mem[..n].copy_from_slice(&buf[..n]);
+                            eprintln!(
+                                "[qspi] loaded persisted QSPI flash from {p}"
+                            );
+                            file = Some(f);
                         }
+                        Err(e) => eprintln!(
+                            "[qspi] read {p} failed: {e}; starting erased"
+                        ),
                     }
-                    Err(e) => eprintln!(
-                        "[qspi] open {p} failed: {e}; running RAM-only"
-                    ),
+                }
+                Err(e) => {
+                    eprintln!("[qspi] open {p} failed: {e}; running RAM-only")
                 }
             }
         }

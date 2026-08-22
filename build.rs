@@ -20,15 +20,11 @@ fn main() {
     let head = dot_git.join("HEAD");
     if head.exists() {
         println!("cargo:rerun-if-changed={}", head.display());
-        if let Ok(c) = std::fs::read_to_string(&head) {
-            if let Some(r) =
+        if let Ok(c) = std::fs::read_to_string(&head)
+            && let Some(r) =
                 c.strip_prefix("ref: ").and_then(|s| s.lines().next())
-            {
-                println!(
-                    "cargo:rerun-if-changed={}",
-                    dot_git.join(r).display()
-                );
-            }
+        {
+            println!("cargo:rerun-if-changed={}", dot_git.join(r).display());
         }
     }
     let packed = dot_git.join("packed-refs");

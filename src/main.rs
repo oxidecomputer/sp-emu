@@ -611,16 +611,12 @@ fn cmd_run(args: &[String]) -> Result<()> {
     // Fall back to the config file / environment for anything not on the command line,
     // so a run can be described entirely by sp-emu.toml (SP_EMU_SLOT / SP_EMU_RUN_MAX).
     let cfg = config::get();
-    if !slot_given {
-        if let Some(s) = cfg.boot_slot() {
-            slot = slot_arg(s)?;
-            slot_given = true;
-        }
+    if !slot_given && let Some(s) = cfg.boot_slot() {
+        slot = slot_arg(s)?;
+        slot_given = true;
     }
-    if !max_given {
-        if let Some(m) = cfg.run_max() {
-            max = m;
-        }
+    if !max_given && let Some(m) = cfg.run_max() {
+        max = m;
     }
     if max == 0 {
         // Serve forever. SP preboot 0: the serve loop advances the SP as MGS
@@ -665,11 +661,9 @@ fn cmd_gdb(args: &[String]) -> Result<()> {
         }
     }
     // Fall back to SP_EMU_SLOT (config file / environment) when no a|b positional given.
-    if !slot_given {
-        if let Some(s) = config::get().boot_slot() {
-            slot = slot_arg(s)?;
-            slot_given = true;
-        }
+    if !slot_given && let Some(s) = config::get().boot_slot() {
+        slot = slot_arg(s)?;
+        slot_given = true;
     }
     serve_forever(slot, slot_given, preboot)
 }
@@ -1102,7 +1096,7 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
     use std::io::Write;
     let mut diff = match config::get().diff() {
         Some(p) => Some(std::io::BufWriter::new(
-            std::fs::File::create(&p)
+            std::fs::File::create(p)
                 .map_err(|e| anyhow!("creating SP_EMU_DIFF trace {p}: {e}"))?,
         )),
         None => None,
@@ -1122,25 +1116,26 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
                 if trace {
                     eprintln!("{:08x}: {}", pc, cpu.last_disasm);
                 }
-                if let (Some(lo), Some(hi)) = (twin_from, twin_to) {
-                    if cpu.cycles >= lo && cpu.cycles <= hi {
-                        eprintln!(
-                            "c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
-                            cpu.cycles,
-                            pc,
-                            cpu.last_disasm,
-                            cpu.r[0],
-                            cpu.r[1],
-                            cpu.r[2],
-                            cpu.r[3],
-                            cpu.r[4],
-                            cpu.r[5],
-                            cpu.r[6],
-                            cpu.r[7],
-                            cpu.r[13],
-                            cpu.r[14]
-                        );
-                    }
+                if let (Some(lo), Some(hi)) = (twin_from, twin_to)
+                    && cpu.cycles >= lo
+                    && cpu.cycles <= hi
+                {
+                    eprintln!(
+                        "c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
+                        cpu.cycles,
+                        pc,
+                        cpu.last_disasm,
+                        cpu.r[0],
+                        cpu.r[1],
+                        cpu.r[2],
+                        cpu.r[3],
+                        cpu.r[4],
+                        cpu.r[5],
+                        cpu.r[6],
+                        cpu.r[7],
+                        cpu.r[13],
+                        cpu.r[14]
+                    );
                 }
                 if let Some(f) = diff.as_mut() {
                     let exc = cpu.mode != mode0 || cpu.ipsr != ipsr0;

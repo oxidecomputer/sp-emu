@@ -111,10 +111,10 @@ impl I2cBridge {
     /// broken pipe so writes stop.
     fn send(&self, line: &str) {
         let mut g = self.0.borrow_mut();
-        if let Some(s) = g.w.as_mut() {
-            if writeln!(s, "{line}").is_err() {
-                g.w = None;
-            }
+        if let Some(s) = g.w.as_mut()
+            && writeln!(s, "{line}").is_err()
+        {
+            g.w = None;
         }
     }
 
