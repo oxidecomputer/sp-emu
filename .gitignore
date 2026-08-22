@@ -1,2 +1,9 @@
 # Rust build output.
 /target
+
+# Instance state written to the cwd when SP_EMU_* overrides point here.
+/*.bin
+/*.bin.nv
+/sp-emu-identity
+/sp-emu-instance.zip
+/dump.json

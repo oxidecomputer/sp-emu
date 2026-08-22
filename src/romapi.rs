@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Minimal LPC55S69 boot-ROM API emulation.
 //!
 //! On silicon the RoT pre-kernel (`lpc55-rot-startup::authenticate_image`) and

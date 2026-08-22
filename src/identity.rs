@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Per-instance device identity for an sp-emu instance.
 //!
 //! Every identity-bearing value the emulated SP and RoT expose used to be a fixed

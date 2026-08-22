@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Fold any known config version forward to the current external schema.
 //!
 //! Today there are two source versions: the legacy flat `SP_EMU_*` file (v0) and

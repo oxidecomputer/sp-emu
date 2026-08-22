@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The internal, validated configuration: the checked domain object the emulator
 //! reads. Its fields are private to the crate and it carries no public
 //! constructor, so the only way to obtain one is [`crate::ingest`], which vets

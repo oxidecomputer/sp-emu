@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! In-process sprot bridge: connects the emulated SP (STM32H7) to the emulated
 //! RoT (LPC55) over their SPI link, so the SP's real `drv-stm32h7-sprot-server`
 //! talks to the RoT's real `drv-lpc55-sprot-server`.

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! LPC55 (Cortex-M33 / ARMv8-M) SoC for the emulated Root-of-Trust, running the
 //! `oxide-rot-1` Hubris firmware. Memory map mirrors chips/lpc55/memory.toml.
 //! Peripherals are modeled iteratively, driven by the firmware's accesses, the

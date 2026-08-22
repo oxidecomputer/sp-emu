@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Shared RoT service: one emulated LPC55 (oxide-rot-1) that answers sprot
 //! request frames over a socket, so SP processes share one RoT instead of each
 //! running its own in-process two-core bridge. The wire is frame-level: a client

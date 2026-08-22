@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Portable instance bundle: pack an sp-emu instance (flash images, their `.nv`
 //! companion files, identity, config, and the stowed Hubris archives) into one
 //! `.zip` so it can be shared or archived and later re-run and inspected with

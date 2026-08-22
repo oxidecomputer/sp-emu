@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Central configuration: ingest every `SP_EMU_*` input (the environment, or a
 //! config file) exactly once, resolve it into a validated [`Config`], and store
 //! it. After `init`, no other module reads the environment; they call

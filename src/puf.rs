@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Model of the LPC55 PUF (Physically Unclonable Function) key store, enough for
 //! the RoT image's `dice-self` startup (`lib/lpc55-rot-startup/src/dice.rs`) to
 //! derive its DICE identity and write the cert handoff -- so `faux-ipcc get-certs`

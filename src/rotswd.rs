@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! RoT-side SWD: the emulated LPC55 RoT drives the SP's debug port (`SwDp`) over
 //! an internal SWD link that it clocks through its FLEXCOMM5 SPI block.
 //!

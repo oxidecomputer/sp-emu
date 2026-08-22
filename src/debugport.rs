@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Emulated ARM debug port: an ADIv5 SW-DP + MEM-AP with a working debug core.
 //!
 //! This is the register-level model probe-rs drives over SWD. The Glasgow-applet

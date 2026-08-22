@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The v0 bridge: the flat `SP_EMU_NAME = "value"` form mapped onto the typed v1
 //! schema. This is the single source of the flat-name to typed-field
 //! correspondence, used to migrate a legacy flat file forward and (in a later

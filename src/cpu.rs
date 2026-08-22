@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Cortex-M7 (ARMv7E-M) CPU core: state, fetch/decode/step, the Thumb-2
 //! execution set Hubris uses, IT blocks, the M-profile system registers, and
 //! the exception entry/return + SVC machinery to reach the first task.

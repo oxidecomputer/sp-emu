@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! LPC55S69 RoT flash: the flash array plus a real flash-controller command
 //! engine, so unmodified RoT Hubris can erase, program, and read its flash the
 //! way it does on silicon. Replaces the flat `add_ram` window and the read-only
