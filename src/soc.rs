@@ -1142,8 +1142,8 @@ impl Spi5 {
     /// Reset per-command state on the CS deasserted->asserted edge: a command
     /// (header write + data read) spans two SPE cycles under one CS lock.
     fn check_cs(&mut self) {
-        let gen = self.cs.get();
-        if gen != self.last_gen {
+        let cs_gen = self.cs.get();
+        if cs_gen != self.last_gen {
             // a new CS lock began -> new FPGA command
             self.idx = 0;
             self.dpos = 0;
@@ -1151,7 +1151,7 @@ impl Spi5 {
             self.op = 0;
             self.addr = 0;
             self.xfer_cnt = 0;
-            self.last_gen = gen;
+            self.last_gen = cs_gen;
         }
     }
     /// Tofino sequencing FSM, run after any write to TOFINO_SEQ_CTRL (0x100:
