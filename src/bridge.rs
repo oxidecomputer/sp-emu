@@ -62,6 +62,21 @@ pub(crate) const VID_SWITCH0: u16 = 0x301;
 pub(crate) const VID_SWITCH1: u16 = 0x302;
 pub(crate) const VID_SIDECAR0: u16 = 0x130;
 
+/// The (switch0, switch1) VLAN ids for this run: the per-board defaults above
+/// with the SP_EMU_VID0/VID1 overrides applied. Single source for both bind
+/// paths (`Bridge::new` and main.rs's well-known-port host).
+pub(crate) fn default_vids(sidecar: bool) -> (u16, u16) {
+    let (def0, def1) = if sidecar {
+        (VID_SIDECAR0, VID_SWITCH1)
+    } else {
+        (VID_SWITCH0, VID_SWITCH1)
+    };
+    (
+        crate::config::get().vid0().unwrap_or(def0),
+        crate::config::get().vid1().unwrap_or(def1),
+    )
+}
+
 /// A bidirectional byte channel to the host CPU over the host-facing UART. A
 /// unix socket (propolis) and a pty master (faux-ipcc and other serial tools)
 /// both satisfy it.
@@ -123,7 +138,12 @@ fn open_host_uart() -> Option<Box<dyn HostUartIo>> {
     let p = crate::config::get().host_uart()?;
     match UnixStream::connect(p) {
         Ok(s) => {
-            let _ = s.set_nonblocking(true);
+            // A blocking socket would hang host_uart_rx's poll; treat a failed
+            // set_nonblocking like a failed connect.
+            if let Err(e) = s.set_nonblocking(true) {
+                eprintln!("[bridge] host-uart set_nonblocking on {p} failed: {e}");
+                return None;
+            }
             eprintln!("[bridge] host-uart (UART7/IPCC) connected: {p}");
             Some(Box::new(s))
         }
@@ -161,10 +181,12 @@ pub struct Bridge {
     /// the sensor-poll flood.
     rx: VecDeque<(u16, Vec<u8>)>,
     /// RX-path drop diagnostics (SP_EMU_RXSTATS): frames received from the host
-    /// sockets, evicted by the flow-fair cap, and delivered to the SP.
+    /// sockets, evicted by the flow-fair cap, delivered to the SP, and SP->MGS
+    /// replies the host socket failed to send.
     n_recv: u64,
     n_evict: u64,
     n_pop: u64,
+    n_send_err: u64,
     /// SP round-trip diagnostics (SP_EMU_RTTSTATS): arrival time of the most
     /// recent client request injected toward the SP, and accumulated request->
     /// reply latency through the emulator (excludes faux-mgs/process/kernel time).
@@ -197,18 +219,11 @@ impl Bridge {
                 format!("SP_EMU_BRIDGE bind addr {:?} must be host:port", bind),
             )
         })?;
-        // Per-board trusted-VLAN defaults (the VID_* constants above): the
-        // bridge must inject MGS traffic on the VLAN the SP's net task listens
-        // on, or the SP drops it (no per-VLAN smoltcp iface for the wrong vid).
+        // Per-board trusted-VLAN defaults (`default_vids` above): the bridge
+        // must inject MGS traffic on the VLAN the SP's net task listens on, or
+        // the SP drops it (no per-VLAN smoltcp iface for the wrong vid).
         // SP_EMU_VID0/VID1 override either default.
-        let sidecar = crate::config::get().board().is_sidecar();
-        let (def0, def1) = if sidecar {
-            (VID_SIDECAR0, VID_SWITCH1)
-        } else {
-            (VID_SWITCH0, VID_SWITCH1)
-        };
-        let vid0 = crate::config::get().vid0().unwrap_or(def0);
-        let vid1 = crate::config::get().vid1().unwrap_or(def1);
+        let (vid0, vid1) = default_vids(crate::config::get().board().is_sidecar());
         let mut socks = Vec::new();
         for (off, vid) in [(0u16, vid0), (1u16, vid1)] {
             let mut a = base;
@@ -229,9 +244,8 @@ impl Bridge {
             // this MGS ereport polls hit an unbound port and retry-storm.
             let mut ea = base;
             ea.set_port(base.port().wrapping_add(off).wrapping_add(EREPORT_OFFSET));
-            match UdpSocket::bind(ea) {
+            match UdpSocket::bind(ea).and_then(|es| es.set_nonblocking(true).map(|()| es)) {
                 Ok(es) => {
-                    let _ = es.set_nonblocking(true);
                     eprintln!(
                         "[bridge] ereport listening on {} (switch{} view, vid {:#x})",
                         ea, off, vid
@@ -243,7 +257,7 @@ impl Bridge {
                     });
                 }
                 Err(e) => eprintln!(
-                    "[bridge] ereport bind {} failed: {} (ereport relay off)",
+                    "[bridge] ereport socket {} failed: {} (ereport relay off)",
                     ea, e
                 ),
             }
@@ -254,9 +268,8 @@ impl Bridge {
         // first owns it, and the offset relay still serves the rest.
         let mut ra = base;
         ra.set_port(EREPORT_PORT);
-        match UdpSocket::bind(ra) {
+        match UdpSocket::bind(ra).and_then(|rs| rs.set_nonblocking(true).map(|()| rs)) {
             Ok(rs) => {
-                let _ = rs.set_nonblocking(true);
                 eprintln!("[bridge] ereport also listening on {} (switch0 view)", ra);
                 socks.push(BoundSock {
                     sock: rs,
@@ -265,7 +278,7 @@ impl Bridge {
                 });
             }
             Err(e) => eprintln!(
-                "[bridge] ereport bind {} skipped: {} (another instance owns it)",
+                "[bridge] ereport socket {} skipped: {} (likely another instance owns it)",
                 ra, e
             ),
         }
@@ -294,9 +307,8 @@ impl Bridge {
                 // container has but a bare dev shell may not. Skip-and-warn so a
                 // privileged-port failure never takes down mgmt/ereport; the
                 // warning keeps the capability signal honest.
-                match UdpSocket::bind(a) {
+                match UdpSocket::bind(a).and_then(|s| s.set_nonblocking(true).map(|()| s)) {
                     Ok(sock) => {
-                        let _ = sock.set_nonblocking(true);
                         eprintln!(
                             "[bridge] listening on {} (vid {:#x}, SP port {})",
                             a, vid, port
@@ -336,6 +348,7 @@ impl Bridge {
             n_recv: 0,
             n_evict: 0,
             n_pop: 0,
+            n_send_err: 0,
             last_req_at: None,
             rtt_n: 0,
             rtt_sum_us: 0,
@@ -499,7 +512,9 @@ impl Bridge {
             .iter()
             .find(|s| s.vid == vid && s.sp_port == src_port)
         {
-            let _ = bs.sock.send_to(payload, peer);
+            if bs.sock.send_to(payload, peer).is_err() {
+                self.n_send_err += 1;
+            }
         }
         // Round-trip latency through the emulator: request-injected -> reply-sent.
         if let Some(t) = self.last_req_at.take() {
@@ -538,10 +553,11 @@ impl Bridge {
         self.n_recv += got.len() as u64;
         if crate::config::get().rxstats() && self.n_recv % 500 < got.len() as u64 {
             eprintln!(
-                "[rxstats] recv={} evict={} pop={} qdepth={}",
+                "[rxstats] recv={} evict={} pop={} send_err={} qdepth={}",
                 self.n_recv,
                 self.n_evict,
                 self.n_pop,
+                self.n_send_err,
                 self.rx.len()
             );
         }

@@ -61,7 +61,7 @@ pub fn serve(
     bus: &mut Bus,
     host: &mut dyn HostIo,
 ) -> Result<()> {
-    stream.set_nodelay(true).ok();
+    stream.set_nodelay(true)?;
     // A read of a large region has probe-rs writing all N transfer commands
     // while the server writes back N responses, so a blocking write_all can
     // deadlock (both peers write, neither reads). Writes therefore never block:
@@ -71,9 +71,7 @@ pub fn serve(
     // (a 150us poll-sleep otherwise dominates latency-bound commands like
     // `tasks -sl`), while the read timeout below keeps the idle-timeout check
     // live so a vanished client can't wedge the single-client accept loop.
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(20)))
-        .ok();
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(20)))?;
     let mut swdp = SwDp::new();
     let mut raw: Vec<u8> = Vec::new(); // 0-delimited COBS frames, undecoded
     let mut root_in: Vec<u8> = Vec::new(); // demuxed Root endpoint byte stream
@@ -87,6 +85,10 @@ pub fn serve(
     // any real operation, so a legitimate session never idles this long.
     let idle_timeout = std::time::Duration::from_secs(5);
     let mut last_activity = std::time::Instant::now();
+    // Current socket mode; set_nonblocking runs only on transitions, and a
+    // failure propagates (a wrong mode means a blocked read or a spin, not a
+    // degraded one).
+    let mut nonblocking: Option<bool> = None;
     loop {
         let mut worked = false;
         // Block on the read only when there is nothing else to do: the core is
@@ -94,7 +96,10 @@ pub fn serve(
         // so a peer that is still writing cannot be deadlocked). Otherwise poll,
         // interleaving core stepping with output flushing.
         let block = cpu.halted && !swdp.step_request && pending_out.is_empty();
-        stream.set_nonblocking(!block).ok();
+        if nonblocking != Some(!block) {
+            stream.set_nonblocking(!block)?;
+            nonblocking = Some(!block);
+        }
         match stream.read(&mut rbuf) {
             Ok(0) => return Ok(()), // client closed
             Ok(n) => {
@@ -225,7 +230,15 @@ fn process_root(inp: &mut Vec<u8>, out: &mut Vec<u8>) {
                 i += 3; // no reply
             }
             CMD_ASSERT_RESET | CMD_CLEAR_RESET => {
-                // The SP_RESET side-band is not modeled; ack by consuming.
+                // The SP_RESET side-band is not modeled; ack by consuming, and
+                // say so once so a debugger-driven reset is not silently a no-op.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static RESET_WARNED: AtomicBool = AtomicBool::new(false);
+                if !RESET_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[glasgow] SP_RESET assert/clear not modeled; acking without effect"
+                    );
+                }
                 i += 1;
             }
             _ => i += 1, // unknown: skip a byte to resync

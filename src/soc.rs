@@ -847,13 +847,20 @@ impl Spi2 {
                     n => {
                         let a = self.seq_addr.wrapping_add(n as u16 - 3);
                         if self.seq_cmd == 1 {
+                            // Read
                             self.seq_read(a)
-                        }
-                        // Read
-                        else {
-                            self.seq.insert(a, b);
+                        } else {
+                            // Write(0) / BitSet(2) / BitClear(3), as in the
+                            // Spi5 mainboard model; other ops store as written.
+                            let cur = *self.seq.get(&a).unwrap_or(&0);
+                            let nv = match self.seq_cmd {
+                                2 => cur | b,  // BitSet: read-modify-write OR
+                                3 => cur & !b, // BitClear: RMW AND-NOT
+                                _ => b,
+                            };
+                            self.seq.insert(a, nv);
                             0
-                        } // Write/BitSet/Clear (approx)
+                        }
                     }
                 }
             }
@@ -1430,9 +1437,9 @@ impl Mmio for GpioBank {
                         // one an SSA/SSD ack, or its cleanup would race this
                         // transfer's bytes (bounded; timeout proceeds).
                         if l.rot_live {
-                            let mut budget = 400;
+                            let mut budget = crate::sprot::STALL_BUDGET_ITERS;
                             while (l.ssa || l.ssd) && budget > 0 {
-                                l = lk.wait_sp(l, 5);
+                                l = lk.wait_sp(l, crate::sprot::WAIT_STEP_MS);
                                 budget -= 1;
                             }
                             // Unread request bytes belong to a dead transaction
@@ -1473,11 +1480,6 @@ impl Mmio for GpioBank {
     }
 }
 
-/// STM32H7 I2C controller: minimal FSM so the driver's transactions complete.
-/// ISR (+0x18) always reports TXE|TXIS|RXNE|TC (ready to send / data available /
-/// transfer complete) with BUSY and NACKF clear; the driver writes bytes to TXDR
-/// (+0x28, discarded) and reads RXDR (+0x24, returns 0): turn-off writes
-/// succeed; unmodeled sensor reads return 0. Other registers store/return.
 /// Scriptable physical environment for the modeled sensors. The sensor chips are
 /// emulated with their real register protocol; the physical quantity they'd
 /// measure (temperature, …) has no source in a virtual rack, so it's injected
@@ -1560,13 +1562,6 @@ pub(crate) fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Build the 1024-byte AT24CSW080 VPD image the sidecar firmware expects:
-/// a `FRU0` root whose body holds a `MAC0` chunk (task_packrat_api::MacAddressBlock
-/// = base_mac[6] + count(u16 LE) + stride(u8)) and a `BARC` chunk (an 0XV2 Oxide
-/// barcode string). This lets drv_packrat_vpd_loader::read_vpd_and_load_packrat
-/// succeed on the first attempt instead of mem-faulting on garbage. Non-sidecar
-/// boards get a blank (all-0xFF) EEPROM, preserving gimlet behavior: its sharkfin
-/// VPD reads fail cleanly as "Truncated", which the firmware tolerates.
 /// STM32H7 HASH (0x4802_1400, irq 80). Minimal model so drv-stm32h7-hash
 /// completes: report DINIS (ready for data) + not BUSY, and when the driver
 /// writes STR.DCAL (start digest) set SR.DCIS and raise irq 80 so its
@@ -1697,6 +1692,13 @@ fn vpd_ascii_field(what: &str, value: &str, max: usize) -> String {
     clean
 }
 
+/// Build the 1024-byte AT24CSW080 VPD image the sidecar firmware expects:
+/// a `FRU0` root whose body holds a `MAC0` chunk (task_packrat_api::MacAddressBlock
+/// = base_mac[6] + count(u16 LE) + stride(u8)) and a `BARC` chunk (an 0XV2 Oxide
+/// barcode string). This lets drv_packrat_vpd_loader::read_vpd_and_load_packrat
+/// succeed on the first attempt instead of mem-faulting on garbage. Non-sidecar
+/// boards get a blank (all-0xFF) EEPROM, preserving gimlet behavior: its sharkfin
+/// VPD reads fail cleanly as "Truncated", which the firmware tolerates.
 fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     let mut img = vec![0xFFu8; 1024];
     let sidecar = crate::config::get().board().is_sidecar();
@@ -1709,7 +1711,7 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
         .and_then(|b| crate::bridge::a4x2_offset(&b))
         .map(|off| (off / 10) as u8)
         .unwrap_or(0);
-    // MAC0: 128-MAC block. sidecar base ...45:30; gimlets ...45:21/22/23.
+    // MAC0: 128-MAC block. sidecar base ...45:30; gimlet k gets ...45:(20+k).
     let mac_last = if sidecar {
         0x30
     } else {
@@ -1770,6 +1772,11 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     Rc::new(img)
 }
 
+/// STM32H7 I2C controller: minimal FSM so the driver's transactions complete.
+/// ISR (+0x18) always reports TXE|TXIS|RXNE|TC (ready to send / data available /
+/// transfer complete) with BUSY and NACKF clear; the driver writes bytes to TXDR
+/// (+0x28, discarded) and reads RXDR (+0x24, returns 0): turn-off writes
+/// succeed; unmodeled sensor reads return 0. Other registers store/return.
 pub struct I2c {
     regs: std::collections::HashMap<u32, u32>,
     ev_irq: u16,
@@ -2615,10 +2622,12 @@ impl Mmio for Scs {
     fn write(&mut self, off: u32, val: u32) {
         let i = (off / 4) as usize & 0x3ff;
         self.regs[i] = val;
-        match off {
-            0xD08 => eprintln!("[scs] VTOR  = {:#010x}", val),
-            0xD88 => eprintln!("[scs] CPACR = {:#010x} (FPU enable)", val),
-            _ => {}
+        if crate::dbg::exc() {
+            match off {
+                0xD08 => eprintln!("[scs] VTOR  = {:#010x}", val),
+                0xD88 => eprintln!("[scs] CPACR = {:#010x} (FPU enable)", val),
+                _ => {}
+            }
         }
     }
 }

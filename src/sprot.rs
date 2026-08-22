@@ -33,6 +33,11 @@ const SPROT_FIFO_BYTES: usize = 16;
 /// EXTI line-3 bit (PE3 = ROT_IRQ), surfaced on the SP's EXTI CPUPR1 register.
 const ROT_IRQ_EXTI_BIT: u32 = 1 << 3;
 
+/// Step length of one bounded `wait_sp` poll while the SP paces on RoT progress.
+pub(crate) const WAIT_STEP_MS: u64 = 5;
+/// Iterations of `wait_sp(_, WAIT_STEP_MS)` in one stall budget: 2000ms total.
+pub(crate) const STALL_BUDGET_ITERS: u32 = (2000 / WAIT_STEP_MS) as u32;
+
 #[derive(Default)]
 pub struct SprotLink {
     pub mosi: VecDeque<u8>, // SP -> RoT (request bytes the master clocks out)
@@ -113,6 +118,9 @@ impl LinkCell {
             rot_cv: Condvar::new(),
         }
     }
+    // Poison policy (here and in the waits below): a panic on either core's
+    // thread is unrecoverable for the pair, so propagating the poison panic
+    // (unwrap) is deliberate fail-fast.
     /// Lock the link state.
     pub fn borrow(&self) -> MutexGuard<'_, SprotLink> {
         self.inner.lock().unwrap()
@@ -290,17 +298,17 @@ impl Mmio for SpiMaster {
                 if lk.rot_live {
                     // Phase 2: an empty `miso` mid-reply would clock a zero
                     // into the response and corrupt its CRC; wait for refill.
-                    let mut budget = 400;
+                    let mut budget = STALL_BUDGET_ITERS;
                     while lk.rot_irq && lk.cs && lk.miso.is_empty() && budget > 0 {
-                        lk = self.link.wait_sp(lk, 5);
+                        lk = self.link.wait_sp(lk, WAIT_STEP_MS);
                         budget -= 1;
                     }
                     // Phase 1: RoT RX FIFO full; wait for its drain. Gated on
                     // !rot_irq: during a reply the SP's dummy clock-outs land
                     // in `mosi` but the RoT is sending, not draining.
-                    budget = 400;
+                    budget = STALL_BUDGET_ITERS;
                     while !lk.rot_irq && lk.mosi.len() >= SPROT_FIFO_BYTES && budget > 0 {
-                        lk = self.link.wait_sp(lk, 5);
+                        lk = self.link.wait_sp(lk, WAIT_STEP_MS);
                         budget -= 1;
                     }
                 }

@@ -71,16 +71,6 @@ fn archive_entry(zip_bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Best-effort read of `img/flash.ron` (the slot layout) for reporting; returns
-/// None for a raw binary or if the entry is absent.
-pub fn archive_flash_ron(path: &str) -> Option<String> {
-    let raw = std::fs::read(path).ok()?;
-    if !raw.starts_with(b"PK") {
-        return None;
-    }
-    String::from_utf8(archive_entry(&raw, "img/flash.ron").ok()?).ok()
-}
-
 /// The image's `app.toml` from a Hubris build archive (root entry). Carries the
 /// firmware's `[config.net.sockets.*]` table, which the well-known-port bridge
 /// uses to bind exactly the SP UDP sockets this image declares.

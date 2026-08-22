@@ -52,13 +52,12 @@ pub struct SwdLink {
     pub resp: Option<u32>,
 }
 
-/// Mutex wrapper for the shared SWD link; `borrow`/`borrow_mut` both lock.
+/// Mutex wrapper for the shared SWD link.
 pub struct SwdCell(Mutex<SwdLink>);
 impl SwdCell {
-    pub fn borrow(&self) -> MutexGuard<'_, SwdLink> {
-        self.0.lock().unwrap()
-    }
-    pub fn borrow_mut(&self) -> MutexGuard<'_, SwdLink> {
+    // Poison policy: a panic on either core's thread is unrecoverable for the
+    // pair, so propagating the poison panic (unwrap) is deliberate fail-fast.
+    pub fn lock(&self) -> MutexGuard<'_, SwdLink> {
         self.0.lock().unwrap()
     }
 }
@@ -116,7 +115,7 @@ impl RotSwdSpi {
         if !matches!(self.phase, Phase::ReadData) || !self.rx.is_empty() {
             return;
         }
-        if let Some(data) = self.link.borrow_mut().resp.take() {
+        if let Some(data) = self.link.lock().resp.take() {
             self.rx.push_back((data as u8).reverse_bits() as u16);
             self.rx.push_back(((data >> 8) as u8).reverse_bits() as u16);
             self.rx.push_back(((data >> 16) as u8).reverse_bits() as u16);
@@ -152,7 +151,7 @@ impl RotSwdSpi {
                     // serve loop runs the actual transfer.
                     self.rx.push_back(ACK_OK);
                     if rnw {
-                        self.link.borrow_mut().req.push_back(SwdReq { ap, rnw: true, a, wdata: 0 });
+                        self.link.lock().req.push_back(SwdReq { ap, rnw: true, a, wdata: 0 });
                         // The SP thread drains SWD requests; it may be parked idle.
                         if let Some(l) = crate::sprot::link() {
                             l.wake_sp();
@@ -183,7 +182,7 @@ impl RotSwdSpi {
                     let rev = ((*acc >> 1) & 0xFFFF_FFFF) as u32;
                     let wdata = rev.reverse_bits();
                     let (ap, a) = (*ap, *a);
-                    self.link.borrow_mut().req.push_back(SwdReq {
+                    self.link.lock().req.push_back(SwdReq {
                         ap,
                         rnw: false,
                         a,

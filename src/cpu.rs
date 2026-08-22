@@ -123,6 +123,9 @@ pub struct Cpu {
     /// interpreter runs both: the SP's ITCM (0x0, where the RoT injects the
     /// endoscope) plus STM32H7 flash (0x0800_0000); the RoT's LPC55 flash (0x0).
     code_ranges: Vec<std::ops::Range<u32>>,
+    /// SYSm encodings already reported by `log_special_once`, `| 0x100` for
+    /// writes.
+    special_logged: std::collections::HashSet<u16>,
     /// Vector-table base used while VTOR reads 0. The STM32H7 boot alias maps
     /// flash at 0x0 but the bus models flash only at 0x0800_0000, so the SP
     /// core redirects; the LPC55's flash really is at 0x0, so the RoT core
@@ -155,6 +158,13 @@ const FLASH_HI: u32 = 0x0a00_0000;
 /// STM32H7 flash. `build_rot_core` overrides it (`set_code_ranges`) for the LPC55
 /// RoT, whose flash is at 0x0.
 const SP_CODE_RANGE: std::ops::Range<u32> = 0x0800_0000..0x0820_0000;
+
+/// IRQs traced under SP_EMU_ETHDBG: Ethernet (61, mem.rs ETH_IRQ) and the I2C
+/// event IRQs (soc.rs controllers), whose sensor traffic paces net.
+const ETHDBG_IRQS: [u16; 6] = [61, 31, 33, 72, 92, 95];
+
+/// Bytes of a task-panic message the `[task-panic]` dump reads from guest RAM.
+const PANIC_MSG_CAP: u32 = 120;
 
 /// Upper bound of the SP's ITCM (0x0000_0000..0x0001_0000). Injected code (the
 /// RoT's endoscope measurement program) runs here. It is cacheable only while the
@@ -244,6 +254,7 @@ impl Cpu {
             syst_rvr: 1,
             code_ranges: vec![0..ITCM_HI, SP_CODE_RANGE],
             vtor_fallback: FLASH_LO,
+            special_logged: Default::default(),
             wfi_idle: false,
         }
     }
@@ -730,6 +741,8 @@ impl Cpu {
                 };
                 self.write_reg(rd, val);
                 if s {
+                    // Divergence: MOVS/MVNS with a modified immediate do not
+                    // update C from ThumbExpandImm's carry-out here.
                     self.set_nz(val);
                 }
                 Ok(())
@@ -1670,7 +1683,7 @@ impl Cpu {
 
     // ---- M-profile special registers (MRS/MSR by SYSm) ---------------------
 
-    fn read_special(&self, sysm: u8) -> u32 {
+    fn read_special(&mut self, sysm: u8) -> u32 {
         match sysm {
             0..=3 => self.build_xpsr(), // (I)(E)APSR / xPSR
             5 => self.ipsr,             // IPSR
@@ -1680,7 +1693,10 @@ impl Cpu {
             17 | 18 => self.basepri,
             19 => self.faultmask as u32,
             20 => self.control,
-            _ => 0,
+            _ => {
+                self.log_special_once(sysm, false);
+                0
+            }
         }
     }
 
@@ -1703,7 +1719,21 @@ impl Cpu {
             17 | 18 => self.basepri = v & 0xff,
             19 => self.faultmask = v & 1 != 0,
             20 => self.set_control(v),
-            _ => {}
+            _ => self.log_special_once(sysm, true),
+        }
+    }
+
+    /// Unmodeled SYSm encodings read as 0 and ignore writes. Surface each
+    /// once, like the [sptrap] convention, so an unmodeled special register
+    /// never presents as a silent skip.
+    fn log_special_once(&mut self, sysm: u8, write: bool) {
+        let key = sysm as u16 | if write { 0x100 } else { 0 };
+        if self.special_logged.insert(key) {
+            eprintln!(
+                "[sptrap] {} unmodeled SYSm {sysm} pc={:#010x}",
+                if write { "MSR to" } else { "MRS from" },
+                self.pc
+            );
         }
     }
 
@@ -1820,7 +1850,7 @@ impl Cpu {
             // BASEPRI masks interrupts whose priority is numerically >= basepri
             // (0 = disabled). Priorities live in the high bits of the byte.
             if self.basepri == 0 || (bus.irq_prio(irq) as u32) < self.basepri {
-                if (irq == 61 || matches!(irq, 31 | 33 | 72 | 92 | 95)) && crate::dbg::eth() {
+                if ETHDBG_IRQS.contains(&irq) && crate::dbg::eth() {
                     eprintln!("[irq] delivering IRQ {} at cyc {}", irq, self.cycles);
                 }
                 bus.clear_pending(irq);
@@ -1838,7 +1868,7 @@ impl Cpu {
     fn exception_entry(&mut self, vecnum: u32, bus: &mut Bus) {
         // Catch task panics (SVC with Sysnum::Panic=8 in r11; msg ptr/len in r4/r5).
         if vecnum == 11 && self.r[11] == 8 && crate::dbg::panic() {
-            let (ptr, len) = (self.r[4], self.r[5].min(120));
+            let (ptr, len) = (self.r[4], self.r[5].min(PANIC_MSG_CAP));
             let mut msg = String::new();
             for i in 0..len {
                 msg.push(bus.read8(ptr.wrapping_add(i)) as char);
@@ -1855,7 +1885,7 @@ impl Cpu {
                     break;
                 }
                 let ret = bus.read32(fp.wrapping_add(4));
-                if (0x0800_0000..0x0806_0000).contains(&ret) {
+                if self.is_code(ret & !1) {
                     eprint!(" {:#x}", ret & !1);
                 }
                 let next = bus.read32(fp);
@@ -1866,13 +1896,11 @@ impl Cpu {
             }
             eprintln!();
         }
-        // Dump syscalls made from net's code range (flash 0x08008000-0x08017fff)
-        // to expose the bogus buffer pointer it hands the kernel. r11=sysnum;
-        // for Recv the args are r4=buf r5=len r6=notif r7=sender; for Send/Reply
-        // they're in r4-r7 too. Gated by SP_EMU_SVCDBG.
-        if vecnum == 11 && crate::dbg::svc() && (0x0800_8000..0x0801_8000).contains(&self.pc) {
+        // Dump each syscall's registers (r11 = sysnum; args in r4-r7).
+        // Gated by SP_EMU_SVCDBG.
+        if vecnum == 11 && crate::dbg::svc() {
             eprintln!(
-                "[net-svc] cyc={} sysnum={} r0={:#x} r1={:#x} r2={:#x} r3={:#x} \
+                "[svc] cyc={} sysnum={} r0={:#x} r1={:#x} r2={:#x} r3={:#x} \
                 r4={:#x} r5={:#x} r6={:#x} r7={:#x} psp={:#x} pc={:#x}",
                 self.cycles,
                 self.r[11],
@@ -1887,18 +1915,6 @@ impl Cpu {
                 self.r[SP],
                 self.pc
             );
-            // BorrowRead (sysnum 4): r7 = dest ptr. Flag a slice base outside net's
-            // RAM (0x24030000-0x2403ffff) / DMA (0x30000000-0x30047fff) as corrupt.
-            let dest = self.r[7];
-            if self.r[11] == 4
-                && !(0x2403_0000..0x2404_0000).contains(&dest)
-                && !(0x3000_0000..0x3004_8000).contains(&dest)
-            {
-                eprintln!(
-                    "[net-BADdest] dest={:#x} dest_len={:#x} lr={:#x}",
-                    dest, self.r[8], self.r[LR]
-                );
-            }
         }
         let return_addr = self.pc; // already advanced past the SVC
                                    // If FP context is active (CONTROL.FPCA), the hardware stacks an extended
@@ -2052,11 +2068,9 @@ impl Cpu {
         }
         self.sp_is_psp = self.mode == Mode::Thread && (self.control & 2) != 0;
         self.r[SP] = if self.sp_is_psp { self.psp } else { self.msp };
-        let in_memmove = (0x0806_6c00..0x0806_6d00).contains(&self.pc);
-        if to_thread && (extended || in_memmove) && crate::dbg::exc() {
+        if to_thread && extended && crate::dbg::exc() {
             eprintln!(
-                "[exc-ret]{} exc={:#x} -> pc={:#010x} extended={} base={:#010x} it={:#04x} cyc={}",
-                if in_memmove { " *MEMMOVE*" } else { "" },
+                "[exc-ret] exc={:#x} -> pc={:#010x} extended={} base={:#010x} it={:#04x} cyc={}",
                 exc,
                 self.pc,
                 extended,
@@ -2067,7 +2081,12 @@ impl Cpu {
         }
         if self.mode == Mode::Thread && (self.control & 1) != 0 && !self.entered_task {
             self.entered_task = true;
-            eprintln!("\n*** ENTERED FIRST TASK: thread mode, unprivileged, PSP={:#010x}, PC={:#010x} ***\n", self.psp, self.pc);
+            if crate::dbg::exc() {
+                eprintln!(
+                    "[exc-ret] first task entered: psp={:#010x} pc={:#010x}",
+                    self.psp, self.pc
+                );
+            }
         }
     }
 

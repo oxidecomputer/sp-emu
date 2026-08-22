@@ -111,6 +111,9 @@ pub struct Bus {
 const SCB_ICSR: u32 = 0xE000_ED04;
 pub const SCB_VTOR: u32 = 0xE000_ED08;
 const SCB_AIRCR: u32 = 0xE000_ED0C;
+/// AIRCR write key (VECTKEY = 0x05FA in bits 31:16); writes without it are
+/// ignored by the reset logic.
+const AIRCR_VECTKEY: u32 = 0x05FA_0000;
 // SysTick registers in the SCS (ARMv7-M B3.3): control/status, reload, current value.
 pub const SYST_CSR: u32 = 0xE000_E010;
 pub const SYST_RVR: u32 = 0xE000_E014;
@@ -151,6 +154,7 @@ const DMAISR: u32 = 0x1008; // interrupt summary; dc0is (bit0) = channel-0 inter
 const DMACTXDLAR: u32 = 0x1114; // TX descriptor list base (word-aligned address)
 const DMACRXDLAR: u32 = 0x111C; // RX descriptor list base
 const DMACTXDTPR: u32 = 0x1120; // TX tail pointer; writing it kicks the TX DMA
+#[allow(dead_code)] // register-map completeness; the model keys RX off polls
 const DMACRXDTPR: u32 = 0x1128; // RX tail pointer
 const DMACTXRLR: u32 = 0x112C; // TX ring length minus 1
 const DMACRXRLR: u32 = 0x1130; // RX ring length minus 1
@@ -513,14 +517,22 @@ impl Bus {
     pub fn write_hydrate_dump(&self, dir: &str, archive_id: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         for r in &self.rams {
-            if r.base == 0x0800_0000 {
-                continue;
-            } // flash comes from the archive
+            if r.base == FLASH_WIN_LO {
+                continue; // flash comes from the archive
+            }
             std::fs::write(format!("{}/0x{:x}.bin", dir, r.base), &r.data)?;
         }
+        // board_name is display-only in humility hydrate; report the emulated
+        // board. archive_id is caller data, so escape it for the JSON string.
+        let board = if crate::config::get().board().is_sidecar() {
+            "sidecar-c"
+        } else {
+            "gimlet"
+        };
+        let id = archive_id.replace('\\', "\\\\").replace('"', "\\\"");
         let json = format!(
-            "{{\"format\":1,\"task_index\":0,\"crash_time\":0,\"board_name\":\"sidecar-c\",\"git_commit\":\"emu\",\"archive_id\":\"{}\",\"fw_version\":null}}",
-            archive_id);
+            "{{\"format\":1,\"task_index\":0,\"crash_time\":0,\"board_name\":\"{board}\",\"git_commit\":\"emu\",\"archive_id\":\"{id}\",\"fw_version\":null}}"
+        );
         std::fs::write(format!("{}/dump.json", dir), json)
     }
 
@@ -1004,7 +1016,7 @@ impl Bus {
         // for the run loop to apply (a device write can't reach the Cpu); fall through
         // so the SCS still stores the register for read-back.
         if addr & !3 == SCB_AIRCR
-            && (val & 0xFFFF_0000) == 0x05FA_0000
+            && (val & 0xFFFF_0000) == AIRCR_VECTKEY
             && val & (1 << 2) != 0
         {
             self.reset_pending = true;

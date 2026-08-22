@@ -160,7 +160,9 @@ fn rewritten_config(rot_nvm: &str) -> String {
             out.push('\n');
         }
     }
-    let mut set = |k: &str, v: &str| out.push_str(&format!("{k} = \"{v}\"\n"));
+    let mut set = |k: &str, v: &str| {
+        out.push_str(&format!("{k} = \"{}\"\n", crate::config::escape_toml(v)))
+    };
     set("SP_EMU_FLASH", "sp-flash.bin");
     if Path::new(rot_nvm).is_file() {
         set("SP_EMU_ROT_NVM", "sp-rot-flash.bin");

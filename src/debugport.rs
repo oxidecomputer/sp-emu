@@ -84,7 +84,11 @@ const SP_MEASUREMENT_SKIP: u32 = 0x9f38_bd71;
 pub enum Ack {
     /// Read data (`Some`) or a write acknowledgement (`None`).
     Ok(Option<u32>),
+    /// Protocol acks the applet response encoding defines; the modeled DP
+    /// answers immediately and faults nothing, so nothing constructs them.
+    #[allow(dead_code)]
     Wait,
+    #[allow(dead_code)]
     Fault,
 }
 

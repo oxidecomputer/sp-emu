@@ -17,9 +17,6 @@
 //! The flash file defaults to ./sp-flash.bin (override with $SP_EMU_FLASH).
 //! Legacy form `sp-emu <image.bin> [max]` still boots a flat image directly.
 
-// Intentional API surface kept for debugging / future use (UART, Halt, names).
-#![allow(dead_code)]
-
 mod bridge;
 mod bundle;
 mod config;
@@ -56,7 +53,7 @@ use mem::Bus;
 /// on its own host address (`$SP_EMU_ADDR0` / `$SP_EMU_ADDR1`, default `::1`),
 /// so tools reach the emulated SP exactly as they would real hardware. The
 /// default `$SP_EMU_BRIDGE` port-offset mode is unchanged.
-fn make_host() -> Box<dyn HostIo> {
+fn make_host() -> Result<Box<dyn HostIo>> {
     if config::get().well_known_ports() {
         return make_well_known_host();
     }
@@ -67,15 +64,13 @@ fn make_host() -> Box<dyn HostIo> {
             } else {
                 v.to_string()
             };
-            match bridge::Bridge::new(&bind) {
-                Ok(b) => Box::new(b),
-                Err(e) => {
-                    eprintln!("[bridge] bind {bind} failed: {e}; falling back to stdout");
-                    Box::new(StdoutHost)
-                }
-            }
+            // An explicitly configured bridge that cannot bind is fatal: a
+            // stdout fallback would look healthy but be unreachable by MGS.
+            let b = bridge::Bridge::new(&bind)
+                .with_context(|| format!("bind SP_EMU_BRIDGE address {bind}"))?;
+            Ok(Box::new(b))
         }
-        None => Box::new(StdoutHost),
+        None => Ok(Box::new(StdoutHost)),
     }
 }
 
@@ -160,7 +155,7 @@ fn warn_if_no_sp_archive() {
 }
 
 /// Build the well-known-port host bridge from `$SP_EMU_ADDR0/1` + vids.
-fn make_well_known_host() -> Box<dyn HostIo> {
+fn make_well_known_host() -> Result<Box<dyn HostIo>> {
     use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
     let cfg = config::get();
@@ -172,14 +167,10 @@ fn make_well_known_host() -> Box<dyn HostIo> {
     // switch0 view: $SP_EMU_ADDR0 (default ::1). switch1 view: $SP_EMU_ADDR1 if
     // set (a distinct address, since both views bind the same real ports).
     let addr0 = parse_ip(cfg.addr0()).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
-    let (def0, def1) = if sidecar {
-        (bridge::VID_SIDECAR0, bridge::VID_SWITCH1)
-    } else {
-        (bridge::VID_SWITCH0, bridge::VID_SWITCH1)
-    };
-    let mut views = vec![(SocketAddr::new(addr0, 0), cfg.vid0().unwrap_or(def0))];
+    let (vid0, vid1) = bridge::default_vids(sidecar);
+    let mut views = vec![(SocketAddr::new(addr0, 0), vid0)];
     if let Some(addr1) = parse_ip(cfg.addr1()) {
-        views.push((SocketAddr::new(addr1, 0), cfg.vid1().unwrap_or(def1)));
+        views.push((SocketAddr::new(addr1, 0), vid1));
     }
 
     // Prefer the socket set the flashed image actually declares (its app.toml):
@@ -200,13 +191,11 @@ fn make_well_known_host() -> Box<dyn HostIo> {
             p
         })
         .unwrap_or_else(|| default_socket_ports(sidecar));
-    match bridge::Bridge::new_well_known(&views, &ports) {
-        Ok(b) => Box::new(b),
-        Err(e) => {
-            eprintln!("[bridge] well-known-port bind failed: {e}; falling back to stdout");
-            Box::new(StdoutHost)
-        }
-    }
+    // Well-known-port mode is explicit configuration; a bind failure is fatal
+    // (a stdout fallback would look healthy but be unreachable by MGS).
+    let b = bridge::Bridge::new_well_known(&views, &ports)
+        .context("bind well-known SP ports (SP_EMU_WELL_KNOWN_PORTS)")?;
+    Ok(Box::new(b))
 }
 
 fn nvm_path() -> String {
@@ -311,6 +300,8 @@ fn describe_version(v: sp_emu_config::SchemaVersion) -> String {
 }
 
 fn main() -> Result<()> {
+    // Default listen address shared by the i2c-sniff / i2c-device subcommands.
+    const I2C_BRIDGE_DEFAULT_ADDR: &str = "[::1]:9100";
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // `--version` short-circuits before any config or identity work, so it prints
     // one clean line and exits. Format matches sp-test's for easy parsing.
@@ -336,7 +327,8 @@ fn main() -> Result<()> {
     // Ensure the instance state directory exists before anything writes into it
     // (identity::init persists the seed there), and announce it for the commands that
     // use instance state.
-    let _ = std::fs::create_dir_all(config::state_dir());
+    std::fs::create_dir_all(config::state_dir())
+        .with_context(|| format!("create state dir {}", config::state_dir()))?;
     // The subcommand: from the command line, or (when none is given) from the config
     // file / environment via SP_EMU_MODE, so `sp-emu --load-config sp-emu.toml` runs a
     // fully-described instance with no positional arguments. A command line always wins.
@@ -371,11 +363,17 @@ fn main() -> Result<()> {
         Some("pack") => cmd_pack(sub_args),
         Some("unpack") => cmd_unpack(sub_args),
         Some("i2c-sniff") => {
-            let addr = sub_args.first().map(|s| s.as_str()).unwrap_or("[::1]:9100");
+            let addr = sub_args
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or(I2C_BRIDGE_DEFAULT_ADDR);
             i2c_bridge::serve(addr)
         }
         Some("i2c-device") => {
-            let addr = sub_args.first().map(|s| s.as_str()).unwrap_or("[::1]:9100");
+            let addr = sub_args
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or(I2C_BRIDGE_DEFAULT_ADDR);
             i2c_bridge::serve_device(addr, sub_args.get(1..).unwrap_or(&[]))
         }
         // Legacy: `sp-emu <image.bin> [max]` boots a flat image without a slot.
@@ -706,7 +704,7 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
         eprintln!("[rot] SP_EMU_ROT_SERVICE={a}");
         rot_service::RotClient::connect(a)
     });
-    let mut host = make_host();
+    let mut host = make_host()?;
     gdb::serve(cpu, bus, rot_image, rot_client, host.as_mut(), preboot)
 }
 
@@ -962,7 +960,7 @@ fn cmd_rot(args: &[String]) -> Result<()> {
     let (mut cpu, mut bus) = build_rot_core(&image)?;
     let trace = config::get().trace();
     cpu.record_disasm = trace;
-    let mut host = make_host();
+    let mut host = make_host()?;
     let mut stopped = false;
     let mut idle_hits: u64 = 0;
     let mut first_idle = false;
@@ -1077,7 +1075,7 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
     let trace = config::get().trace();
     let (twin_from, twin_to) = (config::get().trace_from(), config::get().trace_to());
     let (mut cpu, mut bus) = setup(image, swap_override)?;
-    let mut host = make_host();
+    let mut host = make_host()?;
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
     use std::io::Write;

@@ -53,6 +53,7 @@ pub const IMAGE_B_BASE: u32 = 0x0005_0000;
 
 // Protected flash region page byte-addresses (from the lpc55-pac peripheral
 // bases: FLASH_CFPA0 = 0x9_E000, FLASH_CMPA = 0x9_E400, key store 0x9_E600).
+#[allow(dead_code)] // PFR layout completeness; scratch promotion is future work
 const CFPA_SCRATCH: usize = 0x9_DE00;
 const CFPA_PING: usize = 0x9_E000;
 const CFPA_PONG: usize = 0x9_E200;
@@ -142,6 +143,9 @@ fn to_page(bytes: Vec<u8>) -> [u8; PAGE] {
 /// the Bart RKTH. Not device-unique, so faithful across the fleet.
 fn seed_cmpa() -> [u8; PAGE] {
     let mut cmpa = lpc55_areas::CMPAPage {
+        // BOOT_CFG and SECURE_BOOT_CFG words captured verbatim from the same
+        // device as the RKTH: default boot source/speed, secure boot enabled
+        // (SEC_BOOT_EN, UM11126 table 17).
         boot_cfg: 0x7800_0080,
         cc_socu_pin: DCFG_CC_SOCU,
         cc_socu_dflt: DCFG_CC_SOCU,
@@ -678,10 +682,6 @@ impl RotFlash {
 /// Default backing-file path for the RoT flash, `$SP_EMU_ROT_NVM` or a default.
 pub fn nvm_path() -> String {
     crate::config::instance_file("SP_EMU_ROT_NVM", crate::config::get().rot_nvm_path())
-}
-
-pub fn load_image(path: &str) -> Result<Vec<u8>> {
-    crate::flash::load_image(path)
 }
 
 #[cfg(test)]

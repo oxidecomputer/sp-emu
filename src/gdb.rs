@@ -112,6 +112,7 @@ fn continue_sp_reset_service(
 const JTAG_DETECT_IRQ: u16 = 5;
 const JTAG_DETECT_PINT_REG: u32 = 0x4000_4020;
 const JTAG_DETECT_PINT_BIT: u32 = 1 << 1; // PINT slot 1
+const SP_RESET_PINT_BIT: u32 = 1 << 0; // PINT slot 0 (SP_RESET, same register)
 /// Deliver a JTAG_DETECT falling edge to the RoT, if its firmware has armed the IRQ.
 /// Sets the PINT slot-1 detect bit (OR, so a coincident SP_RESET slot-0 bit survives)
 /// and pends IRQ 5. Returns whether it injected: `false` when the firmware has not
@@ -279,7 +280,8 @@ fn rot_thread_main(
     let mut swd_triggered = false;
     let rotpc_every = crate::config::get().rotpc();
     let mut rotpc_next = 0u64;
-    let mut last_rottrap = u32::MAX;
+    // Distinct pcs already reported by the RoT trap log (mirrors sp_unimpl).
+    let mut rot_trap_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     // SP_EMU_ROT_TRACE_FROM/TO="0xADDR": per-instruction pc window trace.
     let rot_trace_from = crate::config::get().rot_trace_from();
     let rot_trace_to = crate::config::get().rot_trace_to();
@@ -327,7 +329,7 @@ fn rot_thread_main(
         // Fired on a real SP self-reset, or once via SP_EMU_SWD_TRIGGER.
         let synthetic = swd_trigger && !swd_triggered && rb.irq_enabled(4);
         if sp_reset_pint || synthetic {
-            rb.write32(0x4000_4020, 0x1); // PINT.FALL slot 0
+            rb.write32(JTAG_DETECT_PINT_REG, SP_RESET_PINT_BIT); // PINT.FALL slot 0
             rb.pend_irq(4);
             swd_triggered = true;
         }
@@ -365,10 +367,9 @@ fn rot_thread_main(
             if let Err(t) = rc.step(&mut rb, &mut host) {
                 // A RoT task hitting an unimplemented/undecodable instruction
                 // would re-fault every quantum, silently wedged (the kernel
-                // never sees a fault exception here). Surface it once.
-                let tpc = t.pc();
-                if crate::sprot::dbg() && tpc != last_rottrap {
-                    last_rottrap = tpc;
+                // never sees a fault exception here). Surface each distinct pc
+                // once, unconditionally (same convention as [sptrap]).
+                if rot_trap_seen.insert(t.pc()) {
                     match &t {
                         crate::cpu::Trap::Unimplemented {
                             pc,
@@ -625,7 +626,9 @@ pub fn serve(
     // appears, write a humility-hydrate-compatible RAM dump to <dir> and swap the
     // trigger for `.done`. Reads a wedged SP's task table with no probe:
     //   touch <dir>/.trigger; zip <dir>; humility -a <ar> hydrate; humility -d tasks
-    let dump_dir = crate::config::get().dump_dir();
+    // Disarmed (set to None) if the trigger file can't be removed, so a stale
+    // trigger doesn't re-fire the dump every poll for the rest of the run.
+    let mut dump_dir = crate::config::get().dump_dir();
     let dump_archive_id = crate::config::get().dump_archive_id();
     let mut dump_last = std::time::Instant::now();
     // Previous rot-irq level, for edge-detecting ROT_IRQ to raise the SP's EXTI.
@@ -939,12 +942,12 @@ pub fn serve(
             // result (the RoT stalls on FIFOSTAT until a read result lands).
             if let Some(swd) = crate::rotswd::link() {
                 loop {
-                    let req = swd.borrow_mut().req.pop_front();
+                    let req = swd.lock().req.pop_front();
                     let Some(r) = req else { break };
                     if let crate::debugport::Ack::Ok(Some(d)) =
                         sp_swdp.transfer(&mut cpu, &mut bus, r.ap, r.rnw, r.a, r.wdata)
                     {
-                        swd.borrow_mut().resp = Some(d);
+                        swd.lock().resp = Some(d);
                     }
                 }
             }
@@ -1096,7 +1099,12 @@ pub fn serve(
                         Ok(_) => eprintln!("[dump] wrote hydrate RAM dump to {}", ddir),
                         Err(e) => eprintln!("[dump] FAILED: {}", e),
                     }
-                    let _ = std::fs::remove_file(&trig);
+                    if let Err(e) = std::fs::remove_file(&trig) {
+                        // Can't consume the trigger: it would re-fire every poll.
+                        // Warn once and disarm the poller for the rest of the run.
+                        eprintln!("[dump] cannot remove trigger {trig}: {e}; disarming");
+                        dump_dir = None;
+                    }
                     let _ = std::fs::write(format!("{}/.done", ddir), b"done\n");
                 }
             }

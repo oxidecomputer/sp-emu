@@ -76,7 +76,7 @@ fn is_set_in(inputs: &[(&'static str, String)], name: &str) -> bool {
 }
 
 /// Escape a value for a TOML basic string (`"..."`).
-fn escape_toml(s: &str) -> String {
+pub(crate) fn escape_toml(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
@@ -320,8 +320,6 @@ pub fn is_set(name: &str) -> bool {
     is_set_in(&resolved().inputs, name)
 }
 
-/// Resolve an instance file path: the explicit knob value when it was set (or already
-/// absolute), otherwise `value` under the instance state directory (`state_dir`).
 /// Debug: SP-core pc-window instruction trace ranges, from
 /// `SP_EMU_PCWIN=lo-hi[,lo-hi...]` (hex, 0x prefix optional). An emulator
 /// bring-up tracing aid, not instance configuration, so it bypasses the
@@ -341,6 +339,8 @@ pub fn pcwin() -> Option<Vec<(u32, u32)>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Resolve an instance file path: the explicit knob value when it was set (or already
+/// absolute), otherwise `value` under the instance state directory (`state_dir`).
 pub fn instance_file(env_name: &str, value: &str) -> String {
     if is_set(env_name) || std::path::Path::new(value).is_absolute() {
         value.to_string()
