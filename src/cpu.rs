@@ -84,7 +84,7 @@ pub struct Cpu {
     pub tick_events: u64,   // monotonic SysTick underflow events (one per ~1ms); RoT real-time proxy
     pub sp_tick_credit: u32, // RoT-derived ticks the SP still owes itself while blocked on sprot (coupling)
     // Clock freeze: while set, this core's SysTick does not advance from its own
-    // running -- only a credit-armed tick (sp_tick_credit drained in WFI) fires. Used to
+    // running; only a credit-armed tick (sp_tick_credit drained in WFI) fires. Used to
     // pace the RoT's endoscope halt-poll by the SP's progress: without it the RoT's
     // active polling advances its own clock and races past the poll deadline.
     pub tick_frozen: bool,
@@ -97,7 +97,7 @@ pub struct Cpu {
     // `rom_call` carries an in-flight call's resumable state across steps/interrupts.
     pub rom_traps: bool,
     pub rom_call: crate::romapi::RomCall,
-    pub trace_svc: bool,    // log Hubris syscalls (Sysnum in r11) at each SVC — RoT IPC tracing
+    pub trace_svc: bool,    // log Hubris syscalls (Sysnum in r11) at each SVC (RoT IPC tracing)
     pub last_disasm: String,
     decoder: InstDecoder,
     /// PC-keyed decode cache. Hubris executes in place from immutable flash, so
@@ -107,7 +107,7 @@ pub struct Cpu {
     /// image is never self-modified, and the flash-update path writes the other slot.
     dcache: std::collections::HashMap<u32, Rc<Decoded>, PcBuildHasher>,
     /// PC window whose decodes are cacheable: the immutable XIP flash of *this*
-    /// core instance. sp-emu instantiates this one interpreter twice -- a separate
+    /// core instance. sp-emu instantiates this one interpreter twice: a separate
     /// `Cpu`+`Bus` for the STM32H7 SP and for the LPC55 RoT (independent registers,
     /// memory map, and decode cache); they only differ by where their image is
     /// mapped. So the cacheable window is per-instance: it defaults to the SP's
@@ -154,16 +154,15 @@ const SP_CODE_RANGE: std::ops::Range<u32> = 0x0800_0000..0x0820_0000;
 /// Upper bound of the SP's ITCM (0x0000_0000..0x0001_0000). Injected code (the
 /// RoT's endoscope measurement program) runs here. It is cacheable only while the
 /// core is under debug control, and its entries are invalidated on debug-port
-/// writes -- see `flash_cache` / `invalidate_decode` and `step`.
+/// writes; see `flash_cache` / `invalidate_decode` and `step`.
 const ITCM_HI: u32 = 0x0001_0000;
 
 /// Fast hasher for the decode cache's `u32` flash-PC keys. `HashMap`'s default
 /// SipHash is DoS-resistant but far slower than needed, and the decode-cache
 /// lookup is the interpreter's dominant per-instruction cost. PCs are dense and
 /// 2-byte aligned, so a single Fibonacci multiply (2^64 / golden ratio) scatters
-/// them across buckets without clustering; the keys are our own PCs, so SipHash's
-/// DoS resistance buys nothing here. Behavior is identical -- only the bucket
-/// mapping changes.
+/// them across buckets without clustering; the keys are emulator-internal PCs,
+/// never attacker-controlled, so DoS resistance is unnecessary.
 #[derive(Default)]
 struct PcHasher(u64);
 impl std::hash::Hasher for PcHasher {
@@ -336,12 +335,12 @@ impl Cpu {
         }
     }
 
-    /// Set the PC window whose decodes are cached -- this instance's own immutable
+    /// Set the PC window whose decodes are cached: this instance's own immutable
     /// XIP flash. The SP and RoT are separate `Cpu` instances (see `flash_cache`)
     /// whose images sit at different flash bases (SP 0x0800_0000, RoT/LPC55
     /// 0x0001_0000), so each configures its own window; this is a memory-map
     /// setting, not a change of core architecture. The range must cover only
-    /// immutable code -- RAM or injected/self-modified regions must stay outside
+    /// immutable code: RAM or injected/self-modified regions must stay outside
     /// it, or their stale decodes would be reused.
     pub fn set_flash_cache(&mut self, range: std::ops::Range<u32>) {
         self.flash_cache = range;
@@ -461,8 +460,8 @@ impl Cpu {
         self.last_vfp = false;
         self.last_sys = false;
         // Fetch + decode, via the PC-keyed cache for flash code (the common case).
-        // Cacheable: this core's immutable flash, or -- only while the core is
-        // under debug control -- its ITCM. The debug case lets the injected
+        // Cacheable: this core's immutable flash, or, only while the core is
+        // under debug control, its ITCM. The debug case lets the injected
         // endoscope program (which loops over the flash hash for ~140M
         // instructions) be decoded once instead of every instruction; the debug
         // port invalidates those entries on injection (`invalidate_decode`), and
@@ -499,8 +498,7 @@ impl Cpu {
             Some(inst) => {
                 let len = dec.len;
                 // Formatting the disassembly is a heap alloc per instruction; only
-                // do it when last_disasm is read (trace/diff). In production this is
-                // the largest per-instruction cost removed.
+                // do it when last_disasm is read (trace/diff).
                 if self.record_disasm {
                     self.last_disasm = format!("{}", inst);
                 }
@@ -624,7 +622,7 @@ impl Cpu {
     ) -> Result<(), ()> {
         let ops = &inst.operands;
         // ARM rule: 16-bit flag-setting data-processing instructions inside an
-        // IT block do NOT update the flags (the implicit S is suppressed). yaxpeax
+        // IT block do not update the flags (the implicit S is suppressed). yaxpeax
         // still reports them as `movs`/`adds` etc., so suppress here.
         let s = inst.s && !(self.cur_in_it && len == 2);
         self.cur_setflags = s; // so alu()/shift_op() honor the IT-block suppression too
@@ -655,7 +653,7 @@ impl Cpu {
                         // it with the RoT's elapsed 1ms tick events. Convert one unit
                         // of RoT-elapsed time into one SP SysTick: arm the countdown
                         // to fire on the next `maybe_tick` (which reloads systick to
-                        // rvr afterward). Do NOT set idle_skip -- keep the SP running
+                        // rvr afterward). Do not set idle_skip; keep the SP running
                         // so the tick delivers and the next WFI drains more, yielding
                         // exactly `credit` ticks over this visit. This paces the SP's
                         // SysTick-derived sprot timeout at the true RoT-relative rate.
@@ -670,11 +668,11 @@ impl Cpu {
                         // Frozen with no credit yet (the coupled core is waiting on the
                         // other's progress): idle without advancing the clock. Signal
                         // idle to the run loop but leave `systick` alone, so no tick
-                        // fires -- the clock only moves when credit arrives.
+                        // fires; the clock only moves when credit arrives.
                         self.idle_skip = 1;
                     } else {
                         // No accepted request (or caught up to the RoT): the ordinary
-                        // idle throttle -- record the skip so the loop sleeps the host
+                        // idle throttle: record the skip so the loop sleeps the host
                         // instead of pegging a core, and collapse the countdown.
                         self.idle_skip = self.systick;
                         self.systick = 1;
@@ -754,7 +752,7 @@ impl Cpu {
 
             // yaxpeax 0.4 mis-decodes the shift TYPE of the 32-bit register-form
             // shift (T2: `LSL/LSR/ASR/ROR.w Rd, Rn, Rm`); e.g. it reports `lsr.w`
-            // as `lsl.w`. The type lives in raw hw1 bits[6:5]; decode it ourselves.
+            // as `lsl.w`. The type lives in raw hw1 bits[6:5]; decode it from there.
             Opcode::LSL | Opcode::LSR | Opcode::ASR | Opcode::ROR => {
                 let dflt = match inst.opcode {
                     Opcode::LSL => ShiftStyle::LSL,
@@ -956,7 +954,7 @@ impl Cpu {
                 Ok(())
             }
 
-            // NB: yaxpeax gives the 4th operand of BFI/BFC as `msb`, not width
+            // yaxpeax gives the 4th operand of BFI/BFC as `msb`, not width
             // (its own source flags this as a known quirk), so derive width here.
             // yaxpeax 0.4 mis-decodes BFI/BFC's msb field (e.g. reports msb=15 for
             // a `& 0x7fff` clear that should have msb=31), so derive lsb/msb from
@@ -1017,8 +1015,8 @@ impl Cpu {
 
             // PKHBT/PKHTB (pack halfword). Decode T1 from raw: Rd=Rn[lo]|shifted
             // Rm[hi] for BT (LSL), Rn[hi]|shifted Rm[lo] for TB (ASR). net's smoltcp
-            // uses this to assemble values; if skipped, a register keeps a stale
-            // (garbage-pointer) value.
+            // uses this to assemble values; skipping it leaves a register holding
+            // a stale (garbage-pointer) value.
             Opcode::PKHBT | Opcode::PKHTB => {
                 let (hw1, hw2) = ((raw & 0xFFFF) as u16, (raw >> 16) as u16);
                 let rn = (hw1 & 0xF) as u8;
@@ -1054,8 +1052,9 @@ impl Cpu {
             // (e.g. `strb r4,[sp,#3612]` -> `strbt`), so handle them identically to
             // the privileged form: the emulator doesn't enforce MPU privilege, and
             // store()/load() recompute the address from raw bits via mem_addr32,
-            // ignoring yaxpeax's wrong operands. Skipping these dropped a byte
-            // store -> corrupted net's socket handle -> garbage waker -> spin.
+            // ignoring yaxpeax's wrong operands. These must execute as real
+            // stores/loads: a dropped byte store corrupts net's socket handle and
+            // the task spins on a garbage waker.
             Opcode::STRBT => self.store(ops, bus, 1, raw, len),
             Opcode::STRHT => self.store(ops, bus, 2, raw, len),
             Opcode::STRT => self.store(ops, bus, 4, raw, len),
@@ -1215,7 +1214,7 @@ impl Cpu {
 
             Opcode::BKPT => {
                 if self.debug_en {
-                    // Debug enabled: halt into debug state AT the breakpoint (do
+                    // Debug enabled: halt into debug state at the breakpoint (do
                     // not advance past it), the way a real core enters debug on
                     // BKPT when DHCSR.C_DEBUGEN is set. endoscope ends with a BKPT
                     // to signal completion to the RoT, which then reads the result.
@@ -1387,7 +1386,7 @@ impl Cpu {
         len: u32,
     ) -> Result<(), ()> {
         let rt = reg(&ops[0])?;
-        // For 32-bit encodings, decode the address from raw — yaxpeax mis-decodes
+        // For 32-bit encodings, decode the address from raw: yaxpeax mis-decodes
         // several load/store addressing forms (e.g. T3 imm as a register offset).
         let addr = if len == 4 {
             self.mem_addr32(raw)
@@ -1750,11 +1749,11 @@ impl Cpu {
     /// at the lowest priority, so it never preempts a handler).
     pub fn maybe_tick(&mut self, bus: &mut Bus) {
         // SYST_CSR (enable/tickint) and SYST_RVR (reload) are configured once at
-        // boot and ~never change, yet reading them through the full bus dispatch
-        // (RAM-region scan + device scan to reach the SCS) every instruction was a
-        // top per-instruction cost. Refresh the cached copies only periodically;
-        // a sub-256-instruction lag in noticing a CSR/RVR change is immaterial
-        // (the SysTick period is millions of instructions).
+        // boot and ~never change; reading them through the full bus dispatch
+        // (RAM-region scan + device scan to reach the SCS) every instruction is
+        // too costly for the hot loop. Refresh the cached copies only
+        // periodically: the lag in noticing a CSR/RVR change is bounded at 256
+        // instructions, immaterial against a SysTick period of millions.
         if self.cycles & 0xFF == 0 {
             self.syst_csr = bus.read32(crate::mem::SYST_CSR);
             self.syst_rvr = bus.read32(crate::mem::SYST_RVR).max(1);
@@ -2159,7 +2158,7 @@ impl Cpu {
         if hw1 == 0xEEF1 && coproc_fp && (hw2 & 0x00F0) == 0x0010 {
             let rt = ((hw2 >> 12) & 0xF) as usize;
             if rt == 15 {
-                // VMRS APSR_nzcv, FPSCR — copy FP compare flags into APSR.
+                // VMRS APSR_nzcv, FPSCR: copy FP compare flags into APSR.
                 self.n = self.fpscr & (1 << 31) != 0;
                 self.z = self.fpscr & (1 << 30) != 0;
                 self.c = self.fpscr & (1 << 29) != 0;
@@ -2723,8 +2722,8 @@ mod tests {
     #[test]
     fn reset_for_reboot_leaves_core_running() {
         let mut cpu = Cpu::new();
-        cpu.halted = true; // previously debug-halted...
-        cpu.bkpt_hit = true; // ...at a BKPT
+        cpu.halted = true; // stale debug-halt state
+        cpu.bkpt_hit = true; // attributed to a BKPT
         cpu.syst_csr = 0b011; // firmware had SysTick enabled (ENABLE | TICKINT)...
         cpu.syst_rvr = 479_999; // ...and reloaded, before the reset
         cpu.systick = 12_345;
@@ -2760,7 +2759,7 @@ mod tests {
     }
 
     /// A frozen clock does not advance on the core's own running (so its SysTick does
-    /// not underflow), but a credit-armed tick (`systick == 1`) still fires -- this is
+    /// not underflow), but a credit-armed tick (`systick == 1`) still fires: this is
     /// what lets the RoT's endoscope poll advance only at the SP-coupled rate.
     #[test]
     fn tick_frozen_gates_own_running_but_allows_credit() {
@@ -2804,7 +2803,7 @@ mod tests {
         cpu.syst_csr = 0b11; // ENABLE | TICKINT
         cpu.syst_rvr = 4;
         cpu.systick = 0;
-        cpu.mode = Mode::Handler; // not Thread -> the SysTick exception is NOT delivered
+        cpu.mode = Mode::Handler; // not Thread -> the SysTick exception is not delivered
         for _ in 0..4 {
             cpu.maybe_tick(&mut bus);
         }
@@ -2817,7 +2816,7 @@ mod tests {
     }
 
     /// When the SP is credited with RoT-elapsed ticks (a coupled sprot wait), an idle
-    /// WFI converts one credit unit into an armed SysTick (`systick == 1`) WITHOUT
+    /// WFI converts one credit unit into an armed SysTick (`systick == 1`) without
     /// setting `idle_skip`, so the SP keeps running to deliver the tick and drain more.
     #[test]
     fn wfi_drains_sprot_tick_credit() {
@@ -2872,9 +2871,8 @@ mod tests {
     }
 
     /// UXTB16 fills each halfword lane of rd from one byte of rm: lane 0 from
-    /// byte 0, lane 1 from byte 2. Silently skipping it (the pre-fix behavior)
-    /// left the stale rd corrupting a computed register address in monorail's
-    /// serdes10g setup.
+    /// byte 0, lane 1 from byte 2. A silent skip leaves the stale rd corrupting
+    /// a computed register address in monorail's serdes10g setup.
     #[test]
     fn uxtb16_extends_bytes_zero_and_two() {
         let mut bus = ram_bus();

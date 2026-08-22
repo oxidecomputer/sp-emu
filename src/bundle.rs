@@ -137,7 +137,7 @@ fn write_entry(
 }
 
 /// The packed `config.toml`: the set knobs (from `config::to_toml`), minus the
-/// instance-file path knobs, plus canonical bundle-relative paths for what we bundled.
+/// instance-file path knobs, plus canonical bundle-relative paths for the bundled files.
 fn rewritten_config(rot_nvm: &str) -> String {
     let cfg = crate::config::get();
     let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());

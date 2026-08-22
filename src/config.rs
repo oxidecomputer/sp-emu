@@ -16,7 +16,7 @@
 //! `SP_EMU_NAME = "value"` dump the bundle format still consumes.
 //!
 //! Sources and precedence: flag > (config file | environment) > default. The
-//! environment and a config file are two *alternative* sources, never stacked:
+//! environment and a config file are two alternative sources, never stacked:
 //! `--load-config <path>` reads all `SP_EMU_*` settings from a flat
 //! `SP_EMU_NAME = "value"` TOML table and ignores the environment, so a saved
 //! configuration reproduces exactly; without it, the environment is read as usual.
@@ -26,7 +26,7 @@
 //!
 //! Backward compatibility: every `SP_EMU_*` variable keeps its name, default, and
 //! leniency. The env/file path stays lenient (a typo or malformed value coerces to
-//! a default, as before); the strict validation the crate applies is reserved for
+//! a default); the strict validation the crate applies is reserved for
 //! the typed config file.
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -115,8 +115,8 @@ fn render(r: &Resolved) -> String {
 }
 
 /// Parse a flat config file into `(SP_EMU_NAME, value)` pairs, coercing scalar
-/// values to the string the resolver expects (a boolean `false` means "unset" -- a
-/// flag left off). A malformed file is a parse error the caller reports.
+/// values to the string the resolver expects (a boolean `false` means "unset",
+/// a flag left off). A malformed file is a parse error the caller reports.
 fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, toml::de::Error> {
     let table: toml::Table = text.parse()?;
     let mut out = Vec::new();
@@ -139,8 +139,8 @@ static CONFIG: OnceLock<Resolved> = OnceLock::new();
 /// Resolve and store the process configuration. Call once, early in `main`, before
 /// any subsystem is built.
 ///
-/// sp-emu takes its `SP_EMU_*` settings from the environment -- or, with the
-/// `--load-config <path>` flag, from a TOML config file *instead of* the environment,
+/// sp-emu takes its `SP_EMU_*` settings from the environment, or, with the
+/// `--load-config <path>` flag, from a TOML config file instead of the environment,
 /// so a saved configuration reproduces exactly regardless of the shell. The two
 /// sources are never mixed; command-line flags always win. Precedence is
 /// flag > (config file | environment) > default. `--dump-config <path>` writes the
@@ -464,7 +464,7 @@ mod tests {
             from_map(&[("SP_EMU_BOARD", "sidecar")], None).board(),
             Board::Sidecar
         );
-        // a board typo is lenient: it falls back to gimlet, as on master.
+        // a board typo is lenient: it falls back to gimlet.
         assert_eq!(
             from_map(&[("SP_EMU_BOARD", "typo")], None).board(),
             Board::Gimlet
@@ -520,11 +520,10 @@ mod tests {
         assert!(parse_config_toml("this is not = = toml").is_err());
     }
 
-    /// Backward-compatibility contract: every `SP_EMU_*` variable that configured
-    /// sp-emu on the `master` branch must remain resolvable, with the same name. This
-    /// is the exact set read on master (see git history); removing one silently would
-    /// break existing environments. If a removal is ever intentional, delete it here
-    /// too and call it out in the commit -- never let this list quietly shrink.
+    /// Backward-compatibility contract: every `SP_EMU_*` variable in this list must
+    /// remain resolvable, with the same name; removing one silently would break
+    /// existing environments. If a removal is ever intentional, delete it here too
+    /// and call it out in the commit; never let this list quietly shrink.
     #[test]
     fn supports_all_master_env_vars() {
         const MASTER_VARS: &[&str] = &[
@@ -588,7 +587,7 @@ mod tests {
     }
 
     /// Guard: `config.rs` is the sole reader of the environment. No other module
-    /// may call `env::var` -- everything routes through this adapter.
+    /// may call `env::var`; everything routes through this adapter.
     #[test]
     fn env_reads_confined_to_config_module() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

@@ -6,13 +6,13 @@
 //!
 //! This is the register-level model probe-rs drives over SWD. The Glasgow-applet
 //! server (`glasgow.rs`) decodes `CMD_TRANSFER` into calls to [`SwDp::transfer`];
-//! a later phase can drive the same model from the emulated RoT. Unlike a
-//! read-only, memory-only stub, this offers a *real* debug core — halt/run/step
-//! plus register access via DCRSR/DCRDR — which is what hiffy (halt, write
-//! program, run, read results) and endoscope need.
+//! a later phase can drive the same model from the emulated RoT. This is a
+//! working debug core, not a read-only memory stub: halt/run/step plus register
+//! access via DCRSR/DCRDR, which is what hiffy (halt, write program, run, read
+//! results) and endoscope need.
 //!
-//! sp-emu speaks the Glasgow *applet* protocol, not raw SWD line bits, so there
-//! is no parity/turnaround/clocking here — just ADIv5 register semantics.
+//! sp-emu speaks the Glasgow applet protocol, not raw SWD line bits, so there
+//! is no parity/turnaround/clocking here, just ADIv5 register semantics.
 
 use crate::cpu::Cpu;
 use crate::mem::Bus;
@@ -67,8 +67,8 @@ const S_RESET_ST: u32 = 1 << 25;
 const AIRCR: u32 = 0xE000_ED0C;
 const AIRCR_VECTKEY: u32 = 0x05FA_0000;
 const AIRCR_SYSRESETREQ: u32 = 1 << 2;
-// DEMCR.VC_CORERESET (bit0): vector catch — halt at the reset vector instead of
-// running. probe-rs sets it via reset_catch_set for reset-and-halt / endoscope.
+// DEMCR.VC_CORERESET (bit0): vector catch, halting at the reset vector instead
+// of running. probe-rs sets it via reset_catch_set for reset-and-halt / endoscope.
 const VC_CORERESET: u32 = 1 << 0;
 // Slot-A boot vector table (XIP flash): [0]=initial SP, [1]=reset PC.
 const VECTOR_TABLE: u32 = 0x0800_0000;
@@ -265,8 +265,8 @@ impl SwDp {
             DEMCR => self.demcr,
             DCRSR => 0,
             // Synthesize the halt reason from live state. Real DFSR bits are
-            // sticky/W1C; modeling it as plain storage let probe-rs's own
-            // "clear DFSR" write (0x1F) read back as a breakpoint.
+            // sticky/W1C; plain storage would let probe-rs's own "clear DFSR"
+            // write (0x1F) read back as a breakpoint hit.
             DFSR => {
                 if cpu.bkpt_hit {
                     DFSR_BKPT

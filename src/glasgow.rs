@@ -5,9 +5,10 @@
 //! Glasgow Interface Explorer "probe-rs" applet server.
 //!
 //! probe-rs's stock `glasgow` backend (raw-SWD) talks to this over TCP, so
-//! humility reaches sp-emu's debug port with **no probe-rs or humility change**.
-//! We speak the applet protocol (COBS-framed Root/Swd packets, `CMD_TRANSFER`),
-//! not raw SWD line bits — there is no wire, so no parity/turnaround to model.
+//! humility reaches sp-emu's debug port with no probe-rs or humility change.
+//! The server speaks the applet protocol (COBS-framed Root/Swd packets,
+//! `CMD_TRANSFER`), not raw SWD line bits: there is no wire, so no
+//! parity/turnaround to model.
 //! Register transactions drive [`SwDp`] (`debugport.rs`), which owns the SW-DP,
 //! the MEM-AP, and the debug core.
 //!
@@ -52,8 +53,8 @@ const RSP_ACK_FAULT: u8 = 0x04;
 const RUN_BATCH: usize = 50_000;
 
 /// Serve one Glasgow-applet connection to completion. Owns the SP core for the
-/// duration (RoT/eth pump is frozen while a command runs); hiffy and endoscope are
-/// self-contained SP work, so that is fine.
+/// duration (RoT/eth pump is frozen while a command runs); hiffy and endoscope
+/// are self-contained SP work and do not depend on the frozen pumps.
 pub fn serve(
     mut stream: TcpStream,
     cpu: &mut Cpu,
@@ -62,14 +63,14 @@ pub fn serve(
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     // A read of a large region has probe-rs writing all N transfer commands
-    // while we write back N responses, so a blocking write_all can deadlock
-    // (both peers write, neither reads). We therefore never block on a write:
-    // always read before writing and buffer any unsent output in `pending_out`.
-    // We DO block on the read, but only when idle (core halted, nothing buffered
-    // to send) — that gives a round-trip near-zero latency (a 150us poll-sleep
-    // otherwise dominated latency-bound commands like `tasks -sl`), while the
-    // read timeout below keeps the idle-timeout check live so a vanished client
-    // can't wedge the single-client accept loop.
+    // while the server writes back N responses, so a blocking write_all can
+    // deadlock (both peers write, neither reads). Writes therefore never block:
+    // the loop always reads before writing and buffers any unsent output in
+    // `pending_out`. The read does block, but only when idle (core halted,
+    // nothing buffered to send): that gives a round-trip near-zero latency
+    // (a 150us poll-sleep otherwise dominates latency-bound commands like
+    // `tasks -sl`), while the read timeout below keeps the idle-timeout check
+    // live so a vanished client can't wedge the single-client accept loop.
     stream
         .set_read_timeout(Some(std::time::Duration::from_millis(20)))
         .ok();
@@ -89,9 +90,9 @@ pub fn serve(
     loop {
         let mut worked = false;
         // Block on the read only when there is nothing else to do: the core is
-        // halted (so we are not stepping it) and no response is queued (so we are
-        // not mid-transfer and cannot deadlock a peer that is still writing).
-        // Otherwise poll, so we interleave stepping the core / flushing output.
+        // halted (not being stepped) and no response is queued (not mid-transfer,
+        // so a peer that is still writing cannot be deadlocked). Otherwise poll,
+        // interleaving core stepping with output flushing.
         let block = cpu.halted && !swdp.step_request && pending_out.is_empty();
         stream.set_nonblocking(!block).ok();
         match stream.read(&mut rbuf) {
@@ -146,7 +147,8 @@ pub fn serve(
             pending_out.extend(cobs_frame(TGT_SWD, &swd_out));
         }
 
-        // Flush what we can without blocking; keep the remainder for next loop.
+        // Flush whatever the socket accepts without blocking; keep the
+        // remainder for the next loop.
         if !pending_out.is_empty() {
             match stream.write(&pending_out) {
                 Ok(n) => {
@@ -188,10 +190,10 @@ pub fn serve(
             worked = true;
         }
 
-        // If we polled (didn't block) and got nothing done — e.g. output is
-        // backpressured (write returned WouldBlock) while the core is halted —
-        // yield briefly so we don't spin a host core. When `block` was set we
-        // already waited in the blocking read, so no extra sleep is needed.
+        // A poll pass (not blocked) that got nothing done, e.g. output
+        // backpressured (write returned WouldBlock) while the core is halted,
+        // yields briefly so an idle loop does not spin a host core. When `block`
+        // was set the blocking read already waited; no extra sleep is needed.
         if !worked && !block {
             std::thread::sleep(std::time::Duration::from_micros(150));
         }
@@ -223,7 +225,7 @@ fn process_root(inp: &mut Vec<u8>, out: &mut Vec<u8>) {
                 i += 3; // no reply
             }
             CMD_ASSERT_RESET | CMD_CLEAR_RESET => {
-                // SP_RESET side-band is modeled in phase 2; ack by consuming.
+                // The SP_RESET side-band is not modeled; ack by consuming.
                 i += 1;
             }
             _ => i += 1, // unknown: skip a byte to resync

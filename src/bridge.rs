@@ -34,21 +34,23 @@ const EREPORT_PORT: u16 = 57005; // snitch's ereport socket (SP side)
 const EREPORT_OFFSET: u16 = 11100; // host ereport port = mgmt port + this (33300->44400)
 const VLAN_TPID: u16 = 0x8100;
 
-/// The SP's two management VLANs (gimlet app.toml): sidecar1 (vid 0x301) is the
-/// SP's port-1 = switch0 uplink; sidecar2 (vid 0x302) is port-2 = switch1. The
-/// a4x2 port map exposes switch0 at base_port+0 and switch1 at base_port+1, so
-/// each bound socket is tied to the matching VLAN. control_plane_agent listens
-/// on BOTH, so a centralized emulator must answer on both switch views per SP.
-// Trusted management-VLAN defaults, shared with the well-known-port host in
-// main.rs so the two bind paths can't drift. Gimlet uses switch0/switch1; the
-// sidecar swaps switch0 for its local_sidecar VLAN. SP_EMU_VID0/VID1 override.
+/// Trusted management-VLAN ids, shared with the well-known-port host in
+/// main.rs so the two bind paths cannot drift. Each bound socket is one switch
+/// view: base_port+0 = switch0, base_port+1 = switch1 (the a4x2 port map), and
+/// each view is tied to the VLAN the SP's net task serves on that port.
+/// control_plane_agent listens on both views, so the bridge answers on both
+/// per SP. Per-board defaults (see `Bridge::new`): the gimlet's views ride
+/// sidecar1 (0x301) and sidecar2 (0x302); the sidecar's ride local_sidecar
+/// (0x130) and peer_sidecar (0x302). MGS state/inventory require trusted
+/// VLANs (the tech-port VLANs 0x12c/0x12d are untrusted). SP_EMU_VID0/VID1
+/// override either default.
 pub(crate) const VID_SWITCH0: u16 = 0x301;
 pub(crate) const VID_SWITCH1: u16 = 0x302;
 pub(crate) const VID_SIDECAR0: u16 = 0x130;
 
 /// A bidirectional byte channel to the host CPU over the host-facing UART. A
-/// unix socket (voxel/propolis) and a pty master (faux-ipcc and other serial
-/// tools) both satisfy it.
+/// unix socket (propolis) and a pty master (faux-ipcc and other serial tools)
+/// both satisfy it.
 trait HostUartIo: Read + Write {}
 impl<T: Read + Write> HostUartIo for T {}
 
@@ -157,11 +159,11 @@ pub struct Bridge {
     rtt_n: u64,
     rtt_sum_us: u128,
     rtt_max_us: u128,
-    /// host-sp-comms (UART7) bytes to/from the host CPU. In voxel this is the
-    /// propolis IPCC COM port, a unix socket (`$SP_EMU_HOST_UART`). Serial-port
-    /// tools like faux-ipcc want a tty instead: `$SP_EMU_HOST_PTY=1` makes
-    /// sp-emu open a pty and print its slave path. Both back-ends are just a
-    /// bidirectional byte channel.
+    /// host-sp-comms (UART7) bytes to/from the host CPU. A propolis IPCC COM
+    /// port is a unix socket (`$SP_EMU_HOST_UART`); serial-port tools like
+    /// faux-ipcc want a tty instead, so `$SP_EMU_HOST_PTY=1` makes sp-emu open
+    /// a pty and print its slave path. Both back-ends are just a bidirectional
+    /// byte channel.
     host_uart: Option<Box<dyn HostUartIo>>,
     /// Bytes the SP has written toward the host UART but the (non-blocking)
     /// socket has not yet accepted. The channel is low-rate but bursty (an IPCC
@@ -181,16 +183,10 @@ impl Bridge {
                 format!("SP_EMU_BRIDGE bind addr {:?} must be host:port", bind),
             )
         })?;
-        // The management VLAN ids differ by board (gimlet app.toml uses 0x301/
-        // 0x302; the sidecar uses 0x12c/0x12d). Env overrides let the bridge
-        // inject MGS traffic on the VLAN the SP's net task listens on; otherwise
-        // the SP drops it (no per-VLAN smoltcp iface for the wrong vid). Defaults
-        // to the gimlet VLANs.
-        // Per-board trusted-VLAN defaults: the sidecar's management VLANs are
-        // local_sidecar (0x130, port 1 -> switch0 view) and peer_sidecar (0x302,
-        // port 2 -> switch1 view); both are `trusted=true`, which MGS state/
-        // inventory require (the tech-port VLANs 0x12c/0x12d are untrusted). The
-        // gimlet uses 0x301/0x302. SP_EMU_VID0/VID1 still override either default.
+        // Per-board trusted-VLAN defaults (the VID_* constants above): the
+        // bridge must inject MGS traffic on the VLAN the SP's net task listens
+        // on, or the SP drops it (no per-VLAN smoltcp iface for the wrong vid).
+        // SP_EMU_VID0/VID1 override either default.
         let sidecar = crate::config::get().board().is_sidecar();
         let (def0, def1) = if sidecar {
             (VID_SIDECAR0, VID_SWITCH1)
@@ -267,8 +263,8 @@ impl Bridge {
     }
 
     /// Well-known-port mode (additive; opt-in). Each `(addr, vid)` view binds the
-    /// SP's real socket `ports` on `addr` -- host port == SP socket port, no
-    /// offset arithmetic -- so faux-mgs/humility/sp-test reach the emulated SP at
+    /// SP's real socket `ports` on `addr` (host port == SP socket port, no
+    /// offset arithmetic), so faux-mgs/humility/sp-test reach the emulated SP at
     /// exactly the addresses and ports they would use against real hardware
     /// (`<addr>:11111` for MGS, `:57005` for ereport, ...). Instances never
     /// collide because they live on different addresses, not different ports. The
@@ -374,8 +370,8 @@ impl Bridge {
             self.sp_by_vid.insert(vid, (src_mac, src_ip));
             if first {
                 // Readiness marker: the SP's net stack is up and transmitting,
-                // so it is reachable by MGS. A supervisor (voxel-init /
-                // run-fleet.sh) gates bring-up by waiting for this line.
+                // so it is reachable by MGS. Fleet supervisors gate bring-up by
+                // waiting for this exact line; keep its format stable.
                 if self.sp_by_vid.len() == 1 {
                     eprintln!(
                         "[sp-emu] online: SP reachable on the management network (first vid {:#x})",
@@ -462,11 +458,11 @@ impl Bridge {
         // Route the reply to the specific MGS client that sent the request: the
         // SP echoes that client's ephemeral port as the UDP destination port
         // (poll_host injects requests with the real client port as the UDP
-        // source). Real MGS opens many concurrent sockets, so routing to a
-        // single last-seen peer per VLAN starves all but the busiest client
-        // (symptom: discover/state intermittently "no SP discovered" while a
-        // sensor-polling socket hogs the replies). The MGS IP comes from the
-        // learned peer (all clients share the in-zone loopback) + this port.
+        // source). Real MGS opens many concurrent sockets, and a low-rate flow
+        // (discover/state) must keep receiving its replies while a sensor-poll
+        // flood runs; routing to a single last-seen peer per VLAN would starve
+        // all but the busiest client. The MGS IP comes from the learned peer
+        // (all clients share the in-zone loopback) + this port.
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let peer_ip = match self.peer_by_vid.get(&(vid, src_port)) {
             Some(p) => p.ip(),
@@ -667,7 +663,7 @@ impl Bridge {
         let mut icmp = req.to_vec();
         icmp[0] = ICMP6_ECHO_REPLY;
         icmp[2] = 0;
-        icmp[3] = 0; // clear checksum
+        icmp[3] = 0; // checksum is computed over a zeroed checksum field
         let ck = checksum6(&self.my_ip, dst_ip, IPPROTO_ICMPV6, &icmp);
         icmp[2..4].copy_from_slice(&ck.to_be_bytes());
         self.build_ipv6_from(vid, dst_mac, *dst_ip, IPPROTO_ICMPV6, 64, &icmp)

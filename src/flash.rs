@@ -55,7 +55,7 @@ pub fn load_image(path: &str) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {path}"))?;
     if raw.starts_with(b"PK") {
         archive_entry(&raw, "img/final.bin")
-            .context("no img/final.bin in archive — is this a Hubris build archive?")
+            .context("no img/final.bin in archive; is this a Hubris build archive?")
     } else {
         Ok(raw)
     }
@@ -124,7 +124,7 @@ fn files_identical(a: &Path, b: &Path) -> bool {
 /// Copy a Hubris archive into the instance's `<base>/archives/<name>.zip` (base = the
 /// directory of `flash_path`) and return its base-relative ref (e.g. `archives/sp.zip`)
 /// to store in the `.nv` companion file. Skips the copy when the destination holds
-/// this archive: either it IS the source (re-flash from an already-stowed archive)
+/// this archive: either it is the source (re-flash from an already-stowed archive)
 /// or a byte-identical copy (an unchanged instance re-run, e.g. the RoT re-stows on
 /// every serve). The instance is thus self-contained: the archive travels with the
 /// flash image, and `pack` is just a zip of the base directory.
@@ -163,13 +163,13 @@ pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
 /// If exactly one slot is programmed, mirror it into the other bank in-memory.
 ///
 /// sp-emu programs a single slot, but the control-plane inventory (wicketd)
-/// reads the caboose of BOTH banks every poll cycle (~10s per SP). An empty bank
-/// returns NoCaboose, which wicketd never caches and re-fetches forever - and
+/// reads the caboose of both banks every poll cycle (~10s per SP). An empty bank
+/// returns NoCaboose, which wicketd never caches and re-fetches forever, and
 /// each fetch is a ~38ms emulated MGS round-trip, so a real dual-banked SP's
 /// harmless polling becomes a continuous CPU drain here. Presenting the same
 /// image in both banks (as a real SP has) makes the inactive-slot caboose read
 /// succeed and get cached, ending the retries. Only the caboose is read from the
-/// inactive bank, so a byte copy suffices - that image is never executed there.
+/// inactive bank, so a byte copy suffices; that image is never executed there.
 pub fn mirror_unprogrammed_slot(nvm: &mut [u8]) {
     let a = slot_programmed(nvm, 'a').unwrap_or(false);
     let b = slot_programmed(nvm, 'b').unwrap_or(false);
@@ -200,21 +200,21 @@ pub fn slot_programmed(nvm: &[u8], slot: char) -> Result<bool> {
 // Non-volatile register state file
 // ---------------------------------------------------------------------------
 //
-// The flash *contents* live in the raw `sp-flash.bin` image (physical layout:
+// The flash contents live in the raw `sp-flash.bin` image (physical layout:
 // bank1 then bank2). A handful of option-byte bits that survive across a run are
-// not flash data — chiefly the persisted bank-swap selection — so they live in a
+// not flash data (chiefly the persisted bank-swap selection), so they live in a
 // tiny plaintext state file (`sp-flash.bin.nv`, one `key = value` per line). It
 // is deliberately human-inspectable and forward-extensible (Phase 2 adds RoT
 // lines): deleting the state file resets the NV registers to their defaults.
 
-/// Persisted non-volatile state: the STM32H7 option bytes we model, plus the Hubris
+/// Persisted non-volatile state: the modeled STM32H7 option bytes, plus the Hubris
 /// build archive the flashed image came from. The archive ref is a path relative to
 /// the `.nv` file's directory (the instance base), recorded at flash time so a
 /// run-from-flash instance knows its archive for app.toml-derived config and for
 /// humility tooling (which matches the archive's image id).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NvState {
-    /// `OPTSR_CUR.SWAP_BANK_OPT` — which physical bank boots at 0x0800_0000.
+    /// `OPTSR_CUR.SWAP_BANK_OPT`: which physical bank boots at 0x0800_0000.
     pub swap_bank: bool,
     /// The Hubris archive the SP was flashed from, base-relative (e.g.
     /// `archives/sp.zip`). `None` when flashed from a bare image (no archive content).
@@ -269,7 +269,7 @@ pub fn save_nv(path: &str, nv: &NvState) -> Result<()> {
 /// seed time so the instance is self-contained; `None` for a region seeded from a
 /// bare image or absent. Parallel to the SP `NvState`.
 ///
-/// Note: the SP (`sp-flash.bin.nv` = `NvState`) and RoT (`sp-rot-flash.bin.nv` =
+/// The SP (`sp-flash.bin.nv` = `NvState`) and RoT (`sp-rot-flash.bin.nv` =
 /// `RotMeta`) `.nv` files share the extension but are distinct files with distinct
 /// schemas and loaders (`load_nv` vs `load_rot_meta`); loading one with the other's
 /// parser just yields defaults, never a crash.
@@ -324,15 +324,15 @@ pub fn save_rot_meta(path: &str, m: &RotMeta) -> Result<()> {
 // Runtime flash model (STM32H753 embedded flash + FLASH controller)
 // ---------------------------------------------------------------------------
 //
-// Replaces the flat `add_ram` flash window and the store/return FLASH RegFile
-// with a model that behaves like real silicon so unmodified Hubris firmware can
-// perform an in-band MGS firmware update end to end: unlock, whole-bank erase
-// (with the EOP interrupt the driver blocks on), 256-bit word programming with
-// NOR semantics, the option-byte bank swap, and persistence to the host file.
+// Models the flash aperture and FLASH controller with real-silicon behavior so
+// unmodified Hubris firmware can perform an in-band MGS firmware update end to
+// end: unlock, whole-bank erase (with the EOP interrupt the driver blocks on),
+// 256-bit word programming with NOR semantics, the option-byte bank swap, and
+// persistence to the host file.
 //
 // Owned directly by the `Bus` (like the Ethernet DMA), because the data stores
-// that program flash target the *memory aperture* (0x0800_0000/0x0810_0000), not
-// the register block, and must be gated by the controller's lock/PG state — only
+// that program flash target the memory aperture (0x0800_0000/0x0810_0000), not
+// the register block, and must be gated by the controller's lock/PG state; only
 // a single owner of both can coordinate that. Performance: the aperture is the
 // hottest path in the emulator (every instruction fetch and constant load), so
 // reads are a range check + one XOR (bank remap) + a slice read; write-back to
@@ -357,7 +357,7 @@ const CR_PG: u32 = 1 << 1;
 const CR_BER: u32 = 1 << 3;
 const CR_START: u32 = 1 << 7;
 const CR_EOPIE: u32 = 1 << 16;
-// SR bits (BSY/QW read 0 — the model completes instantly; EOP latches).
+// SR bits (BSY/QW read 0, the model completes instantly; EOP latches).
 const SR_EOP: u32 = 1 << 16;
 // OPTCR bits.
 const OPTCR_OPTLOCK: u32 = 1 << 0;
@@ -379,7 +379,7 @@ pub struct Flash {
     mem: Vec<u8>,
     /// Write-through handle to the backing file. Every program/erase writes just
     /// the changed bytes here (seek + write), so the flash image stays in sync
-    /// even if the process is killed without a clean exit — matching real flash,
+    /// even if the process is killed without a clean exit, matching real flash,
     /// where a program/erase is durable the moment it completes. `None` if the
     /// file could not be opened (the model still works in RAM).
     file: Option<std::fs::File>,
@@ -471,7 +471,7 @@ impl Flash {
     /// Read `N` bytes from the aperture, tolerating an access that straddles the
     /// top of the 2 MB window: bytes past the end read as erased flash (0xFF).
     /// The `mem.rs` dispatch only range-checks the base address, so a stray or
-    /// unaligned access in the last few bytes must not panic — the emulator's
+    /// unaligned access in the last few bytes must not panic; the emulator's
     /// contract is to keep the trace moving on out-of-range accesses, not fault.
     #[inline]
     fn read_bytes<const N: usize>(&self, addr: u32) -> [u8; N] {
@@ -498,7 +498,7 @@ impl Flash {
     }
 
     /// A firmware store into the flash aperture. Honored only while bank2 is
-    /// unlocked and CR2.PG is set (a real program cycle); NOR semantics — a
+    /// unlocked and CR2.PG is set (a real program cycle); NOR semantics: a
     /// program can only clear bits (`&=`), never set them. Anything else is
     /// dropped, matching hardware where a stray store to XIP flash faults / is
     /// ignored rather than mutating it.
@@ -520,7 +520,7 @@ impl Flash {
         self.write_through(o, n);
     }
 
-    /// Raw image load at boot (bypasses lock/PG) — used by `Bus::load`. An
+    /// Raw image load at boot (bypasses lock/PG); used by `Bus::load`. An
     /// oversized image is clamped to the window rather than panicking.
     pub fn load_image_at(&mut self, addr: u32, bytes: &[u8]) {
         let o = self.phys_off(addr);
@@ -672,8 +672,8 @@ impl Flash {
                     self.opt_locked = true;
                 }
                 // OPTSTART commits the staged option bytes to the current/NV copy.
-                // It does *not* change the effective mapping — only a reset latches
-                // that — so the running image is not remapped underfoot.
+                // It does not change the effective mapping (only a reset latches
+                // that), so the running image is not remapped underfoot.
                 if val & OPTCR_OPTSTART != 0 && !self.opt_locked {
                     self.committed_swap = self.staged_swap;
                     if self.dbg {
@@ -688,7 +688,7 @@ impl Flash {
                     };
                     if let Err(e) = save_nv(&self.nv_path, &nv) {
                         // A failed persist means the committed swap is lost across
-                        // the next run — surface it rather than silently dropping.
+                        // the next run; surface it rather than silently dropping.
                         eprintln!(
                             "[flash] persist option bytes to {} failed: {e}",
                             self.nv_path
@@ -704,8 +704,8 @@ impl Flash {
     }
 
     fn erase_bank2(&mut self) {
-        // The update server always programs the *inactive* physical bank, reached
-        // via the 0x0810_0000 aperture — which the same XOR maps to the right
+        // The update server always programs the inactive physical bank, reached
+        // via the 0x0810_0000 aperture, which the same XOR maps to the right
         // physical half regardless of the effective swap.
         let base = self.phys_off(FLASH_BASE + BANK_SIZE as u32);
         self.mem[base..base + BANK_SIZE].fill(ERASED);
@@ -722,7 +722,7 @@ impl Flash {
     }
 
     /// Force the boot bank selection (a CLI slot override). Sets all three swap
-    /// bits in memory but does not touch the NV state file — only a firmware OPTSTART
+    /// bits in memory but does not touch the NV state file; only a firmware OPTSTART
     /// commit persists a swap, so a `run a`/`run b` choice never clobbers the
     /// recorded option bytes.
     pub fn force_swap(&mut self, swap: bool) {
@@ -732,7 +732,7 @@ impl Flash {
     }
 
     /// Latch the effective mapping from the committed option byte. Called at every
-    /// reset edge — this is where a committed bank swap actually takes effect.
+    /// reset edge; this is where a committed bank swap actually takes effect.
     pub fn reset_latch(&mut self) {
         self.effective_swap = self.committed_swap;
     }

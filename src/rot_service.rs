@@ -132,16 +132,16 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 drop(lk);
                 continue;
             }
-            // Collect the reply only in phase 2: only after the RoT signalled it
-            // (rot-irq) and CS was reasserted for the reply-read transaction. Mirrors
+            // Collect the reply only in phase 2: only after the RoT signals it
+            // (rot-irq) and CS is reasserted for the reply-read transaction. Mirrors
             // the real SP, which never reads the reply before rot-irq. Draining
-            // `miso` during phase 1 grabbed the reply before the RoT had sent it in a
-            // transaction it was aware of, so the exchange returned while the RoT was
-            // still mid-reply; the next exchange's link reset then reasserted CS
-            // underneath it and it ground forever, never reading the follow-up
-            // request (the caboose's chunked read). Once the reply is complete
-            // (`done`), draining continues but discards, so trailing idle frames the
-            // RoT clocks during wind-down are not appended to the reply.
+            // `miso` during phase 1 grabs the reply before the RoT has sent it in a
+            // transaction it is aware of: the exchange returns while the RoT is
+            // still mid-reply, and the next exchange's link reset reasserts CS
+            // underneath it, leaving it grinding forever without reading the
+            // follow-up request. Once the reply is complete (`done`), draining
+            // continues but discards, so trailing idle frames the RoT clocks during
+            // wind-down are not appended to the reply.
             if phase2 {
                 while let Some(b) = lk.miso.pop_front() {
                     if !done {
@@ -177,9 +177,9 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 resp.truncate(t - start);
                 // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
                 // SSD (FLEXCOMM8 STAT bit5), completes, and deasserts rot-irq,
-                // returning it to idle, ready for the next request. Without this the
-                // RoT spins on the SSD poll forever and never services the following
-                // request (wedged the caboose read after boot-info).
+                // returning it to idle, ready for the next request. Without the
+                // deassert the RoT spins on the SSD poll forever and never services
+                // the following request.
                 let mut lk = link.borrow_mut();
                 lk.cs = false;
                 lk.ssa = false;

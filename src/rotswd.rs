@@ -52,7 +52,7 @@ pub struct SwdLink {
     pub resp: Option<u32>,
 }
 
-/// Mutex wrapper keeping the old `Rc<RefCell>` call-site shape.
+/// Mutex wrapper for the shared SWD link; `borrow`/`borrow_mut` both lock.
 pub struct SwdCell(Mutex<SwdLink>);
 impl SwdCell {
     pub fn borrow(&self) -> MutexGuard<'_, SwdLink> {

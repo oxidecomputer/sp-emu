@@ -4,12 +4,12 @@
 
 //! Per-instance device identity for an sp-emu instance.
 //!
-//! Every identity-bearing value the emulated SP and RoT expose used to be a fixed
-//! constant baked into the binary: the STM32H753 96-bit UID (`soc.rs`), the LPC55
-//! DICE CDI (`lpc55.rs`), and the PUF seed / UDS (`puf.rs`). So every sp-emu
-//! instance produced the *same* self-signed DICE certificate and the same UID --
-//! fine for one emulator, wrong for a fleet (voxel runs many) and for any test
-//! that distinguishes instances or discovers them like real hardware.
+//! Every identity-bearing value the emulated SP and RoT expose is derived per
+//! instance: the STM32H753 96-bit UID (`soc.rs`), the LPC55 DICE CDI
+//! (`lpc55.rs`), and the PUF seed / UDS (`puf.rs`). Fixed constants would give
+//! every instance the same self-signed DICE certificate and the same UID, which
+//! breaks a fleet of emulators and any test that distinguishes instances or
+//! discovers them like real hardware.
 //!
 //! This module derives all per-instance identity from a single 32-byte master
 //! seed. Fields are domain-separated: `field = SHA3-256(master || tag)`, truncated
@@ -21,7 +21,7 @@
 //!   3. otherwise a fresh random source, persisted once.
 //!
 //! A seed source is one of: the reserved word `legacy` (reproduces the previous
-//! fixed constants exactly, so an old UID/CDI/cert can be recovered); a
+//! fixed constants exactly, so a legacy UID/CDI/cert can be recovered); a
 //! `0x`-prefixed hex u64 (`--seed 0x1234`); or any other string (hashed). The
 //! resolved source is written to the identity file so it round-trips.
 //!
@@ -91,7 +91,7 @@ const LEGACY_PUF_UDS: [u8; 32] = [
     0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x2d, 0x21, 0x21, 0x21, 0x21,
 ];
 
-/// Master seed used for a legacy identity's *derived* fields (RoT UUID, VPD MAC),
+/// Master seed used for a legacy identity's derived fields (RoT UUID, VPD MAC),
 /// which had no historical constant; the SP UID / DICE CDI / PUF UDS are then
 /// overridden with the exact old values above.
 const LEGACY_MASTER: [u8; 32] = *b"sp-emu-legacy-identity-master-v1";
@@ -156,8 +156,8 @@ impl Identity {
         derive(&master, TAG_DICE_CDI, &mut id.dice_cdi);
         derive(&master, TAG_PUF_UDS, &mut id.puf_uds);
         derive(&master, TAG_MAC, &mut id.mac);
-        // Locally-administered, unicast (bit1 set, bit0 clear); a MAC we minted,
-        // not an OUI-assigned one.
+        // Locally-administered, unicast (bit1 set, bit0 clear); a synthesized
+        // MAC, not an OUI-assigned one.
         id.mac[0] = (id.mac[0] | 0x02) & !0x01;
         id
     }
@@ -178,7 +178,7 @@ impl Identity {
         if o + 4 <= self.sp_uid.len() {
             u32::from_le_bytes(self.sp_uid[o..o + 4].try_into().unwrap())
         } else {
-            0x0000_0001 // past the 96-bit UID: a stable non-zero filler, as before
+            0x0000_0001 // past the 96-bit UID: a stable non-zero filler
         }
     }
 

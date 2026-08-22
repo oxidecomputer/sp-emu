@@ -356,7 +356,7 @@ mod tests {
         // Optional knobs are surfaced as commented example lines, not omitted.
         assert!(text.contains("# mode = "));
         assert!(text.contains("# rot_from = "));
-        // Comments and all, it still migrates + ingests to the defaults.
+        // The template, comments included, migrates and ingests to the defaults.
         let cfg = crate::migrate::migrate(&text).and_then(ingest).unwrap();
         assert_eq!(cfg.flash_path(), "sp-flash.bin");
         assert_eq!(cfg.eth_quantum(), 4096);

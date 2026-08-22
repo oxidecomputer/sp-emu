@@ -132,9 +132,9 @@ impl Mmio for HashCrypt {
 
     fn write(&mut self, off: u32, val: u32) {
         match off {
-            // Start a fresh SHA2-256 hash: MODE=SHA2-256 AND NEW_HASH asserted
+            // Start a fresh SHA2-256 hash: MODE=SHA2-256 and NEW_HASH asserted
             // together (as bootleby writes). A MODE write without NEW_HASH selects
-            // the algorithm without resetting -- we don't model that (the mode is
+            // the algorithm without resetting; that path is not modeled (the mode is
             // implicitly SHA-256), so such writes are ignored rather than restarting.
             REG_CTRL if val & MODE_MASK == MODE_SHA2_256 && val & NEW_HASH != 0 => self.start(),
             REG_INDATA => self.feed(val),
@@ -172,7 +172,7 @@ mod tests {
             .collect()
     }
 
-    /// Reference SHA-256 over the words' little-endian encodings -- the byte order
+    /// Reference SHA-256 over the words' little-endian encodings, the byte order
     /// the engine consumes INDATA in.
     fn reference_digest(msg: &[u32]) -> Vec<u8> {
         let mut r = Sha256::new();

@@ -5,7 +5,7 @@
 //! Physical memory + MMIO dispatch for the emulated SoC.
 //!
 //! Three kinds of regions: flat RAM (backed by a `Vec<u8>`), MMIO peripherals
-//! (a `dyn Mmio`), and the STM32H7 flash — its own `crate::flash::Flash` model
+//! (a `dyn Mmio`), and the STM32H7 flash: its own `crate::flash::Flash` model
 //! (program/erase/bank-swap/persistence), routed directly here rather than being
 //! flat RAM. Anything unmapped is logged and returns 0 / is swallowed, so the
 //! trace keeps moving and surfaces unmodeled accesses rather than faulting on
@@ -20,7 +20,7 @@ pub trait Mmio {
     fn read(&mut self, off: u32) -> u32;
     fn write(&mut self, off: u32, val: u32);
     /// Poll for a peripheral interrupt to raise. Returns an IRQ number to set
-    /// pending in the NVIC (consumed — returns it once per event). Default: none.
+    /// pending in the NVIC (consumed: returns it once per event). Default: none.
     fn take_irq(&mut self) -> Option<u16> {
         None
     }
@@ -46,7 +46,7 @@ pub struct Bus {
     pub log_unmapped: bool,
     /// Optional address to log writes to (set via $SP_EMU_WATCH); a debugging aid.
     pub watch: Option<u32>,
-    /// Current instruction PC (set by the CPU each step) — for watch logging.
+    /// Current instruction PC (set by the CPU each step), for watch logging.
     pub cur_pc: u32,
     pub cur_cyc: u64,
     /// Set when the most recent access hit an MMIO device (for the differential
@@ -55,7 +55,7 @@ pub struct Bus {
     /// Set whenever a peripheral device is accessed; lets `collect_irqs` skip the
     /// all-device IRQ poll on instructions that touch no device. Sound because
     /// every modeled device raises its IRQ only in response to an MMIO access
-    /// (TIM16 arming, I2C/SPI transactions) — none autonomously.
+    /// (TIM16 arming, I2C/SPI transactions); none raises one autonomously.
     dev_touched: bool,
     /// When true, record every memory write (for the differential harness to
     /// replay into the reference model, incl. writes from skipped instructions).
@@ -65,10 +65,10 @@ pub struct Bus {
     nvic_en: [u32; 8],
     nvic_pend: [u32; 8],
     nvic_prio: [u8; 256],
-    // PendSV pending bit (SCB ICSR.PENDSVSET) — the kernel pends this to defer a
+    // PendSV pending bit (SCB ICSR.PENDSVSET): the kernel pends this to defer a
     // context switch out of SysTick/interrupt handlers.
     pend_pendsv: bool,
-    // STM32H7 Ethernet MAC/DMA — modeled in the Bus (not as an `Mmio` device)
+    // STM32H7 Ethernet MAC/DMA, modeled in the Bus (not as an `Mmio` device)
     // because the DMA engine must read/write descriptor rings + packet buffers
     // that live in RAM, which only the Bus can reach.
     eth: EthDma,
@@ -78,7 +78,7 @@ pub struct Bus {
     // non-empty (host input is async, outside the dev-touched IRQ poll).
     pub uart_tx: crate::soc::UartQueue, // SP -> host
     pub uart_rx: crate::soc::UartQueue, // host -> SP
-    // TIM5 free-running counter base — the instruction count (`cur_cyc`) at the
+    // TIM5 free-running counter base: the instruction count (`cur_cyc`) at the
     // last CNT reset. See the TIM5 handling in read32/write32.
     tim5_base: u64,
     // TIM5 config registers (CR1/PSC/ARR/...), stored so they read back what
@@ -89,7 +89,7 @@ pub struct Bus {
     /// since an `Mmio` device write cannot reach the Cpu.
     pub reset_pending: bool,
     /// STM32H7 embedded flash + FLASH controller (bank swap, program/erase,
-    /// persistence). Modeled in the Bus — like the Ethernet DMA — because the data
+    /// persistence). Modeled in the Bus (like the Ethernet DMA) because the data
     /// stores that program flash target the memory aperture, which only the Bus
     /// reaches, and must be coordinated with the controller register state. `None`
     /// on cores with no modeled flash (e.g. the RoT core in Phase 1).
@@ -102,8 +102,8 @@ pub struct Bus {
     /// the ROM pointer-graph words on read. See `crate::romapi`.
     pub rom_enabled: bool,
     /// Fold the LPC55 TrustZone secure aliases (flash 0x1000_0000, SRAM 0x3000_0000)
-    /// onto their non-secure images, so real bootleby -- which links at the secure
-    /// aliases -- reaches the same RotFlash + RAM. RoT (bootleby) core only; the
+    /// onto their non-secure images, so real bootleby (which links at the secure
+    /// aliases) reaches the same RotFlash + RAM. RoT (bootleby) core only; the
     /// STM32 SP uses 0x3000_0000 as a distinct SRAM, so this stays off there.
     pub secure_alias: bool,
 }
@@ -150,7 +150,7 @@ const DMAMR: u32 = 0x1000; // DMA mode; SWR (bit0) = soft reset, self-clears
 const DMAISR: u32 = 0x1008; // interrupt summary; dc0is (bit0) = channel-0 interrupt
 const DMACTXDLAR: u32 = 0x1114; // TX descriptor list base (word-aligned address)
 const DMACRXDLAR: u32 = 0x111C; // RX descriptor list base
-const DMACTXDTPR: u32 = 0x1120; // TX tail pointer — writing it kicks the TX DMA
+const DMACTXDTPR: u32 = 0x1120; // TX tail pointer; writing it kicks the TX DMA
 const DMACRXDTPR: u32 = 0x1128; // RX tail pointer
 const DMACTXRLR: u32 = 0x112C; // TX ring length minus 1
 const DMACRXRLR: u32 = 0x1130; // RX ring length minus 1
@@ -182,8 +182,8 @@ const NVIC_HI: u32 = 0xE000_E500;
 // hubris drv-stm32h7-startup (after #2571, "Conscript TIM5 for early boot")
 // builds TIM5 into a 32-bit 1 MHz rolling timer and polls TIM5_CNT for
 // `blocking_delay_micros` during early boot. Unlike every other modeled
-// peripheral — which advances only when the firmware touches it (see the
-// `dev_touched` note above) — this counter must advance on its own, or the
+// peripheral, which advances only when the firmware touches it (see the
+// `dev_touched` note above), this counter must advance on its own, or the
 // early-boot delay loop spins forever and the kernel never starts. sp-emu has
 // no wall clock, but the firmware only ever measures CNT *deltas*, so the
 // counter is driven off the retired-instruction count (`cur_cyc`): one
@@ -367,8 +367,8 @@ impl Bus {
             // BMCR (reg 0): the soft-reset bit (15) self-clears when reset completes;
             // the driver spins on it. Return the stored value with reset cleared.
             (0, 0) => *self.eth.regs.get(&0x1_0000).unwrap_or(&0) as u16 & !0x8000,
-            (0, 2) => 0x0007,  // IDENTIFIER_1  ┐ id = 0x0007_04e2 = VSC8552_ID
-            (0, 3) => 0x04e2,  // IDENTIFIER_2  ┘
+            (0, 2) => 0x0007,  // IDENTIFIER_1: high half of id 0x0007_04e2 = VSC8552_ID
+            (0, 3) => 0x04e2,  // IDENTIFIER_2: low half of the same id
             (1, 23) => 0x0000, // EXTENDED_PHY_CONTROL_4: port>>11 == 0 (base port)
             (1, 25) => 0x29e8, // VERIPHY_CTRL_REG2: 8051 CRC == EXPECTED_CRC -> skip patch
             // MICRO_PAGE: the driver writes a command (bit15=go) and polls until
@@ -461,9 +461,9 @@ impl Bus {
             if tdes3 & (1 << 31) == 0 {
                 continue;
             } // driver owns it: nothing to send
-            self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN — back to the driver
+            self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN: back to the driver
                                                       // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
-                                                      // insert into the following packet. Not a packet itself — don't emit.
+                                                      // insert into the following packet. Not a packet itself; don't emit.
             if tdes3 & (1 << 30) != 0 {
                 if tdes3 & (1 << 16) != 0 {
                     self.eth.pending_vid = Some((tdes3 & 0xFFF) as u16);
@@ -534,7 +534,7 @@ impl Bus {
     }
 
     /// Glue between the ETH DMA and the host network bridge: forward transmitted
-    /// frames out, and inject any frames the bridge has for us. Called
+    /// frames out, and inject any frames the bridge holds for the SP. Called
     /// periodically from the run/gdb loops.
     pub fn pump_eth(&mut self, host: &mut dyn crate::host::HostIo) {
         for f in self.eth_take_tx() {
@@ -542,7 +542,7 @@ impl Bus {
         }
         // Drain the host network into the bridge once, then deliver only as many
         // frames as the RX ring can accept right now. Checking ring space before
-        // popping means a frame is never lost to a full ring — it stays queued in
+        // popping means a frame is never lost to a full ring; it stays queued in
         // the bridge (governed by the bridge's flow-fair backlog cap) and is
         // delivered on a later pump once the SP frees a descriptor.
         host.eth_poll();
@@ -557,7 +557,7 @@ impl Bus {
     }
 
     /// True if the next RX descriptor is owned by the DMA (free for the engine to
-    /// write) — i.e. the ring can accept one more frame. Mirrors the OWN-bit check
+    /// write), i.e. the ring can accept one more frame. Mirrors the OWN-bit check
     /// in `eth_rx_inject` so the pump can gate delivery without popping a frame.
     fn eth_rx_has_space(&mut self) -> bool {
         let base = self.eth_reg(DMACRXDLAR);
@@ -709,9 +709,10 @@ impl Bus {
     }
 
     pub fn collect_irqs(&mut self) {
-        // Poll devices only if one was accessed since the last collect — no modeled
-        // device raises an IRQ without an MMIO access, so this is exact, not lossy,
-        // and skips ~15-20 take_irq() calls on every compute-only instruction.
+        // Poll devices only if one was accessed since the last collect. No modeled
+        // device raises an IRQ without an MMIO access, so gating on dev_touched
+        // misses no event and skips ~15-20 take_irq() calls on every compute-only
+        // instruction.
         if self.dev_touched {
             self.dev_touched = false;
             let mut raised = [0u16; 8];
@@ -744,7 +745,7 @@ impl Bus {
         }
         // UART7 (host-sp-comms) RX: like the eth DMA, host input is asynchronous
         // (not gated by the dev-touched poll). Keep IRQ 82 pending while a host
-        // byte waits — level-triggered, matching the H7 FIFO RXFNE the task
+        // byte waits: level-triggered, matching the H7 FIFO RXFNE the task
         // enables; NVIC enable gates actual delivery, and the task's ISR drains
         // RDR (popping `uart_rx`), which clears it.
         if !self.uart_rx.borrow().is_empty() {
@@ -837,8 +838,8 @@ impl Bus {
 
     pub fn read32(&mut self, addr: u32) -> u32 {
         let addr = self.fold(addr);
-        // Flash aperture (XIP): the hottest path — instruction fetch and constant
-        // loads — so it is checked first. A range test + one XOR (bank remap) +
+        // Flash aperture (XIP): the hottest path (instruction fetch and constant
+        // loads), so it is checked first. A range test + one XOR (bank remap) +
         // slice read, no device dispatch.
         if (FLASH_WIN_LO..FLASH_WIN_HI).contains(&addr) {
             if let Some(f) = self.flash.as_ref() {
@@ -1101,8 +1102,8 @@ mod tests {
 
     // Stands in for soc's RegFile catch-all (store/return over the whole
     // peripheral space). TIM5 must be served by the Bus interception, not this
-    // device — the original bug was TIM5_CNT falling through to the catch-all and
-    // reading back whatever was last written, so it never incremented.
+    // device: a TIM5_CNT read that falls through to the catch-all reads back
+    // whatever was last written and never increments.
     struct Sentinel;
     impl Mmio for Sentinel {
         fn name(&self) -> &str {
@@ -1162,11 +1163,10 @@ mod tests {
         assert_eq!(bus.read32(TIM5_CNT), 100);
     }
 
-    // The regression that motivated the fix: drv-stm32h7-startup's
-    // RollingTimer::blocking_delay_micros captures a start CNT, then spins reading
-    // CNT until the wrapping delta reaches the requested micros. With a
-    // non-advancing CNT (the old catch-all) this loop never exits and early boot
-    // hangs forever. Here it must terminate.
+    // drv-stm32h7-startup's RollingTimer::blocking_delay_micros captures a start
+    // CNT, then spins reading CNT until the wrapping delta reaches the requested
+    // micros. With a non-advancing CNT (a catch-all fall-through) the loop never
+    // exits and early boot hangs forever, so it must terminate here.
     #[test]
     fn tim5_blocking_delay_terminates() {
         let mut bus = bus_with_catchall();
@@ -1184,7 +1184,7 @@ mod tests {
             }
             assert!(
                 iters < 10_000,
-                "delay loop did not terminate — CNT not advancing"
+                "delay loop did not terminate; CNT not advancing"
             );
         }
         assert!(iters >= micros);

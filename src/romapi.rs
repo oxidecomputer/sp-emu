@@ -12,9 +12,9 @@
 //!
 //! sp-emu normally skips the boot ROM and jumps straight to the Hubris image, so
 //! that path can't run. This module synthesizes just enough of the pointer graph
-//! for the guest to reach a *trap address*, then services the call in host code
-//! with `lpc55_sign::verify::verify_image` (the same verifier hubtools uses) —
-//! cert chain to the RKTH in CMPA + RSA/SHA-256 — instead of hand-rolling crypto.
+//! for the guest to reach a trap address, then services the call in host code
+//! with `lpc55_sign::verify::verify_image` (the same verifier hubtools uses):
+//! cert chain to the RKTH in CMPA + RSA/SHA-256, not hand-rolled crypto.
 //!
 //! Gated by `config::rot_rom`; when off, none of this is installed and the guest
 //! never branches here. Loading and running real bootleby is a follow-up.
@@ -32,8 +32,8 @@ const LPC55_ROM_TABLE: u32 = 0x1300_10f0;
 const BOOTLOADER_TREE_SKBOOT_OFFSET: u32 = 10 * 4;
 const SKBOOT_PTR_ADDR: u32 = LPC55_ROM_TABLE + BOOTLOADER_TREE_SKBOOT_OFFSET;
 
-/// LPC55 boot-ROM image window (hubris `lpc55-romapi::LPC55_BOOT_ROM`, 64 KiB). We
-/// place the synthesized `SKBootFns` + trap thunks inside it.
+/// LPC55 boot-ROM image window (hubris `lpc55-romapi::LPC55_BOOT_ROM`, 64 KiB).
+/// The synthesized `SKBootFns` + trap thunks live inside it.
 const LPC55_BOOT_ROM: u32 = 0x0300_0000;
 const LPC55_BOOT_ROM_SIZE: u32 = 0x0001_0000;
 const SKBOOT_FNS_ADDR: u32 = LPC55_BOOT_ROM;
@@ -58,7 +58,7 @@ const NXP_IMAGE_LENGTH_OFFSET: u32 = 0x20;
 /// after its result is computed. The pre-kernel calls the ROM with interrupts
 /// enabled; parking (rather than returning in one step) lets the run loop keep
 /// delivering SysTick/NVIC between steps, so a long verify can't starve them.
-/// Rough model — the value only needs to span at least one SysTick period.
+/// Rough model; the value only needs to span at least one SysTick period.
 const SETTLE_STEPS: u32 = 1024;
 
 /// Resumable state of an in-flight ROM call, held on the `Cpu` so it survives an
@@ -102,8 +102,8 @@ pub fn is_trap(pc: u32) -> bool {
 /// so interrupts flow; other ROM entries return immediately via `LR`.
 pub fn rom_dispatch(cpu: &mut Cpu, bus: &mut Bus) {
     // Only AUTH_TRAP drives the settle state machine. The HASHCRYPT irq handler
-    // (and any other/unknown trap) returns immediately via LR and must NOT touch
-    // `cpu.rom_call`: a foreign trap taken *during* an in-flight AUTH_TRAP settle
+    // (and any other/unknown trap) returns immediately via LR and must not touch
+    // `cpu.rom_call`: a foreign trap taken during an in-flight AUTH_TRAP settle
     // would otherwise be absorbed by a Settling arm and corrupt both calls' returns.
     if cpu.pc != AUTH_TRAP {
         cpu.pc = cpu.r[14] & !1;
@@ -183,7 +183,7 @@ fn verify_slot(bus: &Bus, start: u32) -> Result<(), VerifyError> {
     let f = bus.rot_flash().ok_or(VerifyError::NoRotFlash)?;
     // bootleby passes the image's link address, which may be the TrustZone secure
     // flash alias; fold it onto the modeled non-secure window that `RotFlash` indexes.
-    // (The Bus folds this for guest accesses, but here we read `RotFlash` directly.)
+    // (The Bus folds this for guest accesses, but this path reads `RotFlash` directly.)
     let start = start & !crate::mem::LPC55_SECURE_ALIAS_BIT;
     // Total signed length from the NXP image header; fall back to the whole window
     // from `start` if the field is implausible.
@@ -210,7 +210,8 @@ mod tests {
         assert_eq!(rom_read32(SKBOOT_PTR_ADDR), Some(SKBOOT_FNS_ADDR));
         assert_eq!(rom_read32(SKBOOT_FNS_ADDR), Some(AUTH_TRAP | 1));
         assert_eq!(rom_read32(SKBOOT_FNS_ADDR + 4), Some(HASHCRYPT_TRAP | 1));
-        // Unmodeled words in the ROM windows read as 0; elsewhere we don't own it.
+        // Unmodeled words in the ROM windows read as 0; addresses outside them
+        // are not owned by this module.
         assert_eq!(rom_read32(LPC55_ROM_TABLE), Some(0));
         assert_eq!(rom_read32(0x2000_0000), None);
         // The authenticate entry (with the Thumb bit cleared by BLX) is a trap.

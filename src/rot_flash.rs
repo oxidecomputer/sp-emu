@@ -4,8 +4,7 @@
 
 //! LPC55S69 RoT flash: the flash array plus a real flash-controller command
 //! engine, so unmodified RoT Hubris can erase, program, and read its flash the
-//! way it does on silicon. Replaces the flat `add_ram` window and the read-only
-//! `LpcFlash` stub (which acknowledged erase/program but changed nothing).
+//! way it does on silicon.
 //!
 //! Key behaviors modeled (UM11126, lib/lpc55-flash):
 //!
@@ -40,7 +39,7 @@ use anyhow::Result;
 use std::path::Path;
 
 pub const BASE: u32 = 0x0000_0000;
-pub const SIZE: usize = 0x0010_0000; // the 1 MB window the add_ram used to cover
+pub const SIZE: usize = 0x0010_0000; // 1 MB window: flash array plus the protected flash region
 pub const PAGE: usize = 512;
 pub const WORD: usize = 16;
 const WORDS_PER_PAGE: usize = PAGE / WORD; // 32
@@ -116,12 +115,12 @@ const ST_ECC: u32 = 1 << 3;
 // ---- protected flash region seed templates -----------------------------------
 //
 // The CMPA and CFPA page layouts come from `lpc55_areas` (the Oxide signing
-// tooling's authoritative packed structs), so we set named fields rather than
-// hand-rolling byte offsets. Field values are captured from a real grapefruit RoT.
+// tooling's authoritative packed structs), so named fields are set rather than
+// hand-rolled byte offsets. Field values are captured from a real grapefruit RoT.
 // The CFPA carries a SHA-256 over its own first 480 bytes (byte 0x1E0); to_vec()
-// packs but does not seal, so we compute that digest here (as lpc55_sign does).
+// packs but does not seal, so that digest is computed here (as lpc55_sign does).
 
-/// The Bart keyset root-key hash (CMPA `rotkh`). A hash of the *public* root keys,
+/// The Bart keyset root-key hash (CMPA `rotkh`). A hash of the public root keys,
 /// shared by every Bart-signed device (keyset identity, not device-unique).
 const RKTH_BART: [u8; 32] = [
     0x84, 0x33, 0x2e, 0xf8, 0x27, 0x9d, 0xf8, 0x7f, 0xbb, 0x75, 0x9d, 0xc3, 0x86, 0x6c, 0xbc, 0x50,
@@ -175,7 +174,7 @@ fn seed_cfpa(pref_b: bool) -> [u8; PAGE] {
 }
 
 /// Load a real 512-byte CMPA/CFPA page from an override file (SP_EMU_ROT_CMPA/CFPA),
-/// used to run real bootleby whose PFR validation is stricter than our synthesized
+/// used to run real bootleby whose PFR validation is stricter than the synthesized
 /// pages. Fails loudly on an unreadable file or a wrong-sized page.
 fn load_page_override(path: Option<&str>) -> Result<Option<[u8; PAGE]>> {
     let Some(path) = path else {
@@ -232,9 +231,9 @@ impl RotFlash {
         };
 
         // Persisted state takes precedence over `image` and the CMPA/CFPA/bootleby
-        // overrides, so be explicit about which path was taken -- a stale backing
-        // file silently shadowing them is otherwise a confusing surprise. Setting
-        // SP_EMU_ROT_FRESH removes all doubt by forcing a re-seed.
+        // overrides, so be explicit about which path was taken; a stale backing
+        // file can otherwise silently shadow them. Setting SP_EMU_ROT_FRESH
+        // removes all doubt by forcing a re-seed.
         let persisted = Path::new(path).exists();
         let use_persisted = persisted && !cfg.rot_fresh();
         if use_persisted {
@@ -512,10 +511,10 @@ impl RotFlash {
             }
             // "Blank" reflects a page's programmed state, not its byte content: on
             // real flash a programmed word carries ECC, so a page written with 0xFF
-            // data still reads as *not* blank. (A pure content check wrongly calls a
-            // programmed-but-0xFF page blank -- e.g. a firmware image with a 0xFF run,
-            // which broke bootleby's per-page is_programmed scan.) sp-emu tracks
-            // programmed-ness per page in the erased bitset.
+            // data still reads as not blank. A pure content check wrongly calls a
+            // programmed-but-0xFF page blank (e.g. a firmware image with a 0xFF
+            // run), which breaks bootleby's per-page is_programmed scan. sp-emu
+            // tracks programmed-ness per page in the erased bitset.
             if !self.is_erased(base / PAGE) {
                 self.dataw[0] = w;
                 self.status |= ST_DONE | ST_FAIL; // not blank -> FAIL (== success, per UM)
@@ -582,7 +581,7 @@ impl RotFlash {
         &self.mem[o..end]
     }
 
-    /// The PERSISTENT boot-preferred slot from the active CFPA (bit0 of the Oxide
+    /// The persistent boot-preferred slot from the active CFPA (bit0 of the Oxide
     /// boot-preference word, `customer_defined0`: clear = Slot A, set = Slot B).
     /// This is only one of bootleby's inputs. Real bootleby also verifies the
     /// signature of each image (A and B), honors the transient boot preference held

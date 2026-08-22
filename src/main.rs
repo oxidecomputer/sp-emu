@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! sp-emu — a native-Rust emulated Service Processor.
+//! sp-emu: a native-Rust emulated Service Processor.
 //!
 //! Models an STM32H753 SP as an empty board with two flash slots (A/B) backed
 //! by a persistent host file. Flash a Hubris image into a slot once, then
@@ -560,7 +560,7 @@ fn cmd_unpack(args: &[String]) -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    // run [a|b] [max] — max 0 serves forever (the preferred serve mode for
+    // run [a|b] [max]: max 0 serves forever (the preferred serve mode for
     // sp-test): the SP over the MGS bridge + Glasgow SWD probe, plus the
     // in-process/shared RoT when SP_EMU_ROT_FLASH/SERVICE is set. A nonzero max
     // is a bounded, SP-only batch run.
@@ -592,7 +592,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
         }
     }
     if max == 0 {
-        // Serve forever. SP preboot 0 — the serve loop advances the SP as MGS
+        // Serve forever. SP preboot 0: the serve loop advances the SP as MGS
         // traffic arrives (the RoT, if any, preboots per SP_EMU_ROT_PREBOOT).
         return serve_forever(slot, slot_given, 0);
     }
@@ -608,7 +608,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     };
     if !flash::slot_programmed(&nvm, boot_slot)? {
         bail!(
-            "slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
+            "slot {} is empty; flash it first: sp-emu flash {} <image.bin>",
             boot_slot.to_ascii_uppercase(),
             boot_slot
         );
@@ -621,7 +621,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     boot(&nvm, swap_override, max)
 }
 
-/// gdb [a|b] [preboot] — boot a slot to steady state, then run the serve loop
+/// gdb [a|b] [preboot]: boot a slot to steady state, then run the serve loop
 /// (MGS bridge + Glasgow SWD probe, plus the in-process RoT when configured).
 /// Legacy alias for `run <slot> 0`; kept for the `preboot`-count argument.
 fn cmd_gdb(args: &[String]) -> Result<()> {
@@ -663,7 +663,7 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     };
     if !flash::slot_programmed(&nvm, boot_slot)? {
         bail!(
-            "slot {} is empty — flash it first: sp-emu flash {} <image.bin>",
+            "slot {} is empty; flash it first: sp-emu flash {} <image.bin>",
             boot_slot.to_ascii_uppercase(),
             boot_slot
         );
@@ -791,14 +791,14 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // Boot-ROM API emulation (SP_EMU_ROT_ROM): install the synthesized ROM pointer
     // graph and trap `skboot_authenticate` so the RoT pre-kernel's
     // authenticate_image() runs the real signature check. Off by
-    // default -- the direct-boot path above is unchanged.
+    // default; the direct-boot path above is unchanged.
     if config::get().rot_rom() {
         cpu.rom_traps = true;
         bus.rom_enabled = true;
         eprintln!("[rot] boot-ROM API emulation enabled (skboot_authenticate)");
     }
     // Bootleby mode (SP_EMU_ROT_BOOTLEBY): load real bootleby at the flash base and
-    // boot IT instead of jumping to the image; bootleby does genuine A/B selection
+    // boot it instead of jumping to the image; bootleby does genuine A/B selection
     // via the boot-ROM skboot_authenticate shim. It links at the TrustZone secure
     // aliases (flash 0x1000_0000, SRAM 0x3000_0000), so fold those onto the modeled
     // non-secure memory, and turn on the boot-ROM API it calls.
@@ -897,10 +897,10 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
 /// the task's expected load) produced by the hubris `dice-handoff-gen` tool.
 /// Gated on `SP_EMU_ROT_DICE=<dir with dice-certs.bin, dice-alias.bin>`.
 ///
-/// Prototype (Approach A): a deterministic self-signed chain with a stand-in FWID
-/// -- enough for get-certs to return a parseable chain. Approach B (run the real
-/// stage0/bootleby so the identity binds to the actual FWID) is future work; see
-/// doc/dice-handoff.md.
+/// The deposited chain is deterministic and self-signed with a stand-in FWID:
+/// enough for get-certs to return a parseable chain, but the identity does not
+/// bind to the running image's actual FWID (that would take running the real
+/// stage0/bootleby; see doc/dice-handoff.md).
 fn publish_dice_handoff(bus: &mut Bus) {
     let Some(dir) = config::get().rot_dice() else {
         return;
@@ -931,7 +931,7 @@ fn publish_dice_handoff(bus: &mut Bus) {
     }
 }
 
-/// rot-serve <listen-addr> <oxide-rot-1 image|archive> — run one shared RoT that
+/// rot-serve <listen-addr> <oxide-rot-1 image|archive>: run one shared RoT that
 /// answers sprot request frames over a socket (frame-level IPC), so every SP can
 /// share it instead of each emulating its own RoT core. See `rot_service`.
 fn cmd_rot_serve(args: &[String]) -> Result<()> {
@@ -1002,7 +1002,7 @@ fn cmd_rot(args: &[String]) -> Result<()> {
 /// Build the SoC, install the flash model, and reset the CPU from the vector
 /// table. Shared by `run` and `gdb`. `swap_override` forces the effective bank
 /// swap (Some(false)=bank1/slot A, Some(true)=bank2/slot B); None honors the
-/// persisted NV swap. The reset vector is always read from 0x0800_0000 — which
+/// persisted NV swap. The reset vector is always read from 0x0800_0000; which
 /// physical bank that is depends on the swap, exactly as on silicon.
 fn setup(image: &[u8], swap_override: Option<bool>) -> Result<(Cpu, Bus)> {
     let mut bus = Bus::new();
@@ -1036,7 +1036,7 @@ fn setup(image: &[u8], swap_override: Option<bool>) -> Result<(Cpu, Bus)> {
     let mut cpu = Cpu::new();
     cpu.reset(initial_sp, reset_pc);
 
-    // Measurement-handoff token (RFD 568) at initial boot — see the helper.
+    // Measurement-handoff token (RFD 568) at initial boot; see the helper.
     deposit_skip_token_if_debugger(&mut bus);
     Ok((cpu, bus))
 }
@@ -1051,9 +1051,9 @@ const RFD568_SKIP_TOKEN: u32 = 0x9f38_bd71;
 /// firmware spins resetting itself until it finds a valid token at DTCM base:
 ///
 /// 1. RoT present: the RoT measures the SP and deposits VALID (real dance).
-/// 2. No RoT, debugger present (default): we act as the debugger — as humility
-///    does — and deposit SKIP so the SP boots. Applied on warm resets too, so a
-///    firmware-update reboot completes without a RoT.
+/// 2. No RoT, debugger present (default): sp-emu stands in for the debugger
+///    (as humility does) and deposits SKIP so the SP boots. Applied on warm
+///    resets too, so a firmware-update reboot completes without a RoT.
 /// 3. No RoT, no debugger (SP_EMU_ROT_MEASURE): deposit nothing, so a bare SP
 ///    correctly reset-loops until its counter exhausts.
 ///
@@ -1168,8 +1168,8 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
             cpu.flush_decode_cache();
             // Keep the RFD 568 measurement handoff consistent across the reset:
             // by default sp-emu stands in for the humility debugger and re-deposits
-            // the SKIP token (so a firmware-update reboot boots fast, as voxel
-            // expects); SP_EMU_ROT_MEASURE opts out for hardware-faithful behavior
+            // the SKIP token (control-plane update flows expect a fast reboot);
+            // SP_EMU_ROT_MEASURE opts out for hardware-faithful behavior
             // (a bare SP then reset-loops to counter exhaustion, or a RoT measures).
             deposit_skip_token_if_debugger(&mut bus);
             bus.reset_pending = false;

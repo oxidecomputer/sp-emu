@@ -4,15 +4,16 @@
 
 //! Model of the LPC55 PUF (Physically Unclonable Function) key store, enough for
 //! the RoT image's `dice-self` startup (`lib/lpc55-rot-startup/src/dice.rs`) to
-//! derive its DICE identity and write the cert handoff -- so `faux-ipcc get-certs`
+//! derive its DICE identity and write the cert handoff, so `faux-ipcc get-certs`
 //! returns a real chain instead of `AttestNoCerts`.
 //!
 //! The `lpc55-puf` driver runs a small command engine: GENERATEKEY streams a
 //! keycode out of CODEOUTPUT; GETKEY feeds that keycode back in through CODEINPUT
 //! and streams the derived key out of KEYOUTPUT, polling STAT for the busy/avail
-//! handshake. We model that handshake and return a *stable* seed from GETKEY, so
-//! the DICE identity is deterministic across boots -- like a real device's fixed
-//! UDS. This is not a real PUF: there is no unclonable secret. The seed is the
+//! handshake. The model implements that handshake and returns a stable seed from
+//! GETKEY, so the DICE identity is deterministic across boots, like a real
+//! device's fixed UDS. This is not a real PUF: there is no unclonable secret.
+//! The seed is the
 //! per-instance UDS from `crate::identity`, so each sp-emu instance derives a
 //! distinct DICE identity (a `--seed` selects it; see src/identity.rs).
 //!
@@ -24,7 +25,7 @@
 //! GENERATEKEY -> GETKEY -> `block_index(1)` -> `lock_indices_low`, then
 //! `puf_check` requires index 1 to be blocked+locked. So IDXBLK_L starts with
 //! index 1 unblocked/unlocked and the driver's own read-modify-write blocks and
-//! locks it -- unlike the old stub, which pre-blocked it and made GETKEY fail.
+//! locks it; pre-blocking it would make GETKEY fail.
 
 use crate::mem::Mmio;
 use std::collections::{HashMap, VecDeque};
@@ -56,7 +57,7 @@ const STAT_ERROR: u32 = 1 << 2;
 const STAT_KEYOUTAVAIL: u32 = 1 << 5;
 const STAT_CODEINREQ: u32 = 1 << 6;
 const STAT_CODEOUTAVAIL: u32 = 1 << 7;
-// ALLOW: enroll(0), start(1), setkey(2), getkey(3) -- report all permitted.
+// ALLOW: enroll(0), start(1), setkey(2), getkey(3); report all permitted.
 const ALLOW_ALL: u32 = 0x0F;
 
 pub struct Puf {

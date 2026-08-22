@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFileV1 {
-    /// The schema version. `Some(1)` in a well-formed v1 file; ingest checks it.
+    /// The schema version. `Some(1)` in a well-formed v1 file; version routing
+    /// (`peek_version`/`migrate`) checks it, ingest ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Op::is_empty")]

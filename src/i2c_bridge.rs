@@ -2,27 +2,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! I2C bridge - tee (SNIFF) or DELEGATE the emulated SP's I2C transactions to a
+//! I2C bridge: tee (SNIFF) or DELEGATE the emulated SP's I2C transactions to a
 //! local process. Mirrors sp-emu's socket-bridge idiom (`bridge.rs`,
 //! `rot_service.rs`). Two modes, picked by env:
 //!
-//!  - **SNIFF** (`SP_EMU_I2C_BRIDGE=<addr>`) - one-way: every transaction is teed
+//!  - SNIFF (`SP_EMU_I2C_BRIDGE=<addr>`) is one-way: every transaction is teed
 //!    as an annotated human-readable line; the SP's built-in device model still
 //!    answers. `sp-emu i2c-sniff <addr>` is the pretty-printing listener.
-//!  - **DEVICE / DELEGATE** (`SP_EMU_I2C_DEVICE=<addr>`) - request/response: a
+//!  - DEVICE / DELEGATE (`SP_EMU_I2C_DEVICE=<addr>`) is request/response: a
 //!    local process answers reads as the device(s). sp-emu streams START/write
 //!    observations and, per read, sends a query the server replies to with a byte
 //!    (or `-` to defer to the built-in model, so the SP still boots). Injects
-//!    arbitrary device behavior - a chosen sensor value, a custom/corrupt EEPROM
-//!    image - to exercise how Hubris copes. `sp-emu i2c-device <addr> [spec...]`
+//!    arbitrary device behavior (a chosen sensor value, a custom/corrupt EEPROM
+//!    image) to exercise how Hubris copes. `sp-emu i2c-device <addr> [spec...]`
 //!    is a scriptable example server.
 //!
-//! DEVICE wire protocol (newline-delimited text - a device model may be written
+//! DEVICE wire protocol (newline-delimited text, so a device model may be written
 //! in any language; one connection carries all four buses):
 //! ```text
 //!   sp-emu -> server:  S <bus> <addr> <R|W>         transaction start
 //!                      W <bus> <addr> <byte>        write byte (1st = reg pointer)
-//!                      R <bus> <addr> <reg> <idx>   READ query (response wanted)
+//!                      R <bus> <addr> <reg> <idx>   read query (response wanted)
 //!   server -> sp-emu:  0xNN     the read value   |   -   defer to the built-in model
 //! ```
 
@@ -140,7 +140,7 @@ impl I2cBridge {
     }
 
     /// DEVICE only: ask the server for a read byte. `None` = defer to the built-in
-    /// model (server replied `-`, or any error/timeout - fail safe to internal).
+    /// model (server replied `-`, or any error/timeout; fail safe to internal).
     pub fn on_read(&self, bus: u8, addr: u8, reg: u8, idx: u16) -> Option<u8> {
         let mut g = self.0.borrow_mut();
         if !matches!(g.mode, Mode::Device) {
@@ -201,7 +201,7 @@ fn device_name(addr: u8) -> &'static str {
     }
 }
 
-/// `sp-emu i2c-sniff <listen-addr>` - listen + pretty-print the SNIFF trace,
+/// `sp-emu i2c-sniff <listen-addr>`: listen + pretty-print the SNIFF trace,
 /// annotating known device addresses. Loops across emulator relaunches.
 pub fn serve(addr: &str) -> anyhow::Result<()> {
     let l = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
@@ -237,7 +237,7 @@ pub fn serve(addr: &str) -> anyhow::Result<()> {
 }
 
 /// A scriptable device-model override: by (addr, reg) -> 16-bit value (served
-/// big-endian, hi byte at idx 0 - matching `soc::I2c::device_reg`), or by addr ->
+/// big-endian, hi byte at idx 0, matching `soc::I2c::device_reg`), or by addr ->
 /// a byte image (an EEPROM, served at `reg + idx`).
 enum Override {
     Reg { addr: u8, reg: u8, val: u16 },
@@ -266,7 +266,7 @@ fn parse_override(s: &str) -> anyhow::Result<Override> {
     })
 }
 
-/// `sp-emu i2c-device <listen-addr> [spec...]` - an example DELEGATE device
+/// `sp-emu i2c-device <listen-addr> [spec...]`: an example DELEGATE device
 /// server. Answers `R` queries from the given overrides (defers everything else
 /// to the emulator's built-in model with `-`), logging each injected read so the
 /// SP's consumption of the values is visible. Specs:

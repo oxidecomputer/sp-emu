@@ -78,8 +78,8 @@ mod tests {
 
     #[test]
     fn newer_version_peeks_cleanly_past_unknown_sections() {
-        // The whole point of the tolerant probe: a file one version ahead, with
-        // sections this build has never seen, still reports its version.
+        // The tolerant probe's contract: a file one version ahead, with sections
+        // this build has never seen, still reports its version.
         let text = format!(
             "schema_version = {}\n[unknown_future_section]\nx = 1\n",
             CURRENT + 1

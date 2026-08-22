@@ -8,8 +8,6 @@
 //! The debug transport is the Glasgow SWD probe (`crate::glasgow`): a stock
 //! humility (probe-rs) attaches to it via a `20b7:9db1:tcp:127.0.0.1:<port>`
 //! selector, which drives halt/run/step/read/write over an emulated SWD DP/AP.
-//! The older GDB-RSP (`-p ocdgdb`) and OpenOCD (`-p ocd`) transports this module
-//! used to serve were dropped once humility removed those probe backends.
 //!
 //! Between connections the emulator keeps running, so time advances across a
 //! series of humility commands, and the MGS bridge (`crate::bridge`) stays live
@@ -546,7 +544,7 @@ pub fn serve(
     );
 
     // Production/in-zone mode (SP_EMU_NO_DEBUG): skip the SWD debug listener
-    // entirely — MGS only needs the bridge UDP. Otherwise bind it.
+    // entirely; MGS only needs the bridge UDP. Otherwise bind it.
     // Per-instance SWD ports so every sp-emu in a shared switch zone is debuggable
     // simultaneously: offset by the bridge port (33300->0, 33310->10, ...). The SP
     // probe is 4444 + off; the RoT probe (below) is 4544 + off. Pair with the
@@ -558,7 +556,7 @@ pub fn serve(
         .map(|p| p.wrapping_sub(33300))
         .unwrap_or(0);
     let listeners = if crate::config::get().no_debug() {
-        eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG) — serving the bridge only");
+        eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG); serving the bridge only");
         None
     } else {
         let swd_port = 4444u16.wrapping_add(swd_off);
@@ -569,7 +567,7 @@ pub fn serve(
         Some(swd_l)
     };
     // Second Glasgow SWD probe bound to the in-process RoT core, so humility can
-    // attach to the RoT (ringbuf/hiffy/tasks/halt) on the SAME run as the SP probe.
+    // attach to the RoT (ringbuf/hiffy/tasks/halt) on the same run as the SP probe.
     // The RoT probe is the RoT's own debug port; attaching halts the RoT (there is
     // no SP-side JTAG_DETECT analog to assert). Only when an in-process RoT exists.
     let rot_listener = if crate::config::get().no_debug() || !has_rot {
@@ -638,7 +636,7 @@ pub fn serve(
     // sprot coupling state: the RoT's tick_events at the last iteration,
     // to compute per-iteration RoT elapsed-time delta. CREDIT_CAP bounds the SP's
     // owed-tick bucket so a stuck-true request_in_flight can't accumulate unbounded
-    // credit (a few thousand ticks = a few seconds; not a wedge cap -- the
+    // credit (a few thousand ticks = a few seconds; not a wedge cap: the
     // request_in_flight gate handles wedges).
     let mut prev_rot_ticks = 0u64;
     let mut prev_req_dbg = false; // coupledbg: edge-detect request_in_flight for the trace
@@ -729,7 +727,7 @@ pub fn serve(
         // interrupts on a halted core.
         //
         // When the RoT is running an injected program under debug (C_DEBUGEN set, not
-        // halted -- i.e. endoscope after the RoT resumed it), the SP runs endoscope. With
+        // halted: endoscope after the RoT resumed it), the SP runs endoscope. With
         // coupling on, use a bounded chunk so the RoT interleaves; the RoT block below
         // freezes the RoT's clock and advances it by the SP's endoscope progress, so the
         // RoT records a realistic halt time. Otherwise sprint in one shot so the SP halts
@@ -795,9 +793,9 @@ pub fn serve(
             if cpu.idle_skip > 0 {
                 break;
             }
-            // sprot flow control lives in the SPI master itself now: with a live
-            // RoT thread, TXDR blocks on RoT progress (sprot.rs) instead of the
-            // old quantum-interleave breaks here.
+            // sprot flow control lives in the SPI master itself: with a live
+            // RoT thread, TXDR blocks on RoT progress (sprot.rs), so no
+            // quantum-interleave break is needed here.
             // Flush the moment a reply is queued: the round-trip then costs ~one
             // pump instead of the rest of the quantum (matters most under load,
             // when the SP never goes idle so this is the only early break).
@@ -830,7 +828,7 @@ pub fn serve(
         bus.pump_eth(host);
         // host-sp-comms (UART7 / IPCC + host console): drain the SP's TX to the
         // host and feed host input into the SP's RX. Pumped here (not cycle-gated)
-        // so it runs even on the idle path — a host byte injects into uart_rx,
+        // so it runs even on the idle path: a host byte injects into uart_rx,
         // collect_irqs pends IRQ 82, and the idle SP wakes (otherwise an idle WFI
         // would never see the RX and the channel would deadlock).
         bus.pump_uart(host);
@@ -840,7 +838,7 @@ pub fn serve(
         // while the RoT works, turning a sprot round-trip (read-cmpa, rot_boot_info)
         // into seconds. Sleep only when both cores are quiescent, which also keeps
         // the two-core instance's idle CPU low so its timeshare priority doesn't
-        // decay (the cause of the multi-second `voxel sp state` latency).
+        // decay.
         let mut rot_busy = false;
         if has_rot {
             // Hand a self-reset edge to the RoT thread (it pends its own PINT),
@@ -895,8 +893,8 @@ pub fn serve(
             // RoT's handler, causing a retry that desyncs the exchange.
             cpu.tick_frozen = sprot_couple && req_in_flight && !cpu.halted;
             // Endoscope coupling: while the SP runs endoscope under debug, the RoT's
-            // tick is frozen and advanced only by the SP's elapsed endoscope time --
-            // SP cycle delta / SP clock divisor, published as ms credit.
+            // tick is frozen and advanced only by the SP's elapsed endoscope time
+            // (SP cycle delta / SP clock divisor, published as ms credit).
             let now_endo = endoscope_couple && cpu.debug_en && !cpu.halted;
             shared.endo_active.store(now_endo, Ordering::Relaxed);
             let d_sp_cyc = cpu.cycles.saturating_sub(prev_sp_cycles);
@@ -945,7 +943,7 @@ pub fn serve(
             // The RoT released ROT_TO_SP_RESET_L (PIO0_13 low->high) in
             // `sp_reset_leave`: pulse the SP's reset through its debug port. Done
             // after draining the SWD link so the DHCSR/DEMCR writes that arm the
-            // vector catch are already applied to `sp_swdp` -- the SP then halts at
+            // vector catch are already applied to `sp_swdp`; the SP then halts at
             // its reset vector (DFSR.VCATCH), which is what reset_into_debug_halt
             // waits for before injecting endoscope.
             let sp_reset_released = crate::sprot::link()
@@ -956,9 +954,9 @@ pub fn serve(
             }
             // sprot SysTick coupling: while the SP is blocked on an sprot request
             // the RoT has accepted (request_in_flight), advance the SP's SysTick by
-            // the RoT's elapsed 1ms tick events (1:1 -- both kernels tick at 1ms)
+            // the RoT's elapsed 1ms tick events (1:1; both kernels tick at 1ms)
             // so the SP's SysTick-paced sprot timeout counts down at the true
-            // RoT-relative rate. Gate strictly on request_in_flight (NOT rot_busy,
+            // RoT-relative rate. Gate strictly on request_in_flight (not rot_busy,
             // which a wedge latches true via ssa) and skip while the SP is
             // debug-halted (its time is genuinely frozen then). A wedged RoT never
             // sets request_in_flight, so the SP falls to the normal throttle and
@@ -1012,7 +1010,7 @@ pub fn serve(
             }
         } else if let Some(client) = rot_client.as_mut() {
             // Shared-RoT IPC path: no in-process RoT core. Act as the SP's link
-            // peer — accumulate the request the SP clocks out, ship it to the
+            // peer: accumulate the request the SP clocks out, ship it to the
             // shared rot-service on CS-deassert, stuff the reply into `miso` and
             // raise rot-irq (the EXTI block below wakes the SP). The 16-byte TX FIFO
             // requires draining `mosi` as the SP clocks, or a >16B request caps.
@@ -1049,12 +1047,10 @@ pub fn serve(
                     // reply bytes, so the next request the SP clocks (e.g. the
                     // caboose's multi-step follow-up read) is captured whole.
                     //
-                    // Keying end-of-transaction on `miso.is_empty()` was a bug: if
-                    // the SP left even one reply byte unread, `awaiting_reply` stuck
-                    // true and the head of the next request got eaten by the phase-2
-                    // `mosi.clear()` above -> a truncated request -> the RoT never
-                    // sees a complete frame and grinds in its TX loop forever. The
-                    // SP's CS edge is the protocol boundary; use it.
+                    // The SP's CS edge is the protocol boundary; miso emptiness is
+                    // not: a single unread reply byte would otherwise latch
+                    // `awaiting_reply` across requests, and the phase-2
+                    // `mosi.clear()` above would truncate the next request.
                     let mut lk = l.borrow_mut();
                     lk.rot_irq = false;
                     lk.ssa = false;
@@ -1070,7 +1066,7 @@ pub fn serve(
         // latch the SP's EXTI pending bit and pend the EXTI3 NVIC IRQ (9, routed to
         // the sys task's exti wildcard). The sys task then posts the ROT_IRQ
         // notification and sprot's wait_rot_irq returns at once, instead of waiting
-        // out its fallback poll-timer (which made sprot round-trips slow).
+        // out its fallback poll-timer.
         {
             let now_irq = crate::sprot::link()
                 .map(|l| l.borrow().rot_irq)
@@ -1134,7 +1130,7 @@ pub fn serve(
             // Don't sleep while host-UART (IPCC / host console) input is pending:
             // pump_uart just injected it into uart_rx but collect_irqs hasn't run
             // yet, so any_pending_irq() doesn't see IRQ 82 here. Sleeping would
-            // stall the SP for idle_ms per byte -- and host_sp_comms only services
+            // stall the SP for idle_ms per byte, and host_sp_comms only services
             // the UART when it is back in sys_recv, not while blocked calling
             // gimlet_seq, so the SP must keep running for both to make progress.
             let host_uart_pending = !bus.uart_rx.borrow().is_empty();

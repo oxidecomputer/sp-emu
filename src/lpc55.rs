@@ -69,12 +69,12 @@ pub fn install_memory(bus: &mut Bus) {
 
 pub fn install_peripherals(bus: &mut Bus) {
     use crate::soc::{RegFile, Scs};
-    // ARM System Control Space (SysTick/NVIC/SCB/CPACR/VTOR) — without it
+    // ARM System Control Space (SysTick/NVIC/SCB/CPACR/VTOR); without it
     // maybe_tick reads CSR=0, SysTick never fires, and the kernel can't schedule.
     bus.add_device(0xE000_E000, 0x1000, Box::new(Scs::new()));
     // Sprot bridge endpoints on the RoT side: the FLEXCOMM8 SPI slave (0x4009F000,
     // chip.toml [flexcomm8]) and the GPIO block (0x4008C000, chip.toml [gpio]) that
-    // carries ROT_IRQ (P0_18, RoT->SP) and CHIP_SELECT (P1_1, SP->RoT). These MUST
+    // carries ROT_IRQ (P0_18, RoT->SP) and CHIP_SELECT (P1_1, SP->RoT). These must
     // be added before the catch-all RegFiles below: dev_for() returns the first
     // device whose range covers an address, and the lpc55-periph-hi catch-all
     // (0x40035000..0x40100000) otherwise swallows both ranges, leaving the RoT's
@@ -95,7 +95,7 @@ pub fn install_peripherals(bus: &mut Bus) {
     }
     // FLEXCOMM5 SPI: the block the RoT clocks SWD through to drive the SP's debug
     // port. The granted address for this build (per `humility map`) is 0x40096000,
-    // NOT the datasheet's 0x4009A000. Added before the catch-alls, like sprot.
+    // not the datasheet's 0x4009A000. Added before the catch-alls, like sprot.
     if let Some(swd) = crate::rotswd::link() {
         bus.add_device(
             0x4009_6000,

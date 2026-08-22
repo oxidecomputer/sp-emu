@@ -5,7 +5,7 @@
 //! STM32H753 SoC assembly + the boot-critical peripheral models.
 //!
 //! "Boot-critical" here means exactly the peripherals whose busy-wait status
-//! bits the Hubris startup path (`drv/stm32h7-startup`) spins on — if these
+//! bits the Hubris startup path (`drv/stm32h7-startup`) spins on; if these
 //! don't read back "ready", the firmware hangs before reaching the kernel:
 //!   PWR.CSR1.ACTVOSRDY, PWR.D3CR.VOSRDY, RCC.CR.HSERDY, RCC.CR.PLL1RDY,
 //!   RCC.CFGR.SWS == PLL1.
@@ -21,12 +21,12 @@ use std::rc::Rc;
 /// route a transaction. 0 = none/other, 1 = sequencer FPGA (PB5), 2 = KSZ8463 (PI0).
 pub type Spi2Cs = Rc<Cell<u8>>;
 
-/// Sidecar SPI5 user-design chip-select "assert generation" — incremented by the
+/// Sidecar SPI5 user-design chip-select "assert generation", incremented by the
 /// GPIO bank each time PJ6 (CS_USER_L) goes asserted (low). Each FPGA command is
 /// one CS lock (header write + data read across two SPE cycles); Spi5 resets its
 /// per-command state whenever this counter changes. A counter (not a bool) is
 /// used because the deassert between commands happens with no Spi5 access, so a
-/// bool edge would be missed — the GPIO bank sees every PJ6 write and counts.
+/// bool edge would be missed; the GPIO bank sees every PJ6 write and counts.
 pub type Spi5Cs = Rc<Cell<u32>>;
 
 // ---- standard STM32H7 memory map (gimletlet uses the AXI-SRAM layout) -------
@@ -37,7 +37,7 @@ pub fn install_memory(bus: &mut Bus) {
     // it real program/erase/bank-swap/persistence semantics.
     bus.add_ram(0x0000_0000, 0x0001_0000); // ITCM (also boot alias)
     bus.add_ram(0x2000_0000, 0x0002_0000); // DTCM (128 KB)
-    bus.add_ram(0x2400_0000, 0x0008_0000); // AXI SRAM (512 KB) — initial SP lives here
+    bus.add_ram(0x2400_0000, 0x0008_0000); // AXI SRAM (512 KB); initial SP lives here
     bus.add_ram(0x3000_0000, 0x0004_8000); // SRAM1/2/3 (D2)
     bus.add_ram(0x3800_0000, 0x0001_0000); // SRAM4 (D3)
     bus.add_ram(0x3880_0000, 0x0000_1000); // Backup SRAM
@@ -51,10 +51,10 @@ pub fn install_peripherals(bus: &mut Bus) {
                                                                // `Flash` model owned by the Bus (installed in `setup()`), not a device here.
 
     // Ethernet MAC/MTL/DMA (0x40028000) is modeled directly in the Bus (src/mem.rs
-    // `EthDma`) — its DMA engine needs to read/write descriptor rings + packet
+    // `EthDma`): its DMA engine needs to read/write descriptor rings + packet
     // buffers in RAM, which a standalone `Mmio` device can't reach.
 
-    // TIM16 (MDIO bit-timer for the eth driver) — raises its IRQ when armed.
+    // TIM16 (MDIO bit-timer for the eth driver): raises its IRQ when armed.
     bus.add_device(0x4001_4400, 0x400, Box::new(Tim16::new()));
 
     // SPI4 + the KSZ8463 switch behind it (net's management interface).
@@ -126,9 +126,9 @@ pub fn install_peripherals(bus: &mut Bus) {
     // hash_driver never replies => hf (host-flash) waits forever => CPA deadlocks
     // on `send to hf`, stalling the gimlet SP when MGS does its inventory phase1
     // host-flash hash. Modeled below so the digest completes.
-    // Size 0x400: the HASH block is 0x4802_1400..0x4802_1800; the RNG below it
-    // starts at 0x4802_1800. (An earlier 0x1000 span overlapped and shadowed the
-    // RNG, so its status register read back 0 from HASH's fallthrough.)
+    // Size must be 0x400: the HASH block is 0x4802_1400..0x4802_1800, and the RNG
+    // starts at 0x4802_1800. A wider span would shadow the RNG, whose status
+    // register would then read back 0 from HASH's fallthrough.
     bus.add_device(0x4802_1400, 0x400, Box::new(Hash::new()));
 
     // STM32H7 RNG (0x4802_1800): the true random number generator. gimlet's
@@ -136,7 +136,7 @@ pub fn install_peripherals(bus: &mut Bus) {
     // ereport restart id (drv-stm32h7-rng, `packrat`/`ereport` feature).
     // Unmodeled, SR reads 0 from the catch-all below so DRDY never sets: the rng
     // task spins forever, packrat never gets a restart id, and the snitch drops
-    // every ereport request (EreportReadError::RestartIdNotSet) -- so MGS ereport
+    // every ereport request (EreportReadError::RestartIdNotSet), so MGS ereport
     // polls get no reply and time out. Modeled below so entropy is always ready.
     bus.add_device(0x4802_1800, 0x400, Box::new(Rng::new()));
 
@@ -148,7 +148,7 @@ pub fn install_peripherals(bus: &mut Bus) {
     bus.add_device(0x5200_5000, 0x400, Box::new(Qspi::new()));
 
     // SYSCFG (0x5800_0400): gimlet's kernel reads PKGR (+0x124) on boot and
-    // panics unless pkg[3:0] == 0b1000 (TFBGA240) — a guard against flashing
+    // panics unless pkg[3:0] == 0b1000 (TFBGA240), a guard against flashing
     // gimlet firmware onto a gimletlet. Synthesize the gimlet package.
     bus.add_device(0x5800_0400, 0x400, Box::new(Syscfg::new()));
 
@@ -176,7 +176,7 @@ pub fn install_peripherals(bus: &mut Bus) {
     bus.add_device(0x4000_7800, 0x400, Box::new(Uart7::new(utx, urx)));
 
     // Broad store-and-return model for the rest of the peripheral space (GPIO,
-    // SPI, I2C, USART, timers, ...). Added LAST so the specific devices above
+    // SPI, I2C, USART, timers, ...). Added last so the specific devices above
     // (RCC/PWR/FLASH, which synthesize ready bits) take precedence. Supports
     // readback-style peripheral use and keeps the differential harness in
     // sync; status-bit polls that need real hardware still read 0 (a task that
@@ -224,19 +224,19 @@ impl Mmio for Tim16 {
     }
 }
 
-/// Shared byte queue between the UART7 device and the host bridge — the same
+/// Shared byte queue between the UART7 device and the host bridge, the same
 /// Rc-sharing idiom as `Spi2Cs`. TX = SP->host, RX = host->SP. `Bus::pump_uart`
 /// drains/fills these against the `HostIo` (the propolis IPCC COM port).
 pub type UartQueue = Rc<RefCell<std::collections::VecDeque<u8>>>;
 
-/// UART7 (0x4000_7800, IRQ 82) — the SP<->host-CPU link the real Hubris
+/// UART7 (0x4000_7800, IRQ 82): the SP<->host-CPU link the real Hubris
 /// `host_sp_comms` task drives (host-sp-comms / IPCC + the host serial console).
 /// Sufficient for the unmodified `drv-stm32h7-usart` (matches the task's
 /// captured register usage): the transmit path is always ready
 /// (TXFNF|TC|TXFE + TEACK|REACK), so a write to TDR pushes straight to the host
 /// TX queue; a byte in the RX queue sets ISR.RXNE and a read of RDR pops it. The
 /// RX interrupt (IRQ 82) is raised Bus-side in `collect_irqs` while the RX queue
-/// is non-empty (level-triggered, matching the H7 FIFO RXFNE the task enables) —
+/// is non-empty (level-triggered, matching the H7 FIFO RXFNE the task enables);
 /// host input is asynchronous, so it can't go through the dev-touched IRQ poll.
 /// The task uses no TX interrupt (it polls TXFNF), so none is modeled.
 pub struct Uart7 {
@@ -308,7 +308,7 @@ struct Ksz8463 {
 impl Ksz8463 {
     fn read(&self, addr: u16) -> u16 {
         match addr {
-            0x0C => 0x8452, // CIDER (register 0x000): KSZ8463 chip id — driver requires this
+            0x0C => 0x8452, // CIDER (register 0x000): KSZ8463 chip id; driver requires this
             // IADR5 (register 0x02E, packed 0x2F0): high word of an indirect-access
             // MIB-counter read. read_mib_counter() spin-loops here until bit 14
             // ("valid") is set; counter value 0 -> driver returns Count(0).
@@ -324,8 +324,8 @@ impl Ksz8463 {
 /// SPI4 (0x40013400) with an attached KSZ8463 switch slave. `net` talks to the
 /// switch over SPI: a 4-byte exchange [addr_be_hi, addr_be_lo, d0, d1] where the
 /// MSB of byte0 means write. Reads return the 16-bit register (little-endian) in
-/// bytes 2..4. Master is modeled synchronously — each TX byte immediately
-/// produces its RX byte — so the driver's transfer loop never sleeps on
+/// bytes 2..4. Master is modeled synchronously (each TX byte immediately
+/// produces its RX byte), so the driver's transfer loop never sleeps on
 /// spi-irq. The KSZ is mostly store/return, except CIDER (chip id) = 0x8452,
 /// which the driver checks before proceeding.
 pub struct Spi4 {
@@ -420,7 +420,7 @@ impl Mmio for Spi4 {
                     self.rx.remove(0) as u32
                 }
             } // RXDR: pop
-            0x20 => 0, // TXDR read (only happens via byte-write RMW) — harmless
+            0x20 => 0, // TXDR read (only happens via byte-write RMW); harmless
             o => *self.regs.get(&o).unwrap_or(&0),
         }
     }
@@ -446,17 +446,17 @@ impl Mmio for Spi4 {
     }
 }
 
-/// SPI2 (0x4000_3800, sidecar) — `monorail` talks to the VSC7448 management
+/// SPI2 (0x4000_3800, sidecar): `monorail` talks to the VSC7448 management
 /// switch over this bus (`monorail` uses the embedded SPI core, `use-spi-core`;
 /// on the sidecar SPI2 is the VSC7448, whereas on gimlet SPI2 is the iCE40
-/// sequencer — see the board-conditional install). The VSC7448 SPI protocol
+/// sequencer; see the board-conditional install). The VSC7448 SPI protocol
 /// (drv/vsc7448/src/spi.rs, datasheet §5.5.2): each transaction carries a 24-bit
 /// word address = `(reg_addr & 0x00FFFFFF) >> 2`, big-endian, byte0 MSB = write:
 ///   READ:  [a23..16 (MSB=0), a15..8, a7..0] + 1 pad byte + 4 data bytes (BE)
 ///   WRITE: [a23..16 (MSB=1), a15..8, a7..0] + 4 data bytes (BE)
 /// Master is modeled synchronously (each TXDR byte immediately yields its RXDR
 /// byte and SR reports TXP+RXP) so the spi-core transfer loop never sleeps
-/// on spi-irq — same model as the gimlet `Spi4`/KSZ8463.
+/// on spi-irq; same model as the gimlet `Spi4`/KSZ8463.
 ///
 /// The register plane is store/return with the values and behaviors the stock
 /// monorail init checks on top: CHIP_ID (0x374680E9, else BadChipId), PLL5G
@@ -504,7 +504,7 @@ impl Vsc7448 {
     fn vsc_read(&self, waddr: u32) -> u32 {
         match waddr {
             // DEVCPU_GCB:CHIP_REGS:CHIP_ID (reg 0x71010000): rev_id=3, part_id=0x7468,
-            // mfg_id=0x74, one=1 — see drv/vsc7448/src/lib.rs:397.
+            // mfg_id=0x74, one=1; see drv/vsc7448/src/lib.rs:397.
             0x4000 => 0x374680E9,
             // HSIO:PLL5G_STATUS(0):PLL5G_STATUS1 (reg 0x7146003c): pll5g_setup polls
             // gain_stat (bits[18:14]) and only accepts 2 < v < 0xa, else retries 10x
@@ -649,7 +649,7 @@ impl Vsc7448 {
                     if pos == 6 {
                         let (a, mut v) = (self.waddr, self.wval);
                         // RAM_CTRL.RAM_INIT (bit 1) is a self-clearing init strobe in
-                        // QSYS/REW/VOP/ANA_AC/ASM/DSM — the driver writes 1 then polls
+                        // QSYS/REW/VOP/ANA_AC/ASM/DSM; the driver writes 1 then polls
                         // for it to read back 0 (~40us), else BspInitFailed(RamInitFailed).
                         // Store it pre-cleared (preserving ram_ena, bit 0). Full reg addr
                         // = 0x7100_0000 | (word_addr << 2).
@@ -716,7 +716,7 @@ impl Mmio for Vsc7448 {
                     self.rx.remove(0) as u32
                 }
             } // RXDR: pop
-            0x20 => 0, // TXDR read (only via byte-write RMW) — harmless
+            0x20 => 0, // TXDR read (only via byte-write RMW); harmless
             o => *self.regs.get(&o).unwrap_or(&0),
         }
     }
@@ -744,7 +744,7 @@ impl Mmio for Vsc7448 {
     }
 }
 
-/// SPI2 (0x4000_3800) — gimlet's bus shared (by chip-select) between the iCE40
+/// SPI2 (0x4000_3800): gimlet's bus shared (by chip-select) between the iCE40
 /// sequencer FPGA (CS PB5) and the KSZ8463 switch (CS PI0). The active device is
 /// read from the shared `Spi2Cs` cell (set by the GPIO bank). The target is
 /// latched at SPE 0->1 so a whole exchange goes to one device.
@@ -936,7 +936,7 @@ impl Mmio for Spi2 {
     }
 }
 
-/// SPI5 (0x4001_5000, irq85) — sidecar's mainboard ECP5 FPGA via drv-fpga-server
+/// SPI5 (0x4001_5000, irq85): sidecar's mainboard ECP5 FPGA via drv-fpga-server
 /// (`use-spi-core`, so the task drives SPI5 directly). The ECP5 is reported
 /// "configured" via GPIO (done=PJ15 high -> DeviceState::RunningUserDesign), so
 /// SPI5 only carries the FPGA *user-design* register protocol: a 3-byte header
@@ -953,7 +953,7 @@ pub struct Spi5 {
     op: u8,
     addr: u16,
     dpos: u32,     // data bytes consumed this command (after the 3-byte header)
-    xfer_cnt: u32, // bytes in the CURRENT spi-core transfer (for EOT); resets per SPE
+    xfer_cnt: u32, // bytes in the current spi-core transfer (for EOT); resets per SPE
     dbg_n: u32,    // SP_EMU_SPIDBG trace counter (cap output)
     cs: Spi5Cs,    // user-design CS assert-generation; reset the command when it changes
     last_gen: u32,
@@ -971,7 +971,7 @@ pub struct Spi5 {
 /// Seed the FPGA ignition-controller register block so the emulated sidecar SP
 /// answers MGS `ignition`. The sidecar is the rack's ignition hub: MGS issues
 /// GET /ignition as step 1 of SP enumeration, so without a populated controller
-/// no SPs — and therefore no switches or switch-ports — are discovered
+/// no SPs (and therefore no switches or switch-ports) are discovered
 /// (downstream symptom: rack-init fails on `qsfp0 not found`).
 ///
 /// Register layout (drv-sidecar-mainboard-controller / drv-ignition-api):
@@ -1132,7 +1132,7 @@ impl Spi5 {
         }
         self.fpga.insert(0x201, 0x05); // buffers empty, request complete
     }
-    /// Reset per-command state on the CS deasserted->asserted edge — a command
+    /// Reset per-command state on the CS deasserted->asserted edge: a command
     /// (header write + data read) spans two SPE cycles under one CS lock.
     fn check_cs(&mut self) {
         let gen = self.cs.get();
@@ -1186,7 +1186,7 @@ impl Spi5 {
         *self.fpga.get(&a).unwrap_or(&0)
     }
     /// One TXDR byte (full-duplex). Header is the first 3 bytes [op, addr_be];
-    /// after that, data — reads emit register bytes, writes store them.
+    /// after that, data: reads emit register bytes, writes store them.
     fn xfer(&mut self, b: u8) -> u8 {
         self.xfer_cnt += 1; // bytes in this spi-core transfer (drives EOT)
         let out = match self.idx {
@@ -1260,7 +1260,7 @@ impl Mmio for Spi5 {
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x14 => {
-                // SR (EOT/TXC keyed on xfer_cnt, not idx — full-duplex byte count)
+                // SR (EOT/TXC keyed on xfer_cnt, the full-duplex byte count, not idx)
                 let tsize = self.regs.get(&0x04).copied().unwrap_or(0) & 0xFFFF;
                 spi_sr(self.xfer_cnt, tsize, !self.rx.is_empty())
             }
@@ -1304,7 +1304,7 @@ impl Mmio for Spi5 {
     }
 }
 
-/// GPIO bank — store/return, but the read-only input register IDR (+0x10 within
+/// GPIO bank: store/return, but the read-only input register IDR (+0x10 within
 /// each 0x400 port) is synthesized for the boot-critical externally-driven pins:
 ///  - GPIOC (port 2): PC6/PC7 = sequencer V3P3/V1P2 power-good -> bits 6,7 high.
 ///  - GPIOG (port 6): PG[2:0] = board revision -> 0b010 for gimlet-c.
@@ -1367,7 +1367,7 @@ impl Mmio for GpioBank {
                 // GPIOE: PE3 is rot-irq (input from the RoT, active-low). With a RoT
                 // attached, reflect the sprot link's rot_irq on bit 3. With no RoT,
                 // the line sits deasserted (high, pulled up) as on a board with no
-                // RoT populated — otherwise the SP's sprot driver sees ROT_IRQ stuck
+                // RoT populated; otherwise the SP's sprot driver sees ROT_IRQ stuck
                 // asserted and fails every RoT request with RotIrqRemainsAsserted
                 // (faux-mgs tolerates that field error; sp-test treats it as fatal).
                 let odr = *self.regs.get(&(4 * 0x400 + 0x14)).unwrap_or(&0);
@@ -1384,7 +1384,7 @@ impl Mmio for GpioBank {
                     // GPIOF PF12 = front-IO POWER_GOOD (input) -> high so the sequencer's
                     // front-IO preinit passes the PG check.
                     5 => self.regs.get(&(5 * 0x400 + 0x14)).copied().unwrap_or(0) | (1 << 12),
-                    // GPIOJ: mainboard ECP5 config pins — done=PJ15 high (=configured ->
+                    // GPIOJ: mainboard ECP5 config pins; done=PJ15 high (=configured ->
                     // device_state RunningUserDesign, skip bitstream) + program_n=PJ13
                     // high (not in reset). init_n=PJ12 (don't-care once done is high).
                     9 => (1 << 15) | (1 << 13),
@@ -1415,7 +1415,7 @@ impl Mmio for GpioBank {
             // GPIOE PE4 is the RoT chip-select (active-low). Drive the sprot link CS
             // and latch the SSA/SSD slave-select events on each edge. Latched here,
             // on the SP side, because this write always runs inside the SP's quantum
-            // and so never misses a CS edge — unlike the RoT, which only samples the
+            // and so never misses a CS edge, unlike the RoT, which only samples the
             // line when it touches its FLEXCOMM8 registers and can sleep through an
             // entire assert->clock->deassert cycle. See SprotLink.
             if let Some(lk) = crate::sprot::link() {
@@ -1473,7 +1473,7 @@ impl Mmio for GpioBank {
     }
 }
 
-/// STM32H7 I2C controller — minimal FSM so the driver's transactions complete.
+/// STM32H7 I2C controller: minimal FSM so the driver's transactions complete.
 /// ISR (+0x18) always reports TXE|TXIS|RXNE|TC (ready to send / data available /
 /// transfer complete) with BUSY and NACKF clear; the driver writes bytes to TXDR
 /// (+0x28, discarded) and reads RXDR (+0x24, returns 0): turn-off writes
@@ -1517,7 +1517,7 @@ impl SensorEnv {
     }
 }
 
-/// CRC-32/ISCSI (Castagnoli) — the body checksum the `tlvc` crate uses
+/// CRC-32/ISCSI (Castagnoli): the body checksum the `tlvc` crate uses
 /// (`crc::CRC_32_ISCSI`). Reflected poly 0x82F6_3B78, init/xorout 0xFFFF_FFFF.
 fn crc32c(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
@@ -1534,7 +1534,7 @@ fn crc32c(data: &[u8]) -> u32 {
     !crc
 }
 
-/// TLV-C header checksum — mirrors `tlvc::header_checksum` exactly:
+/// TLV-C header checksum; mirrors `tlvc::header_checksum` exactly:
 /// `!(le_u32(tag).wrapping_mul(HEADER_MAGIC).wrapping_add(len))`.
 fn tlvc_header_checksum(tag: [u8; 4], len: u32) -> u32 {
     const HEADER_MAGIC: u32 = 0x6b32_9f69;
@@ -1570,7 +1570,7 @@ pub(crate) fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
 /// STM32H7 HASH (0x4802_1400, irq 80). Minimal model so drv-stm32h7-hash
 /// completes: report DINIS (ready for data) + not BUSY, and when the driver
 /// writes STR.DCAL (start digest) set SR.DCIS and raise irq 80 so its
-/// `sys_recv_notification` wakes. Returns a fixed digest — MGS only records the
+/// `sys_recv_notification` wakes. Returns a fixed digest: MGS only records the
 /// phase1 hash for inventory; it is not checked against the flash here.
 struct Hash {
     irq_pending: bool,
@@ -1624,8 +1624,8 @@ impl Mmio for Hash {
 
 /// STM32H7 RNG (0x4802_1800). Minimal model: report data always ready (SR.DRDY)
 /// with no error bits, and return a non-zero pseudo-random word from DR. The
-/// PRNG is deterministic (fixed seed) so a given boot yields a stable ereport
-/// restart id -- reproducibility the workshop wants; the driver only requires
+/// PRNG is deterministic (fixed seed) so a given boot yields a reproducible
+/// ereport restart id; the driver only requires
 /// DRDY set, CEIS/SEIS clear, and DR != 0 (drv-stm32h7-rng `read`).
 struct Rng {
     state: u64,
@@ -1702,8 +1702,8 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     let sidecar = crate::config::get().board().is_sidecar();
     // Per-instance index from the bridge port (33300->0, 33310->1, ...) so the
     // emulated gimlet SPs get distinct serials and MACs. Inventory keys SPs on
-    // serial, and a shared MAC (the old blank-VPD gimlet default) caused L2
-    // collisions => intermittent "no answer" on the management net.
+    // serial, and MACs must be unique per instance: a shared MAC causes L2
+    // collisions that intermittently drop management-net traffic.
     let idx: u8 = crate::config::get()
         .bridge()
         .and_then(|b| b.rsplit(':').next())
@@ -1839,11 +1839,11 @@ impl I2c {
                 _ => 0,
             }),
             // AT24CSW080 VPD/FRUID EEPROMs are handled out-of-band in the RXDR
-            // read path (addresses 0x50..0x53), not here — see the Mmio::read
+            // read path (addresses 0x50..0x53), not here; see the Mmio::read
             // EEPROM branch. They need real sequential, auto-incrementing reads
             // off the `eeprom` backing store, not the 16-bit-register split below.
             // TMP451 (T6 NIC temp, behind the M.2 mux seg 4, addr 0x4c). Reads are
-            // SINGLE-byte -> the value goes in the high byte (read_idx 0). ManufacturerId
+            // single-byte -> the value goes in the high byte (read_idx 0). ManufacturerId
             // (0xFE) must be 0x55 (TI); Local/Remote temp hi byte = integer °C.
             0x4c => Some(match reg {
                 0xFE => 0x5500,                                         // ManufacturerId = 0x55
@@ -2025,8 +2025,8 @@ impl Mmio for I2c {
 /// (bit 1), moving data one byte at a time through DR (offset 0x20). Reads
 /// are presented whole, with TCF set once drained. Writes report FLEVEL 0 and
 /// TCF as soon as the command's address and data have arrived, so the driver
-/// never waits on the qspi irq. None is raised; an irq-less model avoids the
-/// busy loop a plain stub caused.
+/// never waits on the qspi irq. None is raised; a stray qspi irq would
+/// busy-loop hf.
 const QSPI_SIZE: usize = 32 * 1024 * 1024;
 const QSPI_SECTOR: usize = 65_536;
 
@@ -2430,7 +2430,7 @@ impl Mmio for Qspi {
     }
 }
 
-/// SYSCFG — store/return except PKGR (+0x124), whose pkg[3:0] field reads back
+/// SYSCFG: store/return except PKGR (+0x124), whose pkg[3:0] field reads back
 /// 0b1000 (TFBGA240) so gimlet's package-guard accepts the firmware.
 pub struct Syscfg {
     regs: std::collections::HashMap<u32, u32>,
@@ -2457,7 +2457,7 @@ impl Mmio for Syscfg {
     }
 }
 
-/// STM32H7 unique device ID (96 bits / 3 words) — a stable fake identity.
+/// STM32H7 unique device ID (96 bits / 3 words): a stable fake identity.
 pub struct Uid;
 impl Mmio for Uid {
     fn name(&self) -> &str {
@@ -2473,7 +2473,7 @@ impl Mmio for Uid {
     fn write(&mut self, _: u32, _: u32) {}
 }
 
-/// Generic peripheral that stores writes and returns them (sparse) — models
+/// Generic peripheral that stores writes and returns them (sparse); models
 /// config registers whose only requirement is readback consistency.
 pub struct RegFile {
     name: &'static str,
