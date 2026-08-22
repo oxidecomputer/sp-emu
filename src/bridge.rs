@@ -32,6 +32,20 @@ const ICMP6_NEIGHBOR_ADVERT: u8 = 136;
 const SP_PORT: u16 = 11111; // control_plane_agent's MGS socket
 const EREPORT_PORT: u16 = 57005; // snitch's ereport socket (SP side)
 const EREPORT_OFFSET: u16 = 11100; // host ereport port = mgmt port + this (33300->44400)
+
+/// Base management port of the a4x2 fleet layout: instance k's bridge binds
+/// `33300 + 10*k`. Per-instance derived values (SWD debug ports, VPD
+/// identity) key off this base.
+pub(crate) const A4X2_BASE_PORT: u16 = 33300;
+
+/// The a4x2 per-instance port offset (0, 10, 20, ...) for a bridge address,
+/// or None when the address is not from the a4x2 layout. Callers fall back
+/// to their instance-0 defaults on None.
+pub(crate) fn a4x2_offset(bridge: &str) -> Option<u16> {
+    let port: u16 = bridge.rsplit(':').next()?.parse().ok()?;
+    port.checked_sub(A4X2_BASE_PORT)
+        .filter(|off| off % 10 == 0 && *off < 1000)
+}
 const VLAN_TPID: u16 = 0x8100;
 
 /// Trusted management-VLAN ids, shared with the well-known-port host in

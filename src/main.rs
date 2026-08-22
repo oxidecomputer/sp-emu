@@ -43,7 +43,7 @@ mod rotswd;
 mod soc;
 mod sprot;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use cpu::{Cpu, Trap};
 use host::{HostIo, StdoutHost};
 use mem::Bus;
@@ -457,7 +457,10 @@ fn cmd_flash(args: &[String]) -> Result<()> {
     // Accepts a raw .bin or a Hubris build archive (.zip with img/final.bin).
     let image = flash::load_image(src)?;
     let base = flash::slot_base(slot)?;
-    let reset_pc = u32::from_le_bytes(image[4..8].try_into().unwrap_or_default()) & !1;
+    if image.len() < 8 {
+        bail!("{src}: {} bytes is too short for a vector table", image.len());
+    }
+    let reset_pc = u32::from_le_bytes(image[4..8].try_into().unwrap()) & !1;
     let path = nvm_path();
     flash::program_slot(&path, slot, &image)?;
 
@@ -788,6 +791,8 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // legitimate RoT returns are not reported as crashes.
     let rot_flash = 0x0u32..0x000A_0000;
     cpu.set_code_ranges(vec![rot_flash]);
+    // VTOR = 0 is the real table location on the LPC55; no boot-alias redirect.
+    cpu.set_vtor_fallback(0);
     // Boot-ROM API emulation (SP_EMU_ROT_ROM): install the synthesized ROM pointer
     // graph and trap `skboot_authenticate` so the RoT pre-kernel's
     // authenticate_image() runs the real signature check. Off by
@@ -1076,9 +1081,13 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
 
     // Differential-test trace: per-instruction state for lockstep vs Unicorn.
     use std::io::Write;
-    let mut diff = config::get()
-        .diff()
-        .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("diff file")));
+    let mut diff = match config::get().diff() {
+        Some(p) => Some(std::io::BufWriter::new(
+            std::fs::File::create(&p)
+                .map_err(|e| anyhow!("creating SP_EMU_DIFF trace {p}: {e}"))?,
+        )),
+        None => None,
+    };
     bus.rec = diff.is_some();
     // Per-instruction disasm formatting is a heap alloc; only enable it when a
     // consumer (full trace, windowed trace, or the diff harness) will read it.

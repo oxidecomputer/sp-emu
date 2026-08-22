@@ -20,7 +20,9 @@ use yaxpeax_arm::armv7::{InstDecoder, Operand};
 enum Mode { Code, Data }
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).expect("usage: analyze <elf>");
+    let path = std::env::args()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("usage: analyze <elf>"))?;
     let data = std::fs::read(&path)?;
     let obj = object::File::parse(&*data)?;
 

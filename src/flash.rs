@@ -741,7 +741,9 @@ impl Flash {
     /// only forces the OS to flush its buffers; called at reset and on exit.
     pub fn flush(&mut self) {
         if let Some(f) = self.file.as_mut() {
-            let _ = f.sync_all();
+            if let Err(e) = f.sync_all() {
+                eprintln!("[flash] sync {} failed: {e}", self.path);
+            }
         }
     }
 }

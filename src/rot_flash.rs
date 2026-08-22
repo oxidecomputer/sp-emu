@@ -205,6 +205,11 @@ pub struct RotFlash {
     file: Option<std::fs::File>,
     path: String,
     dbg: bool,
+    /// Command codes already reported as unimplemented, one bit per `cmd & 0xF`.
+    unknown_cmds_logged: u16,
+    /// Set after the first failed erased-bitset write, so a persistently
+    /// failing disk logs once rather than per flash operation.
+    bitset_write_failed: bool,
 }
 
 fn bitset_path(path: &str) -> String {
@@ -228,6 +233,8 @@ impl RotFlash {
             file: None,
             path: path.to_string(),
             dbg: cfg.rotflashdbg(),
+            unknown_cmds_logged: 0,
+            bitset_write_failed: false,
         };
 
         // Persisted state takes precedence over `image` and the CMPA/CFPA/bootleby
@@ -237,9 +244,6 @@ impl RotFlash {
         let persisted = Path::new(path).exists();
         let use_persisted = persisted && !cfg.rot_fresh();
         if use_persisted {
-            eprintln!(
-                "[rotflash] loaded persisted RoT flash from {path} (ignoring the passed image)"
-            );
             // Warn loudly if provisioning overrides are being shadowed by the file.
             if cfg.rot_cmpa().is_some() || cfg.rot_cfpa().is_some() || cfg.rot_bootleby().is_some()
             {
@@ -248,14 +252,24 @@ impl RotFlash {
                      (ignored). Set SP_EMU_ROT_FRESH=1 or delete the file to apply them."
                 );
             }
-            if let Ok(data) = std::fs::read(path) {
-                let n = data.len().min(SIZE);
-                f.mem[..n].copy_from_slice(&data[..n]);
-            }
-            if let Ok(bits) = std::fs::read(bitset_path(path)) {
-                let n = bits.len().min(f.erased.len());
-                f.erased[..n].copy_from_slice(&bits[..n]);
-            }
+            let data = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("reading persisted RoT flash {path}: {e}"))?;
+            let n = data.len().min(SIZE);
+            f.mem[..n].copy_from_slice(&data[..n]);
+            // The erased bitset is load-bearing (blank-check and erased-read
+            // ECC behavior); a persisted image without it is corrupt state.
+            let bits = std::fs::read(bitset_path(path)).map_err(|e| {
+                anyhow::anyhow!(
+                    "reading erased bitset {}: {e}; delete {path} or set \
+                     SP_EMU_ROT_FRESH=1 to re-seed",
+                    bitset_path(path)
+                )
+            })?;
+            let n = bits.len().min(f.erased.len());
+            f.erased[..n].copy_from_slice(&bits[..n]);
+            eprintln!(
+                "[rotflash] loaded persisted RoT flash from {path} (ignoring the passed image)"
+            );
         } else {
             if persisted {
                 eprintln!("[rotflash] SP_EMU_ROT_FRESH: ignoring persisted {path}, re-seeding");
@@ -453,7 +467,15 @@ impl RotFlash {
             CMD_PROGRAM => self.cmd_program(),
             CMD_BLANK => self.cmd_blank(),
             CMD_READ => self.cmd_read(),
-            _ => self.status |= ST_DONE,
+            unknown => {
+                // Unimplemented command: report failure rather than a fake
+                // completion the firmware would take as success.
+                if self.unknown_cmds_logged & (1 << unknown) == 0 {
+                    self.unknown_cmds_logged |= 1 << unknown;
+                    eprintln!("[rotflash] unimplemented CMD={unknown}; reporting FAIL");
+                }
+                self.status |= ST_DONE | ST_FAIL;
+            }
         }
     }
 
@@ -612,7 +634,7 @@ impl RotFlash {
                 self.file = None;
             }
         }
-        let _ = std::fs::write(bitset_path(&self.path), &self.erased);
+        self.persist_bitset();
     }
 
     fn persist_all(&mut self) {
@@ -627,12 +649,28 @@ impl RotFlash {
                 self.file = None;
             }
         }
-        let _ = std::fs::write(bitset_path(&self.path), &self.erased);
+        self.persist_bitset();
+    }
+
+    /// Persist the erased bitset. It is load-bearing state (blank-check and
+    /// erased-read ECC), so a failure is reported, once.
+    fn persist_bitset(&mut self) {
+        if let Err(e) = std::fs::write(bitset_path(&self.path), &self.erased) {
+            if !self.bitset_write_failed {
+                self.bitset_write_failed = true;
+                eprintln!(
+                    "[rotflash] erased-bitset write to {} failed: {e}",
+                    bitset_path(&self.path)
+                );
+            }
+        }
     }
 
     pub fn flush(&mut self) {
         if let Some(f) = self.file.as_mut() {
-            let _ = f.sync_all();
+            if let Err(e) = f.sync_all() {
+                eprintln!("[rotflash] sync {} failed: {e}", self.path);
+            }
         }
     }
 }

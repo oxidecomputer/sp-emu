@@ -549,17 +549,25 @@ pub fn serve(
     // simultaneously: offset by the bridge port (33300->0, 33310->10, ...). The SP
     // probe is 4444 + off; the RoT probe (below) is 4544 + off. Pair with the
     // matching selector.
-    let swd_off: u16 = crate::config::get()
-        .bridge()
-        .and_then(|b| b.rsplit(':').next())
-        .and_then(|p| p.parse::<u16>().ok())
-        .map(|p| p.wrapping_sub(33300))
-        .unwrap_or(0);
+    let swd_off: u16 = match crate::config::get().bridge() {
+        Some(b) => crate::bridge::a4x2_offset(&b).unwrap_or_else(|| {
+            // The "1" well-known-port shorthand and ad-hoc addresses are not
+            // in the a4x2 layout; only a host:port outside it merits a note.
+            if b.contains(':') {
+                eprintln!(
+                    "[gdb] bridge {b} is outside the a4x2 port layout; \
+                     using the default SWD ports"
+                );
+            }
+            0
+        }),
+        None => 0,
+    };
     let listeners = if crate::config::get().no_debug() {
         eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG); serving the bridge only");
         None
     } else {
-        let swd_port = 4444u16.wrapping_add(swd_off);
+        let swd_port = 4444u16 + swd_off; // swd_off < 1000, no overflow
         let swd_l = TcpListener::bind(("127.0.0.1", swd_port))?;
         swd_l.set_nonblocking(true)?;
         eprintln!("[gdb] ready (swd :{swd_port}). attach with:");
@@ -573,7 +581,7 @@ pub fn serve(
     let rot_listener = if crate::config::get().no_debug() || !has_rot {
         None
     } else {
-        let rot_swd_port = 4544u16.wrapping_add(swd_off);
+        let rot_swd_port = 4544u16 + swd_off;
         let l = TcpListener::bind(("127.0.0.1", rot_swd_port))?;
         l.set_nonblocking(true)?;
         eprintln!("[gdb] ready (rot swd :{rot_swd_port}). attach with:");

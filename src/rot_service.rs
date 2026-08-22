@@ -227,7 +227,15 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<Job>();
     std::thread::spawn(move || {
         crate::sprot::enable();
-        let (mut rc, mut rb) = crate::build_rot_core(&image).expect("build RoT core");
+        // The worker owns the only RoT; without it every client would block
+        // on a reply that can never come, so a build failure ends the service.
+        let (mut rc, mut rb) = match crate::build_rot_core(&image) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[rotsvc] fatal: building the RoT core failed: {e}");
+                std::process::exit(1);
+            }
+        };
         let mut host = StdoutHost;
         let preboot: u64 = crate::config::get().rot_preboot().unwrap_or(40_000_000);
         for _ in 0..preboot {
@@ -245,6 +253,7 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
         // idempotent: true for the read/nonce'd sprot traffic, not for
         // state-mutating ops like RoT update.
         let mut cache: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut cache_hit_warned = false;
         // Drive the RoT continuously, like the in-process two-core bridge. Between
         // requests it keeps stepping so it finishes tearing down the prior reply and
         // returns to its sprot receive loop; otherwise it freezes mid-teardown the
@@ -264,6 +273,14 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
                         );
                     }
                     let resp = if let Some(r) = cache.get(&req) {
+                        if !cache_hit_warned {
+                            cache_hit_warned = true;
+                            eprintln!(
+                                "[rotsvc] serving a cached reply for a \
+                                 repeated request; state-mutating sprot ops \
+                                 must not go through rot-serve"
+                            );
+                        }
                         r.clone()
                     } else {
                         let r = rot_exchange(&mut rc, &mut rb, &mut host, &req);

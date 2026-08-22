@@ -123,6 +123,11 @@ pub struct Cpu {
     /// interpreter runs both: the SP's ITCM (0x0, where the RoT injects the
     /// endoscope) plus STM32H7 flash (0x0800_0000); the RoT's LPC55 flash (0x0).
     code_ranges: Vec<std::ops::Range<u32>>,
+    /// Vector-table base used while VTOR reads 0. The STM32H7 boot alias maps
+    /// flash at 0x0 but the bus models flash only at 0x0800_0000, so the SP
+    /// core redirects; the LPC55's flash really is at 0x0, so the RoT core
+    /// (`set_vtor_fallback(0)`) uses VTOR as written.
+    vtor_fallback: u32,
     /// Set when a WFI executes with nothing pending: a genuine idle, whatever the
     /// `wfi_throttle` state. The RoT preboot loop (which runs with the throttle
     /// off, so `idle_skip` never fires) reads it to stop as soon as the core
@@ -238,6 +243,7 @@ impl Cpu {
             syst_csr: 0,
             syst_rvr: 1,
             code_ranges: vec![0..ITCM_HI, SP_CODE_RANGE],
+            vtor_fallback: FLASH_LO,
             wfi_idle: false,
         }
     }
@@ -351,6 +357,12 @@ impl Cpu {
     /// flash; the RoT core sets its LPC55 flash (at 0x0).
     pub fn set_code_ranges(&mut self, ranges: Vec<std::ops::Range<u32>>) {
         self.code_ranges = ranges;
+    }
+
+    /// Replace the vector-table base used while VTOR reads 0 (see
+    /// `vtor_fallback`).
+    pub fn set_vtor_fallback(&mut self, base: u32) {
+        self.vtor_fallback = base;
     }
 
     /// Whether `pc` lies in any of this core's executable-memory windows.
@@ -910,12 +922,21 @@ impl Cpu {
                 );
                 Ok(())
             }
-            Opcode::SMLA(_, _) => {
-                // signed multiply-accumulate (halfword forms): approximate with low halves
-                let a = (self.read_reg(reg(&ops[1])?) as i16) as i32;
-                let b = (self.read_reg(reg(&ops[2])?) as i16) as i32;
+            Opcode::SMLA(n_top, m_top) => {
+                // SMLABB/BT/TB/TT: signed halfword multiply-accumulate. The
+                // Thumb decoder passes the encoding's raw N/M bits: set means
+                // the top halfword of Rn/Rm. The Q flag is not modeled.
+                let sel = |v: u32, top: bool| {
+                    let h = if top { (v >> 16) as u16 } else { v as u16 };
+                    h as i16 as i32
+                };
+                let a = sel(self.read_reg(reg(&ops[1])?), n_top);
+                let b = sel(self.read_reg(reg(&ops[2])?), m_top);
                 let c = self.read_reg(reg(&ops[3])?);
-                self.write_reg(reg(&ops[0])?, (a * b) as u32 + c);
+                self.write_reg(
+                    reg(&ops[0])?,
+                    (a.wrapping_mul(b) as u32).wrapping_add(c),
+                );
                 Ok(())
             }
 
@@ -1937,7 +1958,7 @@ impl Cpu {
         self.ipsr = vecnum;
         self.r[LR] = exc;
         let vtor = bus.read32(0xE000_ED08) & !0x7f;
-        let vtor = if vtor == 0 { 0x0800_0000 } else { vtor }; // boot-aliased table
+        let vtor = if vtor == 0 { self.vtor_fallback } else { vtor };
         self.pc = bus.read32(vtor.wrapping_add(vecnum * 4)) & !1;
         self.itstate = 0;
     }
@@ -2904,5 +2925,55 @@ mod tests {
         assert!(cpu.step(&mut bus, &mut host).is_ok());
         assert_eq!(cpu.r[2], 0x8000_0001);
         assert!(cpu.c, "non-S form leaves carry unchanged");
+    }
+
+    /// SMLABB/BT/TB/TT multiply the selected signed halfwords of Rn and Rm
+    /// and accumulate with wrapping. T1 encoding: hw2 bit 5 = N (Rn top),
+    /// bit 4 = M (Rm top).
+    #[test]
+    fn smla_halfword_variants() {
+        for (n_top, m_top, want) in [
+            (false, false, 4i64 * -2 + 100),
+            (false, true, 4 * 3 + 100),
+            (true, false, -32768 * -2 + 100),
+            (true, true, -32768 * 3 + 100),
+        ] {
+            let mut bus = ram_bus();
+            // SMLAxy r0, r1, r2, r3 = fb11 30(NM)2.
+            bus.write16(RAM, 0xfb11);
+            bus.write16(
+                RAM + 2,
+                0x3002 | ((n_top as u16) << 5) | ((m_top as u16) << 4),
+            );
+            let mut cpu = Cpu::new();
+            cpu.pc = RAM;
+            cpu.r[1] = 0x8000_0004; // top -32768, bottom 4
+            cpu.r[2] = 0x0003_FFFE; // top 3, bottom -2
+            cpu.r[3] = 100;
+            let mut host = StdoutHost;
+            assert!(cpu.step(&mut bus, &mut host).is_ok());
+            assert_eq!(
+                cpu.r[0],
+                want as u32,
+                "n_top={n_top} m_top={m_top}"
+            );
+        }
+    }
+
+    /// The SMLA accumulate wraps; an overflowing Ra must not panic.
+    #[test]
+    fn smla_accumulate_wraps() {
+        let mut bus = ram_bus();
+        // SMLABB r0, r1, r2, r3 = fb11 3002.
+        bus.write16(RAM, 0xfb11);
+        bus.write16(RAM + 2, 0x3002);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.r[1] = 4;
+        cpu.r[2] = 3;
+        cpu.r[3] = u32::MAX;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.r[0], 11, "12 + 0xFFFF_FFFF wraps to 11");
     }
 }

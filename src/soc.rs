@@ -1706,9 +1706,8 @@ fn build_vpd_eeprom() -> Rc<Vec<u8>> {
     // collisions that intermittently drop management-net traffic.
     let idx: u8 = crate::config::get()
         .bridge()
-        .and_then(|b| b.rsplit(':').next())
-        .and_then(|p| p.parse::<u32>().ok())
-        .map(|p| ((p.wrapping_sub(33300)) / 10) as u8)
+        .and_then(|b| crate::bridge::a4x2_offset(&b))
+        .map(|off| (off / 10) as u8)
         .unwrap_or(0);
     // MAC0: 128-MAC block. sidecar base ...45:30; gimlets ...45:21/22/23.
     let mac_last = if sidecar {

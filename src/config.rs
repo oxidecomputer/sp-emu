@@ -176,10 +176,19 @@ pub fn init(
                     );
                 }
             }
-            let file = parse_config_toml(&text).unwrap_or_else(|e| {
-                eprintln!("[config] ignoring malformed {path}: {e}");
-                Vec::new()
-            });
+            // Malformed TOML is an error for the same reason an unreadable
+            // path is: the flag exists to reproduce a run, so failing open
+            // to an all-defaults instance defeats it.
+            let file = parse_config_toml(&text)
+                .map_err(|e| anyhow!("malformed --load-config {path}: {e}"))?;
+            // Unknown keys stay non-fatal (forward compatibility with a file
+            // carrying a knob this build dropped) but are named, so a typo'd
+            // knob does not silently resolve to its default.
+            for (k, _) in &file {
+                if !sp_emu_config::ENV_NAMES.contains(&k.as_str()) {
+                    eprintln!("[config] {path}: unrecognized key {k} ignored");
+                }
+            }
             eprintln!(
                 "[config] loaded {} ({} vars); ignoring the SP_EMU_* environment",
                 path,

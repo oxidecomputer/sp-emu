@@ -60,6 +60,10 @@ const STAT_CODEOUTAVAIL: u32 = 1 << 7;
 // ALLOW: enroll(0), start(1), setkey(2), getkey(3); report all permitted.
 const ALLOW_ALL: u32 = 0x0F;
 
+// KEYSIZE is a 6-bit field (UM11126): key length in 64-bit units. Masking
+// writes bounds the keycode stream a guest can request.
+const KEYSIZE_MASK: u32 = 0x3F;
+
 pub struct Puf {
     keyindex: u32,
     keysize: u32,
@@ -176,8 +180,9 @@ impl Puf {
                 }
                 // Keycode fully fed back: stream the seed out of KEYOUTPUT
                 // (little-endian words, matching the driver's to_ne_bytes on the
-                // little-endian Cortex-M33).
-                let words = self.key_bytes() / 4;
+                // little-endian Cortex-M33). A key length beyond the modeled
+                // seed clamps to the seed; the driver only asks for 256 bits.
+                let words = self.key_bytes().min(self.seed.len()) / 4;
                 for i in 0..words {
                     let b: [u8; 4] = self.seed[i * 4..i * 4 + 4].try_into().unwrap();
                     self.keyout.push_back(u32::from_le_bytes(b));
@@ -237,7 +242,15 @@ impl Mmio for Puf {
                 }
             }
             KEYINDEX => self.keyindex = val,
-            KEYSIZE => self.keysize = val,
+            KEYSIZE => {
+                if val & !KEYSIZE_MASK != 0 {
+                    eprintln!(
+                        "[puf] KEYSIZE write {val:#x} exceeds the 6-bit \
+                         field; masked"
+                    );
+                }
+                self.keysize = val & KEYSIZE_MASK;
+            }
             CODEINPUT => self.consume_codein(),
             IDXBLK_L => self.idxblk_l = val,
             KEYINPUT => {} // SETKEY path, unused
