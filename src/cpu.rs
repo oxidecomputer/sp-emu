@@ -14,30 +14,24 @@ use crate::host::HostIo;
 use crate::mem::Bus;
 use std::rc::Rc;
 use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
-use yaxpeax_arm::armv7::{ConditionCode, InstDecoder, Opcode, Operand, RegShiftStyle, ShiftStyle};
+use yaxpeax_arm::armv7::{
+    ConditionCode, InstDecoder, Opcode, Operand, RegShiftStyle, ShiftStyle,
+};
 
 #[derive(Debug)]
 pub enum Trap {
-    Decode {
-        pc: u32,
-    },
-    Unimplemented {
-        pc: u32,
-        bytes: [u8; 4],
-        len: u32,
-        disasm: String,
-    },
-    Halt {
-        pc: u32,
-        why: &'static str,
-    },
+    Decode { pc: u32 },
+    Unimplemented { pc: u32, bytes: [u8; 4], len: u32, disasm: String },
+    Halt { pc: u32, why: &'static str },
 }
 
 impl Trap {
     /// The program counter at which the trap occurred (every variant carries one).
     pub fn pc(&self) -> u32 {
         match self {
-            Trap::Decode { pc } | Trap::Unimplemented { pc, .. } | Trap::Halt { pc, .. } => *pc,
+            Trap::Decode { pc }
+            | Trap::Unimplemented { pc, .. }
+            | Trap::Halt { pc, .. } => *pc,
         }
     }
 }
@@ -73,15 +67,15 @@ pub struct Cpu {
     pub cycles: u64,
     pub entered_task: bool,
     pub bad_ret_dumps: u32, // crash detector: count of corrupt-return-PC dumps emitted
-    pub last_vfp: bool,     // last step was a VFP instr (differential harness skip)
-    pub last_it: bool,      // last step was an IT or IT-gated instr (harness skip)
-    pub last_sys: bool,     // last step was MRS/MSR/CPS (Unicorn can't decode M-profile)
-    cur_in_it: bool,        // currently executing inside an IT block
-    cur_setflags: bool,     // effective flag-setting for the current instr (S, suppressed in IT)
-    systick: u32,           // SysTick down-counter (driven per instruction)
+    pub last_vfp: bool, // last step was a VFP instr (differential harness skip)
+    pub last_it: bool,  // last step was an IT or IT-gated instr (harness skip)
+    pub last_sys: bool, // last step was MRS/MSR/CPS (Unicorn can't decode M-profile)
+    cur_in_it: bool,    // currently executing inside an IT block
+    cur_setflags: bool, // effective flag-setting for the current instr (S, suppressed in IT)
+    systick: u32,       // SysTick down-counter (driven per instruction)
     pub wfi_throttle: bool, // enable WFI idle-throttle (set by the gdb serve loop, post-preboot)
-    pub idle_skip: u32,     // instrs skipped to the next tick on an idle WFI (loop sleeps instead)
-    pub tick_events: u64,   // monotonic SysTick underflow events (one per ~1ms); RoT real-time proxy
+    pub idle_skip: u32, // instrs skipped to the next tick on an idle WFI (loop sleeps instead)
+    pub tick_events: u64, // monotonic SysTick underflow events (one per ~1ms); RoT real-time proxy
     pub sp_tick_credit: u32, // RoT-derived ticks the SP still owes itself while blocked on sprot (coupling)
     // Clock freeze: while set, this core's SysTick does not advance from its own
     // running; only a credit-armed tick (sp_tick_credit drained in WFI) fires. Used to
@@ -89,15 +83,15 @@ pub struct Cpu {
     // active polling advances its own clock and races past the poll deadline.
     pub tick_frozen: bool,
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
-    pub halted: bool,       // external debug halt (DHCSR C_HALT via the SWD debug port)
-    pub debug_en: bool,     // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
-    pub bkpt_hit: bool,     // last halt was a BKPT instruction (reported as DFSR.BKPT)
+    pub halted: bool, // external debug halt (DHCSR C_HALT via the SWD debug port)
+    pub debug_en: bool, // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
+    pub bkpt_hit: bool, // last halt was a BKPT instruction (reported as DFSR.BKPT)
     // Boot-ROM API emulation (RoT core, config::rot_rom). When `rom_traps` is set,
     // a branch into the boot-ROM trap window is serviced by `crate::romapi`;
     // `rom_call` carries an in-flight call's resumable state across steps/interrupts.
     pub rom_traps: bool,
     pub rom_call: crate::romapi::RomCall,
-    pub trace_svc: bool,    // log Hubris syscalls (Sysnum in r11) at each SVC (RoT IPC tracing)
+    pub trace_svc: bool, // log Hubris syscalls (Sysnum in r11) at each SVC (RoT IPC tracing)
     pub last_disasm: String,
     decoder: InstDecoder,
     /// PC-keyed decode cache. Hubris executes in place from immutable flash, so
@@ -142,9 +136,9 @@ pub struct Cpu {
 
 /// A cached fetch+decode for one instruction at a fixed flash PC.
 struct Decoded {
-    raw: u32,     // the 32-bit little-endian instruction word (operands re-read from this)
+    raw: u32, // the 32-bit little-endian instruction word (operands re-read from this)
     buf: [u8; 4], // the raw bytes (for Trap reporting)
-    len: u32,     // encoded length (2 or 4)
+    len: u32, // encoded length (2 or 4)
     inst: Option<yaxpeax_arm::armv7::Instruction>, // None => yaxpeax Err (VFP / try_vfp on raw)
 }
 
@@ -271,18 +265,10 @@ impl Cpu {
     /// The two stack pointers, resolved to their banked values regardless of
     /// which one is currently active (`r[13]`).
     pub fn current_msp(&self) -> u32 {
-        if self.sp_is_psp {
-            self.msp
-        } else {
-            self.r[SP]
-        }
+        if self.sp_is_psp { self.msp } else { self.r[SP] }
     }
     pub fn current_psp(&self) -> u32 {
-        if self.sp_is_psp {
-            self.r[SP]
-        } else {
-            self.psp
-        }
+        if self.sp_is_psp { self.r[SP] } else { self.psp }
     }
 
     /// xPSR as a debugger sees it: APSR flags | IPSR exception number | Thumb.
@@ -346,7 +332,7 @@ impl Cpu {
                 self.faultmask = (v >> 16) & 1 != 0;
                 self.set_control(v >> 24);
             }
-            33 => self.fpscr = v,                     // FPSCR
+            33 => self.fpscr = v, // FPSCR
             64..=95 => self.s[(n - 64) as usize] = v, // S0..S31
             _ => {}
         }
@@ -448,11 +434,7 @@ impl Cpu {
 
     #[inline]
     fn read_reg(&self, i: u8) -> u32 {
-        if i == 15 {
-            self.cur_insn.wrapping_add(4)
-        } else {
-            self.r[i as usize]
-        }
+        if i == 15 { self.cur_insn.wrapping_add(4) } else { self.r[i as usize] }
     }
     #[inline]
     fn write_reg(&mut self, i: u8, v: u32) {
@@ -463,7 +445,11 @@ impl Cpu {
         }
     }
 
-    pub fn step(&mut self, bus: &mut Bus, host: &mut dyn HostIo) -> Result<(), Trap> {
+    pub fn step(
+        &mut self,
+        bus: &mut Bus,
+        host: &mut dyn HostIo,
+    ) -> Result<(), Trap> {
         let pc = self.pc;
         // Boot-ROM API trap (RoT core, config::rot_rom): the guest branched into
         // the synthesized boot-ROM window. Service it in host code; the call may
@@ -489,7 +475,8 @@ impl Cpu {
         // instructions) be decoded once instead of every instruction; the debug
         // port invalidates those entries on injection (`invalidate_decode`), and
         // gating on `debug_en` keeps normal execution's mutable ITCM uncached.
-        let cacheable = self.flash_cache.contains(&pc) || (self.debug_en && pc < ITCM_HI);
+        let cacheable =
+            self.flash_cache.contains(&pc) || (self.debug_en && pc < ITCM_HI);
         let dec: Rc<Decoded> = if cacheable {
             match self.dcache.get(&pc) {
                 Some(d) => d.clone(), // Rc bump; decouples from the &mut self execute below
@@ -527,13 +514,14 @@ impl Cpu {
                 }
                 self.pc = pc.wrapping_add(len);
                 if cond_ok {
-                    self.execute(inst, pc, len, raw, bus, host)
-                        .map_err(|_| Trap::Unimplemented {
+                    self.execute(inst, pc, len, raw, bus, host).map_err(|_| {
+                        Trap::Unimplemented {
                             pc,
                             bytes: buf,
                             len,
                             disasm: format!("{}", inst),
-                        })
+                        }
+                    })
                 } else {
                     Ok(()) // condition false: skip the instruction
                 }
@@ -541,7 +529,8 @@ impl Cpu {
             None => {
                 // VFP (or genuinely unimplemented). Thumb VFP encodings are 4 bytes.
                 if cond_ok {
-                    if self.try_v8m(raw, pc, bus) || self.try_vfp(raw, pc, bus) {
+                    if self.try_v8m(raw, pc, bus) || self.try_vfp(raw, pc, bus)
+                    {
                         Ok(())
                     } else {
                         Err(Trap::Decode { pc })
@@ -612,25 +601,16 @@ impl Cpu {
     fn fetch_decode(&self, pc: u32, bus: &mut Bus) -> Decoded {
         let mut buf = [0u8; 4];
         buf[0..2].copy_from_slice(&bus.read16(pc).to_le_bytes());
-        buf[2..4].copy_from_slice(&bus.read16(pc.wrapping_add(2)).to_le_bytes());
+        buf[2..4]
+            .copy_from_slice(&bus.read16(pc.wrapping_add(2)).to_le_bytes());
         let raw = u32::from_le_bytes(buf);
         let mut reader = U8Reader::new(&buf);
         match self.decoder.decode(&mut reader) {
             Ok(inst) => {
                 let len = inst.len().to_const();
-                Decoded {
-                    raw,
-                    buf,
-                    len,
-                    inst: Some(inst),
-                }
+                Decoded { raw, buf, len, inst: Some(inst) }
             }
-            Err(_) => Decoded {
-                raw,
-                buf,
-                len: 4,
-                inst: None,
-            },
+            Err(_) => Decoded { raw, buf, len: 4, inst: None },
         }
     }
 
@@ -651,7 +631,11 @@ impl Cpu {
         self.cur_setflags = s; // so alu()/shift_op() honor the IT-block suppression too
         match inst.opcode {
             Opcode::NOP => Ok(()),
-            Opcode::DSB | Opcode::DMB | Opcode::ISB | Opcode::YIELD | Opcode::WFE => Ok(()),
+            Opcode::DSB
+            | Opcode::DMB
+            | Opcode::ISB
+            | Opcode::YIELD
+            | Opcode::WFE => Ok(()),
             Opcode::WFI => {
                 // Wait-for-interrupt. When idle-throttling is enabled (the gdb
                 // serve loop, post-preboot) and nothing is pending, skip the idle
@@ -669,7 +653,10 @@ impl Cpu {
                 if !bus.any_pending_irq() {
                     self.wfi_idle = true;
                 }
-                if self.wfi_throttle && self.systick > 1 && !bus.any_pending_irq() {
+                if self.wfi_throttle
+                    && self.systick > 1
+                    && !bus.any_pending_irq()
+                {
                     if self.sp_tick_credit > 0 {
                         // sprot coupling: the SP is blocked on an sprot
                         // request the RoT has accepted, and the serve loop credited
@@ -711,20 +698,40 @@ impl Cpu {
                 Ok(())
             }
 
-            Opcode::PUSH => self.stmdb_regs(bus, SP as u8, reglist(&ops[0])?, true),
-            Opcode::POP => self.ldmia_regs(bus, SP as u8, reglist(&ops[0])?, true),
+            Opcode::PUSH => {
+                self.stmdb_regs(bus, SP as u8, reglist(&ops[0])?, true)
+            }
+            Opcode::POP => {
+                self.ldmia_regs(bus, SP as u8, reglist(&ops[0])?, true)
+            }
 
             // yaxpeax's LDM/STM (add, pre) tuple is unreliable (it reports 16-bit
             // STMIA as increment-before), so decode the addressing mode from raw.
             Opcode::STM(..) => {
                 let (rn, wb) = regwback(&ops[0])?;
                 let (add, pre) = ldm_stm_mode(raw, len);
-                self.block_transfer(bus, rn, wb, reglist(&ops[1])?, add, pre, true)
+                self.block_transfer(
+                    bus,
+                    rn,
+                    wb,
+                    reglist(&ops[1])?,
+                    add,
+                    pre,
+                    true,
+                )
             }
             Opcode::LDM(..) => {
                 let (rn, wb) = regwback(&ops[0])?;
                 let (add, pre) = ldm_stm_mode(raw, len);
-                self.block_transfer(bus, rn, wb, reglist(&ops[1])?, add, pre, false)
+                self.block_transfer(
+                    bus,
+                    rn,
+                    wb,
+                    reglist(&ops[1])?,
+                    add,
+                    pre,
+                    false,
+                )
             }
 
             Opcode::MOV => {
@@ -855,14 +862,20 @@ impl Cpu {
                 let a = self.read_reg(reg(&ops[1])?);
                 let b = self.read_reg(reg(&ops[2])?);
                 let c = self.read_reg(reg(&ops[3])?);
-                self.write_reg(reg(&ops[0])?, a.wrapping_mul(b).wrapping_add(c));
+                self.write_reg(
+                    reg(&ops[0])?,
+                    a.wrapping_mul(b).wrapping_add(c),
+                );
                 Ok(())
             }
             Opcode::MLS => {
                 let a = self.read_reg(reg(&ops[1])?);
                 let b = self.read_reg(reg(&ops[2])?);
                 let c = self.read_reg(reg(&ops[3])?);
-                self.write_reg(reg(&ops[0])?, c.wrapping_sub(a.wrapping_mul(b)));
+                self.write_reg(
+                    reg(&ops[0])?,
+                    c.wrapping_sub(a.wrapping_mul(b)),
+                );
                 Ok(())
             }
             Opcode::UMULL => {
@@ -896,7 +909,8 @@ impl Cpu {
                 let a = self.read_reg(reg(&ops[2])?) as i32 as i64;
                 let b = self.read_reg(reg(&ops[3])?) as i32 as i64;
                 let acc = (((self.read_reg(reg(&ops[1])?) as u64) << 32)
-                    | self.read_reg(reg(&ops[0])?) as u64) as i64;
+                    | self.read_reg(reg(&ops[0])?) as u64)
+                    as i64;
                 let p = acc.wrapping_add(a * b);
                 self.write_reg(reg(&ops[0])?, p as u32);
                 self.write_reg(reg(&ops[1])?, (p >> 32) as u32);
@@ -927,11 +941,7 @@ impl Cpu {
                 let b = self.read_reg(reg(&ops[2])?) as i32;
                 self.write_reg(
                     reg(&ops[0])?,
-                    if b == 0 {
-                        0
-                    } else {
-                        (a.wrapping_div(b)) as u32
-                    },
+                    if b == 0 { 0 } else { (a.wrapping_div(b)) as u32 },
                 );
                 Ok(())
             }
@@ -1024,11 +1034,8 @@ impl Cpu {
                 let rn = self.read_reg(reg(&ops[1])?);
                 let lsb = imm_val(&ops[2])?;
                 let width = imm_val(&ops[3])?;
-                let mask = if width >= 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << width) - 1
-                };
+                let mask =
+                    if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
                 self.write_reg(reg(&ops[0])?, (rn >> lsb) & mask);
                 Ok(())
             }
@@ -1056,7 +1063,8 @@ impl Cpu {
                 let rn = (hw1 & 0xF) as u8;
                 let rd = ((hw2 >> 8) & 0xF) as u8;
                 let rm = (hw2 & 0xF) as u8;
-                let shift = ((((hw2 >> 12) & 0x7) << 2) | ((hw2 >> 6) & 0x3)) as u32;
+                let shift =
+                    ((((hw2 >> 12) & 0x7) << 2) | ((hw2 >> 6) & 0x3)) as u32;
                 let tb = (hw2 >> 5) & 1; // 0 = PKHBT (LSL), 1 = PKHTB (ASR)
                 let (vn, vm) = (self.read_reg(rn), self.read_reg(rm));
                 let result = if tb == 0 {
@@ -1188,7 +1196,8 @@ impl Cpu {
                 } else {
                     bus.read8(base.wrapping_add(idx)) as u32
                 };
-                self.pc = self.cur_insn.wrapping_add(4).wrapping_add(offset << 1);
+                self.pc =
+                    self.cur_insn.wrapping_add(4).wrapping_add(offset << 1);
                 Ok(())
             }
 
@@ -1322,7 +1331,11 @@ impl Cpu {
         Ok(())
     }
 
-    fn shift_op(&mut self, ops: &[Operand; 4], style: ShiftStyle) -> Result<(), ()> {
+    fn shift_op(
+        &mut self,
+        ops: &[Operand; 4],
+        style: ShiftStyle,
+    ) -> Result<(), ()> {
         let rd = reg(&ops[0])?;
         let (rm, amt) = if matches!(ops[2], Operand::Nothing) {
             (self.read_reg(rd), self.opval(&ops[1])?)
@@ -1403,7 +1416,8 @@ impl Cpu {
             }
         };
         let lo = ext(v & 0xFF).wrapping_add(acc & 0xFFFF) & 0xFFFF;
-        let hi = ext((v >> 16) & 0xFF).wrapping_add((acc >> 16) & 0xFFFF) & 0xFFFF;
+        let hi =
+            ext((v >> 16) & 0xFF).wrapping_add((acc >> 16) & 0xFFFF) & 0xFFFF;
         self.write_reg(rd, (hi << 16) | lo);
         Ok(())
     }
@@ -1516,7 +1530,11 @@ impl Cpu {
         }
     }
 
-    fn load_double(&mut self, ops: &[Operand; 4], bus: &mut Bus) -> Result<(), ()> {
+    fn load_double(
+        &mut self,
+        ops: &[Operand; 4],
+        bus: &mut Bus,
+    ) -> Result<(), ()> {
         let (rt, rt2) = (reg(&ops[0])?, reg(&ops[1])?);
         let addr = self.mem_addr(&ops[2])?;
         let a = bus.read32(addr);
@@ -1525,7 +1543,11 @@ impl Cpu {
         self.write_reg(rt2, b);
         Ok(())
     }
-    fn store_double(&mut self, ops: &[Operand; 4], bus: &mut Bus) -> Result<(), ()> {
+    fn store_double(
+        &mut self,
+        ops: &[Operand; 4],
+        bus: &mut Bus,
+    ) -> Result<(), ()> {
         let (rt, rt2) = (reg(&ops[0])?, reg(&ops[1])?);
         let addr = self.mem_addr(&ops[2])?;
         bus.write32(addr, self.read_reg(rt));
@@ -1618,10 +1640,22 @@ impl Cpu {
     }
 
     /// PUSH = STMDB sp! ; POP = LDMIA sp!. Generic block transfer otherwise.
-    fn stmdb_regs(&mut self, bus: &mut Bus, rn: u8, mask: u16, wback: bool) -> Result<(), ()> {
+    fn stmdb_regs(
+        &mut self,
+        bus: &mut Bus,
+        rn: u8,
+        mask: u16,
+        wback: bool,
+    ) -> Result<(), ()> {
         self.block_transfer(bus, rn, wback, mask, false, true, true)
     }
-    fn ldmia_regs(&mut self, bus: &mut Bus, rn: u8, mask: u16, wback: bool) -> Result<(), ()> {
+    fn ldmia_regs(
+        &mut self,
+        bus: &mut Bus,
+        rn: u8,
+        mask: u16,
+        wback: bool,
+    ) -> Result<(), ()> {
         self.block_transfer(bus, rn, wback, mask, true, false, false)
     }
 
@@ -1639,9 +1673,9 @@ impl Cpu {
         let count = mask.count_ones();
         let base = self.r[rn as usize];
         let mut addr = match (add, pre) {
-            (true, false) => base,                                          // IA
-            (true, true) => base.wrapping_add(4),                           // IB
-            (false, true) => base.wrapping_sub(4 * count),                  // DB
+            (true, false) => base,                         // IA
+            (true, true) => base.wrapping_add(4),          // IB
+            (false, true) => base.wrapping_sub(4 * count), // DB
             (false, false) => base.wrapping_sub(4 * count).wrapping_add(4), // DA
         };
         // Defer loading PC: a popped EXC_RETURN triggers an exception return that
@@ -1831,7 +1865,10 @@ impl Cpu {
             // the serve loop diffs the RoT's `tick_events` to pace the SP's SysTick
             // during a coupled sprot wait.
             self.tick_events = self.tick_events.wrapping_add(1);
-            if self.syst_csr & 2 != 0 && self.mode == Mode::Thread && !self.primask {
+            if self.syst_csr & 2 != 0
+                && self.mode == Mode::Thread
+                && !self.primask
+            {
                 self.exception_entry(15, bus); // SysTick exception
             }
         }
@@ -1851,7 +1888,10 @@ impl Cpu {
             // (0 = disabled). Priorities live in the high bits of the byte.
             if self.basepri == 0 || (bus.irq_prio(irq) as u32) < self.basepri {
                 if ETHDBG_IRQS.contains(&irq) && crate::dbg::eth() {
-                    eprintln!("[irq] delivering IRQ {} at cyc {}", irq, self.cycles);
+                    eprintln!(
+                        "[irq] delivering IRQ {} at cyc {}",
+                        irq, self.cycles
+                    );
                 }
                 bus.clear_pending(irq);
                 self.exception_entry(16 + irq as u32, bus); // exception number = 16 + IRQ
@@ -1917,17 +1957,25 @@ impl Cpu {
             );
         }
         let return_addr = self.pc; // already advanced past the SVC
-                                   // If FP context is active (CONTROL.FPCA), the hardware stacks an extended
-                                   // frame (basic + S0-S15 + FPSCR + reserved). Entry and return must agree,
-                                   // or the task's stack pointer drifts across syscalls.
+        // If FP context is active (CONTROL.FPCA), the hardware stacks an extended
+        // frame (basic + S0-S15 + FPSCR + reserved). Entry and return must agree,
+        // or the task's stack pointer drifts across syscalls.
         let fpca = self.control & 4 != 0;
         let words = if fpca { 26 } else { 8 };
         let frame_base = self.r[SP].wrapping_sub(4 * words);
         // Trace exceptions taken from a task's code (thread mode) to locate a
         // return that restores a corrupt PC. Gated by $SP_EMU_EXCDBG.
         if self.mode == Mode::Thread && fpca && crate::dbg::exc() {
-            eprintln!("[exc-ent] vec={} from_pc={:#010x} fpca={} it={:#04x} sp={:#010x} frame={:#010x} cyc={}",
-                vecnum, return_addr, fpca, self.itstate, self.r[SP], frame_base, self.cycles);
+            eprintln!(
+                "[exc-ent] vec={} from_pc={:#010x} fpca={} it={:#04x} sp={:#010x} frame={:#010x} cyc={}",
+                vecnum,
+                return_addr,
+                fpca,
+                self.itstate,
+                self.r[SP],
+                frame_base,
+                self.cycles
+            );
         }
         let basic = [
             self.r[0],
@@ -2001,8 +2049,10 @@ impl Cpu {
         // port.
         if !self.is_code(pc) && self.bad_ret_dumps < 6 {
             self.bad_ret_dumps += 1;
-            eprintln!("[exc-ret BAD] return PC={:#010x} (not code!) exc={:#x} from_psp={} base={:#010x} lr={:#010x} xpsr={:#010x} cyc={}",
-                pc, exc, return_psp, base, lr, xpsr, self.cycles);
+            eprintln!(
+                "[exc-ret BAD] return PC={:#010x} (not code!) exc={:#x} from_psp={} base={:#010x} lr={:#010x} xpsr={:#010x} cyc={}",
+                pc, exc, return_psp, base, lr, xpsr, self.cycles
+            );
             eprintln!(
                 "   frame: r0={:#x} r1={:#x} r2={:#x} r3={:#x} r12={:#x}",
                 r0, r1, r2, r3, r12
@@ -2014,11 +2064,7 @@ impl Cpu {
                     "   [{:#010x}] = {:#010x}{}",
                     a,
                     bus.read32(a),
-                    if a == base + 24 {
-                        "  <-- stacked PC"
-                    } else {
-                        ""
-                    }
+                    if a == base + 24 { "  <-- stacked PC" } else { "" }
                 );
             }
         }
@@ -2049,11 +2095,7 @@ impl Cpu {
         } else {
             self.control &= !4;
         }
-        self.mode = if to_thread {
-            Mode::Thread
-        } else {
-            Mode::Handler
-        };
+        self.mode = if to_thread { Mode::Thread } else { Mode::Handler };
         if to_thread {
             if return_psp {
                 self.control |= 2;
@@ -2071,15 +2113,13 @@ impl Cpu {
         if to_thread && extended && crate::dbg::exc() {
             eprintln!(
                 "[exc-ret] exc={:#x} -> pc={:#010x} extended={} base={:#010x} it={:#04x} cyc={}",
-                exc,
-                self.pc,
-                extended,
-                base,
-                self.itstate,
-                self.cycles
+                exc, self.pc, extended, base, self.itstate, self.cycles
             );
         }
-        if self.mode == Mode::Thread && (self.control & 1) != 0 && !self.entered_task {
+        if self.mode == Mode::Thread
+            && (self.control & 1) != 0
+            && !self.entered_task
+        {
             self.entered_task = true;
             if crate::dbg::exc() {
                 eprintln!(
@@ -2121,23 +2161,25 @@ impl Cpu {
         let single = (hw2 >> 8) & 1 == 0;
         let imm8 = hw2 & 0xFF;
 
-        let load_store_single = |s: &mut [u32; 32], bus: &mut Bus, reg: usize, addr: u32| {
-            if l == 1 {
-                s[reg & 31] = bus.read32(addr);
-            } else {
-                bus.write32(addr, s[reg & 31]);
-            }
-        };
-        let load_store_double = |s: &mut [u32; 32], bus: &mut Bus, dreg: usize, addr: u32| {
-            let r = (dreg & 15) * 2;
-            if l == 1 {
-                s[r] = bus.read32(addr);
-                s[r + 1] = bus.read32(addr.wrapping_add(4));
-            } else {
-                bus.write32(addr, s[r]);
-                bus.write32(addr.wrapping_add(4), s[r + 1]);
-            }
-        };
+        let load_store_single =
+            |s: &mut [u32; 32], bus: &mut Bus, reg: usize, addr: u32| {
+                if l == 1 {
+                    s[reg & 31] = bus.read32(addr);
+                } else {
+                    bus.write32(addr, s[reg & 31]);
+                }
+            };
+        let load_store_double =
+            |s: &mut [u32; 32], bus: &mut Bus, dreg: usize, addr: u32| {
+                let r = (dreg & 15) * 2;
+                if l == 1 {
+                    s[r] = bus.read32(addr);
+                    s[r + 1] = bus.read32(addr.wrapping_add(4));
+                } else {
+                    bus.write32(addr, s[r]);
+                    bus.write32(addr.wrapping_add(4), s[r + 1]);
+                }
+            };
 
         if p == 1 && w == 0 {
             // VLDR / VSTR: single register, byte offset = imm8 << 2.
@@ -2153,9 +2195,19 @@ impl Cpu {
                 base.wrapping_sub(off)
             };
             if single {
-                load_store_single(&mut self.s, bus, ((vd << 1) | d) as usize, addr);
+                load_store_single(
+                    &mut self.s,
+                    bus,
+                    ((vd << 1) | d) as usize,
+                    addr,
+                );
             } else {
-                load_store_double(&mut self.s, bus, ((d << 4) | vd) as usize, addr);
+                load_store_double(
+                    &mut self.s,
+                    bus,
+                    ((d << 4) | vd) as usize,
+                    addr,
+                );
             }
         } else {
             // VLDM / VSTM / VPUSH / VPOP: imm8 = number of transferred words.
@@ -2164,16 +2216,22 @@ impl Cpu {
             let stride = if single { 4 } else { 8 };
             let total = stride * count;
             let base = self.r[rn];
-            let mut addr = if u == 1 {
-                base
-            } else {
-                base.wrapping_sub(total)
-            };
+            let mut addr = if u == 1 { base } else { base.wrapping_sub(total) };
             for i in 0..count {
                 if single {
-                    load_store_single(&mut self.s, bus, (first + i) as usize, addr);
+                    load_store_single(
+                        &mut self.s,
+                        bus,
+                        (first + i) as usize,
+                        addr,
+                    );
                 } else {
-                    load_store_double(&mut self.s, bus, (first + i) as usize, addr);
+                    load_store_double(
+                        &mut self.s,
+                        bus,
+                        (first + i) as usize,
+                        addr,
+                    );
                 }
                 addr = addr.wrapping_add(stride);
             }
@@ -2241,8 +2299,9 @@ impl Cpu {
             // Double precision: register number = (bit<<4)|Vx; value spans 2 words.
             let dr = |x: u32, b: u32| (((b << 4) | x) as usize & 15) * 2;
             let (dd, dn, dm) = (dr(vd, d), dr(vn, n), dr(vm, m));
-            let getd =
-                |s: &[u32; 32], i: usize| f64::from_bits(s[i] as u64 | ((s[i + 1] as u64) << 32));
+            let getd = |s: &[u32; 32], i: usize| {
+                f64::from_bits(s[i] as u64 | ((s[i + 1] as u64) << 32))
+            };
             let setd = |s: &mut [u32; 32], i: usize, v: f64| {
                 let b = v.to_bits();
                 s[i] = b as u32;
@@ -2253,11 +2312,7 @@ impl Cpu {
                 let r = match opc1 {
                     0b00 => {
                         let acc = getd(&self.s, dd);
-                        if op == 0 {
-                            acc + a * b
-                        } else {
-                            acc - a * b
-                        }
+                        if op == 0 { acc + a * b } else { acc - a * b }
                     }
                     0b10 => {
                         if op == 0 {
@@ -2300,19 +2355,11 @@ impl Cpu {
             let r = match opc1 {
                 0b00 => {
                     let acc = f(&self.s, sd);
-                    if op == 0 {
-                        acc + a * b
-                    } else {
-                        acc - a * b
-                    }
+                    if op == 0 { acc + a * b } else { acc - a * b }
                 } // VMLA/VMLS
                 0b01 => {
                     let acc = f(&self.s, sd);
-                    if op == 0 {
-                        a * b - acc
-                    } else {
-                        -(a * b) - acc
-                    }
+                    if op == 0 { a * b - acc } else { -(a * b) - acc }
                 } // VNMLS/VNMLA
                 0b10 => {
                     if op == 0 {
@@ -2378,11 +2425,8 @@ impl Cpu {
                 0b1100 | 0b1101 => {
                     // VCVT.<S32|U32>.F32  (float -> int, round toward zero)
                     let v = f(&self.s, sm);
-                    self.s[sd] = if vn & 1 == 1 {
-                        (v as i32) as u32
-                    } else {
-                        v as u32
-                    };
+                    self.s[sd] =
+                        if vn & 1 == 1 { (v as i32) as u32 } else { v as u32 };
                 }
                 _ => {}
             }
@@ -2416,7 +2460,8 @@ impl Cpu {
         if self.itstate & 0b111 == 0 {
             self.itstate = 0;
         } else {
-            self.itstate = (self.itstate & 0b1110_0000) | ((self.itstate << 1) & 0b0001_1111);
+            self.itstate = (self.itstate & 0b1110_0000)
+                | ((self.itstate << 1) & 0b0001_1111);
         }
     }
 
@@ -2569,13 +2614,21 @@ fn thumb_branch_target(raw: u32, pc: u32, len: u32) -> u32 {
             let i1 = 1 - (j1 ^ s);
             let i2 = 1 - (j2 ^ s);
             let imm10 = hw1 & 0x3FF;
-            let off = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+            let off = (s << 24)
+                | (i1 << 23)
+                | (i2 << 22)
+                | (imm10 << 12)
+                | (imm11 << 1);
             let off = ((off << 7) as i32 >> 7) as u32;
             pc.wrapping_add(4).wrapping_add(off)
         } else {
             // T3 conditional B.W: 21-bit signed offset
             let imm6 = hw1 & 0x3F;
-            let off = (s << 20) | (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1);
+            let off = (s << 20)
+                | (j2 << 19)
+                | (j1 << 18)
+                | (imm6 << 12)
+                | (imm11 << 1);
             let off = ((off << 11) as i32 >> 11) as u32;
             pc.wrapping_add(4).wrapping_add(off)
         }
@@ -2617,7 +2670,9 @@ fn ldm_stm_mode(raw: u32, len: u32) -> (bool, bool) {
 fn vfp_expand_imm32(imm8: u32) -> u32 {
     let sign = (imm8 >> 7) & 1;
     let b6 = (imm8 >> 6) & 1;
-    let exp = ((1 - b6) << 7) | ((if b6 == 1 { 0x1F } else { 0 }) << 2) | ((imm8 >> 4) & 3);
+    let exp = ((1 - b6) << 7)
+        | ((if b6 == 1 { 0x1F } else { 0 }) << 2)
+        | ((imm8 >> 4) & 3);
     let frac = (imm8 & 0xF) << 19;
     (sign << 31) | (exp << 23) | frac
 }
@@ -2825,7 +2880,10 @@ mod tests {
         // A credit arm (systick == 1) fires exactly one tick even while frozen.
         cpu.systick = 1;
         cpu.maybe_tick(&mut bus);
-        assert_eq!(cpu.tick_events, 1, "a credit-armed tick fires while frozen");
+        assert_eq!(
+            cpu.tick_events, 1,
+            "a credit-armed tick fires while frozen"
+        );
     }
 
     // Thumb `WFI` = 0xBF30.
@@ -2871,7 +2929,10 @@ mod tests {
         let mut host = StdoutHost;
         assert!(cpu.step(&mut bus, &mut host).is_ok());
         assert_eq!(cpu.sp_tick_credit, 2, "one credit consumed");
-        assert_eq!(cpu.systick, 1, "a tick is armed to fire on the next maybe_tick");
+        assert_eq!(
+            cpu.systick, 1,
+            "a tick is armed to fire on the next maybe_tick"
+        );
         assert_eq!(cpu.idle_skip, 0, "credited path does not yield/sleep");
     }
 
@@ -2906,7 +2967,10 @@ mod tests {
         cpu.wfi_idle = false;
         let mut host = StdoutHost;
         assert!(cpu.step(&mut bus, &mut host).is_ok());
-        assert!(cpu.wfi_idle, "an idle WFI is signalled regardless of throttle");
+        assert!(
+            cpu.wfi_idle,
+            "an idle WFI is signalled regardless of throttle"
+        );
         assert_eq!(cpu.idle_skip, 0, "throttle path did not run");
     }
 
@@ -2971,11 +3035,7 @@ mod tests {
             cpu.r[3] = 100;
             let mut host = StdoutHost;
             assert!(cpu.step(&mut bus, &mut host).is_ok());
-            assert_eq!(
-                cpu.r[0],
-                want as u32,
-                "n_top={n_top} m_top={m_top}"
-            );
+            assert_eq!(cpu.r[0], want as u32, "n_top={n_top} m_top={m_top}");
         }
     }
 

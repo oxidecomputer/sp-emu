@@ -124,8 +124,9 @@ const ST_ECC: u32 = 1 << 3;
 /// The Bart keyset root-key hash (CMPA `rotkh`). A hash of the public root keys,
 /// shared by every Bart-signed device (keyset identity, not device-unique).
 const RKTH_BART: [u8; 32] = [
-    0x84, 0x33, 0x2e, 0xf8, 0x27, 0x9d, 0xf8, 0x7f, 0xbb, 0x75, 0x9d, 0xc3, 0x86, 0x6c, 0xbc, 0x50,
-    0xcd, 0x24, 0x6f, 0xbb, 0x5a, 0x64, 0x70, 0x5a, 0x7e, 0x60, 0xba, 0x86, 0xbf, 0x01, 0xc2, 0x7d,
+    0x84, 0x33, 0x2e, 0xf8, 0x27, 0x9d, 0xf8, 0x7f, 0xbb, 0x75, 0x9d, 0xc3,
+    0x86, 0x6c, 0xbc, 0x50, 0xcd, 0x24, 0x6f, 0xbb, 0x5a, 0x64, 0x70, 0x5a,
+    0x7e, 0x60, 0xba, 0x86, 0xbf, 0x01, 0xc2, 0x7d,
 ];
 /// DCFG_CC_SOCU debug-configuration word (pin and default hold the same value on
 /// this debug-open board).
@@ -134,9 +135,7 @@ const DCFG_CC_SOCU: u32 = 0xfd00_02ff;
 const CFPA_HASH_OFF: usize = 0x1E0;
 
 fn to_page(bytes: Vec<u8>) -> [u8; PAGE] {
-    bytes
-        .try_into()
-        .expect("a packed CMPA/CFPA page is exactly 512 bytes")
+    bytes.try_into().expect("a packed CMPA/CFPA page is exactly 512 bytes")
 }
 
 /// CMPA, kept verbatim from a real Bart-signed device: the secure-boot config and
@@ -184,8 +183,8 @@ fn load_page_override(path: Option<&str>) -> Result<Option<[u8; PAGE]>> {
     let Some(path) = path else {
         return Ok(None);
     };
-    let bytes =
-        std::fs::read(path).map_err(|e| anyhow::anyhow!("rot CMPA/CFPA override {path}: {e}"))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("rot CMPA/CFPA override {path}: {e}"))?;
     let page: [u8; PAGE] = bytes.as_slice().try_into().map_err(|_| {
         anyhow::anyhow!(
             "rot CMPA/CFPA override {path}: {} bytes, need {PAGE}",
@@ -249,15 +248,18 @@ impl RotFlash {
         let use_persisted = persisted && !cfg.rot_fresh();
         if use_persisted {
             // Warn loudly if provisioning overrides are being shadowed by the file.
-            if cfg.rot_cmpa().is_some() || cfg.rot_cfpa().is_some() || cfg.rot_bootleby().is_some()
+            if cfg.rot_cmpa().is_some()
+                || cfg.rot_cfpa().is_some()
+                || cfg.rot_bootleby().is_some()
             {
                 eprintln!(
                     "[rotflash] WARNING: persisted {path} shadows SP_EMU_ROT_CMPA/CFPA/BOOTLEBY \
                      (ignored). Set SP_EMU_ROT_FRESH=1 or delete the file to apply them."
                 );
             }
-            let data = std::fs::read(path)
-                .map_err(|e| anyhow::anyhow!("reading persisted RoT flash {path}: {e}"))?;
+            let data = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("reading persisted RoT flash {path}: {e}")
+            })?;
             let n = data.len().min(SIZE);
             f.mem[..n].copy_from_slice(&data[..n]);
             // The erased bitset is load-bearing (blank-check and erased-read
@@ -276,7 +278,9 @@ impl RotFlash {
             );
         } else {
             if persisted {
-                eprintln!("[rotflash] SP_EMU_ROT_FRESH: ignoring persisted {path}, re-seeding");
+                eprintln!(
+                    "[rotflash] SP_EMU_ROT_FRESH: ignoring persisted {path}, re-seeding"
+                );
             }
             eprintln!(
                 "[rotflash] seeded fresh RoT flash (slot A image + CMPA/CFPA/NMPA) to {path}"
@@ -324,10 +328,12 @@ impl RotFlash {
         // Real device CMPA/CFPA pages if provided (SP_EMU_ROT_CMPA/CFPA, for running
         // real bootleby), else the synthesized pages. The synthesized CFPA's
         // persistent boot preference follows SP_EMU_ROT_BOOT_PREF.
-        let cmpa = load_page_override(cfg.rot_cmpa())?.unwrap_or_else(seed_cmpa);
+        let cmpa =
+            load_page_override(cfg.rot_cmpa())?.unwrap_or_else(seed_cmpa);
         self.write_pages(CMPA, &cmpa);
         let pref_b = cfg.rot_boot_pref() == Some("b");
-        let cfpa = load_page_override(cfg.rot_cfpa())?.unwrap_or_else(|| seed_cfpa(pref_b));
+        let cfpa = load_page_override(cfg.rot_cfpa())?
+            .unwrap_or_else(|| seed_cfpa(pref_b));
         self.write_pages(CFPA_PING, &cfpa);
         // Pong zeroed, not a copy: on a factory-fresh part the versions tie and
         // bootleby's read_cfpa takes the first page, so ping is unambiguously
@@ -343,7 +349,9 @@ impl RotFlash {
             eprintln!("[rotflash] NMPA from {path} ({n} bytes)");
             self.write_pages(NMPA, &blob[..n]);
         } else {
-            for (i, page) in [(0, NMPA_P0), (1, NMPA_P1), (8, NMPA_P8), (9, NMPA_P9)] {
+            for (i, page) in
+                [(0, NMPA_P0), (1, NMPA_P1), (8, NMPA_P8), (9, NMPA_P9)]
+            {
                 self.write_pages(NMPA + i * PAGE, page);
             }
         }
@@ -476,7 +484,9 @@ impl RotFlash {
                 // completion the firmware would take as success.
                 if self.unknown_cmds_logged & (1 << unknown) == 0 {
                     self.unknown_cmds_logged |= 1 << unknown;
-                    eprintln!("[rotflash] unimplemented CMD={unknown}; reporting FAIL");
+                    eprintln!(
+                        "[rotflash] unimplemented CMD={unknown}; reporting FAIL"
+                    );
                 }
                 self.status |= ST_DONE | ST_FAIL;
             }
@@ -485,7 +495,8 @@ impl RotFlash {
 
     /// EraseRange: erase every 512-byte page the word range [STARTA, STOPA] spans.
     fn cmd_erase(&mut self) {
-        let (lo, hi) = (self.starta as usize * WORD, self.stopa as usize * WORD);
+        let (lo, hi) =
+            (self.starta as usize * WORD, self.stopa as usize * WORD);
         let (first, last) = (lo / PAGE, hi / PAGE);
         for page in first..=last.min(NPAGES - 1) {
             let base = page * PAGE;
@@ -502,7 +513,8 @@ impl RotFlash {
         let row = (self.starta as usize) % WORDS_PER_PAGE;
         for i in 0..4 {
             let b = self.dataw[i].to_le_bytes();
-            self.page_buf[row * WORD + i * 4..row * WORD + i * 4 + 4].copy_from_slice(&b);
+            self.page_buf[row * WORD + i * 4..row * WORD + i * 4 + 4]
+                .copy_from_slice(&b);
         }
         self.status |= ST_DONE;
     }
@@ -575,7 +587,8 @@ impl RotFlash {
     /// Parse the CFPA page at `page_addr` via the authoritative `lpc55_areas`
     /// layout. An unparseable (e.g. erased) page reads as all-zero fields.
     fn cfpa_at(&self, page_addr: usize) -> lpc55_areas::CFPAPage {
-        let page: [u8; PAGE] = self.mem[page_addr..page_addr + PAGE].try_into().unwrap();
+        let page: [u8; PAGE] =
+            self.mem[page_addr..page_addr + PAGE].try_into().unwrap();
         lpc55_areas::CFPAPage::from_bytes(&page).unwrap_or_default()
     }
 
@@ -616,11 +629,7 @@ impl RotFlash {
     /// is separate future work.
     pub fn boot_pref_slot(&self) -> char {
         let cfpa = self.cfpa_at(self.active_cfpa());
-        if cfpa.customer_defined0[0] & 1 == 0 {
-            'a'
-        } else {
-            'b'
-        }
+        if cfpa.customer_defined0[0] & 1 == 0 { 'a' } else { 'b' }
     }
 
     // ---- persistence -------------------------------------------------------
@@ -634,7 +643,10 @@ impl RotFlash {
                 .seek(SeekFrom::Start(off as u64))
                 .and_then(|_| f.write_all(&self.mem[off..end]));
             if let Err(e) = r {
-                eprintln!("[rotflash] write-through to {} failed: {e}", self.path);
+                eprintln!(
+                    "[rotflash] write-through to {} failed: {e}",
+                    self.path
+                );
                 self.file = None;
             }
         }
@@ -681,7 +693,10 @@ impl RotFlash {
 
 /// Default backing-file path for the RoT flash, `$SP_EMU_ROT_NVM` or a default.
 pub fn nvm_path() -> String {
-    crate::config::instance_file("SP_EMU_ROT_NVM", crate::config::get().rot_nvm_path())
+    crate::config::instance_file(
+        "SP_EMU_ROT_NVM",
+        crate::config::get().rot_nvm_path(),
+    )
 }
 
 #[cfg(test)]
@@ -730,7 +745,10 @@ mod tests {
         // Pages 2..7 are unprogrammed on the sampled part; a read of those faults.
         for page in 2..8 {
             let off = NMPA + page * PAGE;
-            assert!(f.is_erased(off / PAGE), "NMPA page {page} must stay erased");
+            assert!(
+                f.is_erased(off / PAGE),
+                "NMPA page {page} must stay erased"
+            );
         }
         assert_eq!(
             f.mem[NMPA_UUID..NMPA_UUID + 16],
@@ -759,7 +777,11 @@ mod tests {
         f.reg_write(REG_STARTA, word);
         f.reg_write(REG_INT_CLR_STATUS, 0xF);
         f.reg_write(REG_CMD, CMD_READ);
-        assert_ne!(f.reg_read(REG_INT_STATUS) & ST_ECC, 0, "erased read -> ECC");
+        assert_ne!(
+            f.reg_read(REG_INT_STATUS) & ST_ECC,
+            0,
+            "erased read -> ECC"
+        );
 
         // Erase the page (already erased, but drives the path), then program it:
         // 32x Write filling the buffer, then Program.
@@ -814,7 +836,8 @@ mod tests {
         let mut c = lpc55_areas::CFPAPage::default();
         c.version = 9;
         c.customer_defined0[0] = 1; // boot preference = Slot B
-        f.mem[CFPA_PONG..CFPA_PONG + PAGE].copy_from_slice(&c.to_vec().unwrap());
+        f.mem[CFPA_PONG..CFPA_PONG + PAGE]
+            .copy_from_slice(&c.to_vec().unwrap());
         assert_eq!(f.active_cfpa(), CFPA_PONG, "higher version wins");
         assert_eq!(f.boot_pref_slot(), 'b', "pong selects slot B");
         cleanup(&f);
@@ -864,12 +887,16 @@ mod tests {
         use sha2::{Digest, Sha256};
         assert_eq!(
             Sha256::digest(seed_cmpa())[..],
-            hex32("ffb9169cce8f600a47e795a326ef97aa7872ef75bacb02a7ed2b93fdd5451db4")[..],
+            hex32(
+                "ffb9169cce8f600a47e795a326ef97aa7872ef75bacb02a7ed2b93fdd5451db4"
+            )[..],
             "CMPA matches the captured device",
         );
         assert_eq!(
             Sha256::digest(seed_cfpa(false))[..],
-            hex32("dc81d4c0429548776a9db89ffc2221725b04b2ed86c036f35e444270a4c7deb5")[..],
+            hex32(
+                "dc81d4c0429548776a9db89ffc2221725b04b2ed86c036f35e444270a4c7deb5"
+            )[..],
             "CFPA (fresh) matches the generated template",
         );
     }

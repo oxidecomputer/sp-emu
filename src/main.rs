@@ -28,8 +28,8 @@ mod gdb;
 mod glasgow;
 mod hashcrypt;
 mod host;
-mod identity;
 mod i2c_bridge;
+mod identity;
 mod lpc55;
 mod mem;
 mod puf;
@@ -40,7 +40,7 @@ mod rotswd;
 mod soc;
 mod sprot;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use cpu::{Cpu, Trap};
 use host::{HostIo, StdoutHost};
 use mem::Bus;
@@ -66,8 +66,9 @@ fn make_host() -> Result<Box<dyn HostIo>> {
             };
             // An explicitly configured bridge that cannot bind is fatal: a
             // stdout fallback would look healthy but be unreachable by MGS.
-            let b = bridge::Bridge::new(&bind)
-                .with_context(|| format!("bind SP_EMU_BRIDGE address {bind}"))?;
+            let b = bridge::Bridge::new(&bind).with_context(|| {
+                format!("bind SP_EMU_BRIDGE address {bind}")
+            })?;
             Ok(Box::new(b))
         }
         None => Ok(Box::new(StdoutHost)),
@@ -81,11 +82,8 @@ fn make_host() -> Result<Box<dyn HostIo>> {
 fn archive_socket_ports(archive: &str) -> Option<Vec<u16>> {
     let app = flash::archive_app_toml(archive)?;
     let value: toml::Value = app.parse().ok()?;
-    let sockets = value
-        .get("config")?
-        .get("net")?
-        .get("sockets")?
-        .as_table()?;
+    let sockets =
+        value.get("config")?.get("net")?.get("sockets")?.as_table()?;
     let mut ports: Vec<u16> = sockets
         .values()
         .filter_map(|s| s.get("port")?.as_integer())
@@ -93,11 +91,7 @@ fn archive_socket_ports(archive: &str) -> Option<Vec<u16>> {
         .map(|p| p as u16)
         .collect();
     ports.sort_unstable();
-    if ports.is_empty() {
-        None
-    } else {
-        Some(ports)
-    }
+    if ports.is_empty() { None } else { Some(ports) }
 }
 
 /// Fallback SP UDP socket set when no archive is available to parse, keyed by
@@ -133,12 +127,7 @@ fn sp_archive() -> Option<String> {
     }
     let flash = config::get().flash_path().to_string();
     let rel = flash::load_nv(&flash::nv_state_path(&flash)).archive?;
-    Some(
-        flash::instance_base(&flash)
-            .join(rel)
-            .to_string_lossy()
-            .into_owned(),
-    )
+    Some(flash::instance_base(&flash).join(rel).to_string_lossy().into_owned())
 }
 
 /// Warn at serve start when no SP Hubris archive is available (neither
@@ -160,13 +149,13 @@ fn make_well_known_host() -> Result<Box<dyn HostIo>> {
 
     let cfg = config::get();
     let sidecar = cfg.board().is_sidecar();
-    let parse_ip = |s: Option<&str>| -> Option<IpAddr> {
-        s.and_then(|s| s.parse().ok())
-    };
+    let parse_ip =
+        |s: Option<&str>| -> Option<IpAddr> { s.and_then(|s| s.parse().ok()) };
 
     // switch0 view: $SP_EMU_ADDR0 (default ::1). switch1 view: $SP_EMU_ADDR1 if
     // set (a distinct address, since both views bind the same real ports).
-    let addr0 = parse_ip(cfg.addr0()).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    let addr0 =
+        parse_ip(cfg.addr0()).unwrap_or(IpAddr::V6(Ipv6Addr::LOCALHOST));
     let (vid0, vid1) = bridge::default_vids(sidecar);
     let mut views = vec![(SocketAddr::new(addr0, 0), vid0)];
     if let Some(addr1) = parse_ip(cfg.addr1()) {
@@ -242,10 +231,10 @@ fn extract_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
 fn cmd_config(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("validate") => {
-            let path = args
-                .get(1)
-                .context("usage: sp-emu config validate <path>")?;
-            let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+            let path =
+                args.get(1).context("usage: sp-emu config validate <path>")?;
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read {path}"))?;
             // A newer or invalid file is a non-zero exit with a clear message; a
             // valid one reports the version it was read as.
             let version = sp_emu_config::validate(&text)
@@ -261,7 +250,8 @@ fn cmd_config(args: &[String]) -> Result<()> {
             let input = args
                 .get(1)
                 .context("usage: sp-emu config upgrade <in> [out]")?;
-            let text = std::fs::read_to_string(input).with_context(|| format!("read {input}"))?;
+            let text = std::fs::read_to_string(input)
+                .with_context(|| format!("read {input}"))?;
             // Fold any known version (flat or typed) forward, validate it, then emit
             // the current typed schema with its version stamped.
             let mut external = sp_emu_config::migrate(&text)
@@ -269,12 +259,16 @@ fn cmd_config(args: &[String]) -> Result<()> {
             sp_emu_config::ingest(external.clone())
                 .map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
             external.schema_version = Some(sp_emu_config::CURRENT);
-            let out_toml =
-                sp_emu_config::to_toml(&external).map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
+            let out_toml = sp_emu_config::to_toml(&external)
+                .map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
             match args.get(2) {
                 Some(out) => {
-                    std::fs::write(out, out_toml).with_context(|| format!("write {out}"))?;
-                    eprintln!("[config] upgraded {input} -> {out} (schema v{})", sp_emu_config::CURRENT);
+                    std::fs::write(out, out_toml)
+                        .with_context(|| format!("write {out}"))?;
+                    eprintln!(
+                        "[config] upgraded {input} -> {out} (schema v{})",
+                        sp_emu_config::CURRENT
+                    );
                 }
                 None => print!("{out_toml}"),
             }
@@ -282,9 +276,15 @@ fn cmd_config(args: &[String]) -> Result<()> {
         }
         _ => {
             eprintln!("usage:");
-            eprintln!("  sp-emu config validate <path>    check a config file; report its schema version");
-            eprintln!("  sp-emu config schema             print a documented template at defaults");
-            eprintln!("  sp-emu config upgrade <in> [out] convert any known version to the current typed schema");
+            eprintln!(
+                "  sp-emu config validate <path>    check a config file; report its schema version"
+            );
+            eprintln!(
+                "  sp-emu config schema             print a documented template at defaults"
+            );
+            eprintln!(
+                "  sp-emu config upgrade <in> [out] convert any known version to the current typed schema"
+            );
             bail!("unknown `config` subcommand");
         }
     }
@@ -293,9 +293,13 @@ fn cmd_config(args: &[String]) -> Result<()> {
 /// A human-readable name for a detected schema version.
 fn describe_version(v: sp_emu_config::SchemaVersion) -> String {
     match v {
-        sp_emu_config::SchemaVersion::LegacyFlat => "the legacy flat SP_EMU_* format".to_string(),
+        sp_emu_config::SchemaVersion::LegacyFlat => {
+            "the legacy flat SP_EMU_* format".to_string()
+        }
         sp_emu_config::SchemaVersion::Known(n) => format!("schema v{n}"),
-        sp_emu_config::SchemaVersion::Newer(n) => format!("schema v{n} (newer than this build)"),
+        sp_emu_config::SchemaVersion::Newer(n) => {
+            format!("schema v{n} (newer than this build)")
+        }
     }
 }
 
@@ -347,7 +351,16 @@ fn main() -> Result<()> {
     let sub_args: &[String] = args.get(1..).unwrap_or(&[]);
     if matches!(
         cmd,
-        Some("flash" | "erase" | "info" | "run" | "gdb" | "rot" | "rot-serve" | "pack")
+        Some(
+            "flash"
+                | "erase"
+                | "info"
+                | "run"
+                | "gdb"
+                | "rot"
+                | "rot-serve"
+                | "pack"
+        )
     ) {
         announce_state_dir();
     }
@@ -382,35 +395,58 @@ fn main() -> Result<()> {
                 .first()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5_000_000);
-            let image = std::fs::read(p).with_context(|| format!("read {p}"))?;
+            let image =
+                std::fs::read(p).with_context(|| format!("read {p}"))?;
             boot(&image, Some(false), max)
         }
         _ => {
             eprintln!("usage:");
             eprintln!("  sp-emu flash <a|b> <image.bin>   program a slot");
             eprintln!("  sp-emu erase <a|b>               erase a slot");
-            eprintln!("  sp-emu info                      show slot reset vectors");
-            eprintln!("  sp-emu run [a|b] [max_insns]     boot from a slot (max 0 = run forever)");
+            eprintln!(
+                "  sp-emu info                      show slot reset vectors"
+            );
+            eprintln!(
+                "  sp-emu run [a|b] [max_insns]     boot from a slot (max 0 = run forever)"
+            );
             eprintln!(
                 "  sp-emu gdb [a|b] [preboot]       alias for `run <slot> 0`, taking a preboot count"
             );
             eprintln!(
                 "  sp-emu rot <oxide-rot-1 img> [max]  boot the LPC55 RoT firmware standalone"
             );
-            eprintln!("  sp-emu config <validate|schema|upgrade>  work on config files (see `sp-emu config`)");
-            eprintln!("  sp-emu pack [bundle.zip]         bundle this instance (flash+archives) to a zip");
-            eprintln!("  sp-emu unpack <bundle.zip> [dir] extract an instance bundle for run + humility");
-            eprintln!("  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here");
-            eprintln!("  sp-emu i2c-device [addr] [spec]  act AS I2C devices for an emulator (SP_EMU_I2C_DEVICE);");
+            eprintln!(
+                "  sp-emu config <validate|schema|upgrade>  work on config files (see `sp-emu config`)"
+            );
+            eprintln!(
+                "  sp-emu pack [bundle.zip]         bundle this instance (flash+archives) to a zip"
+            );
+            eprintln!(
+                "  sp-emu unpack <bundle.zip> [dir] extract an instance bundle for run + humility"
+            );
+            eprintln!(
+                "  sp-emu i2c-sniff [listen-addr]   tee I2C traffic from an emulator (SP_EMU_I2C_BRIDGE) here"
+            );
+            eprintln!(
+                "  sp-emu i2c-device [addr] [spec]  act AS I2C devices for an emulator (SP_EMU_I2C_DEVICE);"
+            );
             eprintln!(
                 "                                   spec: addr/reg=val  or  addr@eeprom-file"
             );
             eprintln!();
             eprintln!("global flags (any position):");
-            eprintln!("  -V, --version                    print version, git revision, and build profile");
-            eprintln!("  --seed <hex|string>              per-instance identity seed (or $SP_EMU_SEED)");
-            eprintln!("  --load-config <path>             read a TOML config file as the base layer");
-            eprintln!("  --dump-config <path>             write the effective configuration to a TOML file");
+            eprintln!(
+                "  -V, --version                    print version, git revision, and build profile"
+            );
+            eprintln!(
+                "  --seed <hex|string>              per-instance identity seed (or $SP_EMU_SEED)"
+            );
+            eprintln!(
+                "  --load-config <path>             read a TOML config file as the base layer"
+            );
+            eprintln!(
+                "  --dump-config <path>             write the effective configuration to a TOML file"
+            );
             eprintln!();
             eprintln!(
                 "A config file may set SP_EMU_MODE / SP_EMU_SLOT / SP_EMU_RUN_MAX, so"
@@ -432,11 +468,7 @@ fn print_version() {
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
         env!("SP_EMU_GIT_HASH"),
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
+        if cfg!(debug_assertions) { "debug" } else { "release" },
     );
 }
 
@@ -518,7 +550,9 @@ fn cmd_info() -> Result<()> {
         let base = flash::slot_base(slot)?;
         if flash::slot_programmed(&nvm, slot)? {
             let sp = u32::from_le_bytes(nvm[off..off + 4].try_into().unwrap());
-            let pc = u32::from_le_bytes(nvm[off + 4..off + 8].try_into().unwrap()) & !1;
+            let pc =
+                u32::from_le_bytes(nvm[off + 4..off + 8].try_into().unwrap())
+                    & !1;
             println!(
                 "  slot {} @ {:#010x}: programmed  (SP={:#010x} reset PC={:#010x})",
                 slot.to_ascii_uppercase(),
@@ -547,15 +581,11 @@ fn cmd_pack(args: &[String]) -> Result<()> {
 /// unpack <bundle.zip> [dir]: extract an instance bundle so it can be run and
 /// inspected with humility without the original archives.
 fn cmd_unpack(args: &[String]) -> Result<()> {
-    let bundle_path = args
-        .first()
-        .context("usage: sp-emu unpack <bundle.zip> [dest-dir]")?;
+    let bundle_path =
+        args.first().context("usage: sp-emu unpack <bundle.zip> [dest-dir]")?;
     // Default dest: the bundle's basename without .zip.
     let dest = args.get(1).cloned().unwrap_or_else(|| {
-        bundle_path
-            .strip_suffix(".zip")
-            .unwrap_or(bundle_path)
-            .to_string()
+        bundle_path.strip_suffix(".zip").unwrap_or(bundle_path).to_string()
     });
     bundle::unpack(bundle_path, &dest)
 }
@@ -602,11 +632,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
     // An explicit slot forces the boot bank; otherwise honor the persisted swap.
     let swap_override = slot_given.then_some(slot == 'b');
     let nv = flash::load_nv(&flash::nv_state_path(&path));
-    let boot_slot = if swap_override.unwrap_or(nv.swap_bank) {
-        'b'
-    } else {
-        'a'
-    };
+    let boot_slot =
+        if swap_override.unwrap_or(nv.swap_bank) { 'b' } else { 'a' };
     if !flash::slot_programmed(&nvm, boot_slot)? {
         bail!(
             "slot {} is empty; flash it first: sp-emu flash {} <image.bin>",
@@ -657,11 +684,8 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
     let mut nvm = flash::load_nvm(&path)?;
     let swap_override = slot_given.then_some(slot == 'b');
     let nv = flash::load_nv(&flash::nv_state_path(&path));
-    let boot_slot = if swap_override.unwrap_or(nv.swap_bank) {
-        'b'
-    } else {
-        'a'
-    };
+    let boot_slot =
+        if swap_override.unwrap_or(nv.swap_bank) { 'b' } else { 'a' };
     if !flash::slot_programmed(&nvm, boot_slot)? {
         bail!(
             "slot {} is empty; flash it first: sp-emu flash {} <image.bin>",
@@ -769,7 +793,10 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
     // The RoT flash model owns the 0x0 window and the 0x4003_4000 controller: it
     // seeds slot A from `image` plus the protected flash region (CMPA/CFPA/NMPA),
     // backed by a persistent file, and gives real erase/program/blank-check.
-    bus.install_rot_flash(rot_flash::RotFlash::new(&rot_flash::nvm_path(), image)?);
+    bus.install_rot_flash(rot_flash::RotFlash::new(
+        &rot_flash::nvm_path(),
+        image,
+    )?);
     publish_rot_bootstate(&mut bus, image);
     publish_dice_handoff(&mut bus);
     let initial_sp = bus.read32(base);
@@ -870,7 +897,7 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
     blob.extend_from_slice(&0u32.to_le_bytes()); // HandoffDataHeader.version
     blob.extend_from_slice(b"whatwhatwhat"); // HandoffDataHeader.magic
     blob.push(0u8); // RotBootStateV2.active = RotSlot::A
-                    // a/b/stage0/stage0next: digest[32] + status (Ok(()) = discriminant 0).
+    // a/b/stage0/stage0next: digest[32] + status (Ok(()) = discriminant 0).
     for d in [&digest_a, &digest_erased, &digest_erased, &digest_erased] {
         blob.extend_from_slice(d);
         blob.push(0u8); // Result::Ok(())
@@ -884,10 +911,7 @@ fn publish_rot_bootstate(bus: &mut Bus, image: &[u8]) {
         "[rot] published RotBootStateV2 handoff @ {:#010x} ({} bytes); slot-A sha3-256 = {}",
         UPDATE_RANGE_BASE,
         blob.len(),
-        digest_a
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
+        digest_a.iter().map(|b| format!("{:02x}", b)).collect::<String>()
     );
 }
 
@@ -938,25 +962,21 @@ fn publish_dice_handoff(bus: &mut Bus) {
 /// answers sprot request frames over a socket (frame-level IPC), so every SP can
 /// share it instead of each emulating its own RoT core. See `rot_service`.
 fn cmd_rot_serve(args: &[String]) -> Result<()> {
-    let listen = args
-        .first()
-        .context("usage: rot-serve <listen-addr> <rot-image>")?;
-    let image_path = args
-        .get(1)
-        .context("usage: rot-serve <listen-addr> <rot-image>")?;
+    let listen =
+        args.first().context("usage: rot-serve <listen-addr> <rot-image>")?;
+    let image_path =
+        args.get(1).context("usage: rot-serve <listen-addr> <rot-image>")?;
     let image = flash::load_image(image_path)?;
     rot_service::run(listen, &image)
 }
 
 fn cmd_rot(args: &[String]) -> Result<()> {
-    let path = args
-        .first()
-        .context("usage: sp-emu rot <oxide-rot-1 image.bin|archive.zip> [max]")?;
+    let path = args.first().context(
+        "usage: sp-emu rot <oxide-rot-1 image.bin|archive.zip> [max]",
+    )?;
     let image = flash::load_image(path)?;
-    let max = args
-        .get(1)
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(20_000_000);
+    let max =
+        args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(20_000_000);
     let (mut cpu, mut bus) = build_rot_core(&image)?;
     let trace = config::get().trace();
     cpu.record_disasm = trace;
@@ -1073,7 +1093,8 @@ fn deposit_skip_token_if_debugger(bus: &mut Bus) {
 /// instruction count. `swap_override` selects the initial boot bank (see `setup`).
 fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
     let trace = config::get().trace();
-    let (twin_from, twin_to) = (config::get().trace_from(), config::get().trace_to());
+    let (twin_from, twin_to) =
+        (config::get().trace_from(), config::get().trace_to());
     let (mut cpu, mut bus) = setup(image, swap_override)?;
     let mut host = make_host()?;
 
@@ -1103,21 +1124,42 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
                 }
                 if let (Some(lo), Some(hi)) = (twin_from, twin_to) {
                     if cpu.cycles >= lo && cpu.cycles <= hi {
-                        eprintln!("c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
-                            cpu.cycles, pc, cpu.last_disasm,
-                            cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7], cpu.r[13], cpu.r[14]);
+                        eprintln!(
+                            "c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
+                            cpu.cycles,
+                            pc,
+                            cpu.last_disasm,
+                            cpu.r[0],
+                            cpu.r[1],
+                            cpu.r[2],
+                            cpu.r[3],
+                            cpu.r[4],
+                            cpu.r[5],
+                            cpu.r[6],
+                            cpu.r[7],
+                            cpu.r[13],
+                            cpu.r[14]
+                        );
                     }
                 }
                 if let Some(f) = diff.as_mut() {
                     let exc = cpu.mode != mode0 || cpu.ipsr != ipsr0;
                     // VFP is validated against Unicorn (S-regs included), so it
                     // is not skipped; only state Unicorn cannot mirror is.
-                    let skip = (bus.mmio_hit || exc || cpu.last_it || cpu.last_sys) as u8;
+                    let skip =
+                        (bus.mmio_hit || exc || cpu.last_it || cpu.last_sys)
+                            as u8;
                     let _ = write!(f, "{:08x}", pc);
                     for k in 0..15 {
                         let _ = write!(f, " {:08x}", cpu.r[k]);
                     }
-                    let _ = write!(f, " {:08x} {:08x} {} S", cpu.pc, cpu.apsr(), skip);
+                    let _ = write!(
+                        f,
+                        " {:08x} {:08x} {} S",
+                        cpu.pc,
+                        cpu.apsr(),
+                        skip
+                    );
                     for sr in &cpu.s {
                         let _ = write!(f, " {:08x}", sr);
                     }
@@ -1128,12 +1170,7 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
                     let _ = writeln!(f);
                 }
             }
-            Err(Trap::Unimplemented {
-                pc,
-                bytes,
-                len,
-                disasm,
-            }) => {
+            Err(Trap::Unimplemented { pc, bytes, len, disasm }) => {
                 eprintln!("\n=== STOP: unimplemented instruction ===");
                 eprintln!("  pc     : {:#010x}", pc);
                 eprintln!("  disasm : {}", disasm);

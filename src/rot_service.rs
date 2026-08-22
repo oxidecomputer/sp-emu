@@ -29,7 +29,12 @@ const MAX_FRAME: usize = 4096;
 /// the core signals idle (`idle_skip`, which it clears). Returns whether it idled.
 /// Shared by `rot_exchange`'s grind loop and the idle keep-alive loop. The preboot
 /// loop does not stop on idle, so it does not use this.
-fn run_quantum(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, n: u32) -> bool {
+fn run_quantum(
+    rc: &mut Cpu,
+    rb: &mut Bus,
+    host: &mut dyn HostIo,
+    n: u32,
+) -> bool {
     for _ in 0..n {
         if rc.step(rb, host).is_err() {
             break;
@@ -55,7 +60,12 @@ fn first_nonzero(buf: &[u8]) -> Option<usize> {
 /// Synthesizes the SP's side of the link: manipulates the shared `SprotLink`
 /// (mosi/cs/ssa) the way `SpiMaster` plus the soc CS driver would, and steps the
 /// RoT core (waking its FLEXCOMM8 irq) as `gdb::serve` does.
-fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -> Vec<u8> {
+fn rot_exchange(
+    rc: &mut Cpu,
+    rb: &mut Bus,
+    host: &mut dyn HostIo,
+    req: &[u8],
+) -> Vec<u8> {
     let link = crate::sprot::link().expect("sprot link enabled");
     {
         let mut lk = link.borrow_mut();
@@ -88,8 +98,12 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                     .collect(),
                 None => String::from("(all-zero)"),
             };
-            eprintln!("[rotsvc] grind it={it} phase2={phase2} resp={} first_nonzero@{:?} head={head} rot_pc={:#010x}",
-                resp.len(), nz, rc.pc);
+            eprintln!(
+                "[rotsvc] grind it={it} phase2={phase2} resp={} first_nonzero@{:?} head={head} rot_pc={:#010x}",
+                resp.len(),
+                nz,
+                rc.pc
+            );
         }
         // Phase 1: feed request bytes as the RoT drains mosi (16-byte FIFO cap);
         // deassert CS once the whole request is in and nearly drained.
@@ -160,7 +174,9 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         if phase2 && total.is_none() {
             if let Some(start) = first_nonzero(&resp) {
                 if resp.len() >= start + 6 {
-                    let body_size = u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
+                    let body_size =
+                        u16::from_le_bytes([resp[start + 4], resp[start + 5]])
+                            as usize;
                     let t = start + 6 + body_size + 2;
                     if body_size + 8 <= MAX_RESP {
                         total = Some(t);
@@ -204,7 +220,8 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         }
     }
     if dbg() {
-        let hx: String = resp.iter().take(48).map(|b| format!("{b:02x}")).collect();
+        let hx: String =
+            resp.iter().take(48).map(|b| format!("{b:02x}")).collect();
         eprintln!(
             "[rotsvc] exchange: req {}B -> resp {}B [{hx}]",
             req.len(),
@@ -237,7 +254,8 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
             }
         };
         let mut host = StdoutHost;
-        let preboot: u64 = crate::config::get().rot_preboot().unwrap_or(40_000_000);
+        let preboot: u64 =
+            crate::config::get().rot_preboot().unwrap_or(40_000_000);
         for _ in 0..preboot {
             if rc.step(&mut rb, &mut host).is_err() {
                 break;
@@ -264,7 +282,8 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
             match req_rx.try_recv() {
                 Ok((req, resp_tx)) => {
                     if dbg() {
-                        let hx: String = req.iter().map(|b| format!("{b:02x}")).collect();
+                        let hx: String =
+                            req.iter().map(|b| format!("{b:02x}")).collect();
                         eprintln!(
                             "[rotsvc] req mt={:#04x} len={} hex={hx} cache_hit={}",
                             req.get(6).copied().unwrap_or(0),
@@ -307,7 +326,8 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
             }
         }
     });
-    let l = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
+    let l =
+        TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
     eprintln!("[rotsvc] listening on {listen} (RoT prebooting in background)");
     for conn in l.incoming() {
         let s = match conn {
@@ -360,10 +380,7 @@ pub struct RotClient {
 }
 impl RotClient {
     pub fn connect(addr: &str) -> Self {
-        let mut c = RotClient {
-            addr: addr.to_string(),
-            stream: None,
-        };
+        let mut c = RotClient { addr: addr.to_string(), stream: None };
         c.ensure();
         c
     }
@@ -375,7 +392,9 @@ impl RotClient {
                     eprintln!("[rotclient] connected to {}", self.addr);
                     self.stream = Some(s);
                 }
-                Err(e) => eprintln!("[rotclient] connect {} failed: {e}", self.addr),
+                Err(e) => {
+                    eprintln!("[rotclient] connect {} failed: {e}", self.addr)
+                }
             }
         }
     }

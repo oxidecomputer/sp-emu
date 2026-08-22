@@ -111,12 +111,16 @@ pub fn serve(
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(e) => return Err(e.into()),
         }
         if last_activity.elapsed() > idle_timeout {
-            eprintln!("[gdb] SWD client idle {}s, dropping", idle_timeout.as_secs());
+            eprintln!(
+                "[gdb] SWD client idle {}s, dropping",
+                idle_timeout.as_secs()
+            );
             return Ok(());
         }
 
@@ -276,7 +280,12 @@ fn process_swd(
                 if i + 5 > inp.len() {
                     break;
                 }
-                u32::from_le_bytes([inp[i + 1], inp[i + 2], inp[i + 3], inp[i + 4]])
+                u32::from_le_bytes([
+                    inp[i + 1],
+                    inp[i + 2],
+                    inp[i + 3],
+                    inp[i + 4],
+                ])
             };
             i += if rnw { 1 } else { 5 };
             match swdp.transfer(cpu, bus, ap, rnw, a, wdata) {

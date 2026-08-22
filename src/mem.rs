@@ -11,7 +11,7 @@
 //! trace keeps moving and surfaces unmodeled accesses rather than faulting on
 //! the first one.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// A memory-mapped peripheral. Phase 1 models everything at word granularity;
 /// the bus synthesizes narrower (8/16-bit) accesses from word ops.
@@ -138,7 +138,8 @@ const FLASH_REG_HI: u32 = 0x5200_4000;
 // region) and the flash-controller register block. Routed to the Bus-owned
 // `rot_flash` model (RoT core only).
 const ROT_FLASH_WIN_LO: u32 = crate::rot_flash::BASE;
-const ROT_FLASH_WIN_HI: u32 = crate::rot_flash::BASE + crate::rot_flash::SIZE as u32;
+const ROT_FLASH_WIN_HI: u32 =
+    crate::rot_flash::BASE + crate::rot_flash::SIZE as u32;
 const ROT_FLASH_REG_LO: u32 = 0x4003_4000;
 const ROT_FLASH_REG_HI: u32 = 0x4003_5000;
 
@@ -147,7 +148,7 @@ const ETH_BASE: u32 = 0x4002_8000;
 const ETH_END: u32 = 0x4002_A000;
 const ETH_IRQ: u16 = 61;
 const UART7_IRQ: u16 = 82; // host-sp-comms USART (UART7) global interrupt (H7)
-                           // Register offsets relative to ETH_BASE.
+// Register offsets relative to ETH_BASE.
 const MACMDIOAR: u32 = 0x0200; // MDIO address/control; MB (bit0) = busy, self-clears
 const DMAMR: u32 = 0x1000; // DMA mode; SWR (bit0) = soft reset, self-clears
 const DMAISR: u32 = 0x1008; // interrupt summary; dc0is (bit0) = channel-0 interrupt
@@ -166,10 +167,10 @@ const BUFSZ: u32 = 1536; // drv/stm32h7-eth ring::BUFSZ
 struct EthDma {
     regs: std::collections::HashMap<u32, u32>,
     rx_next: u32,             // index into the RX descriptor ring
-    tx_frames: Vec<Vec<u8>>,  // frames emitted by the SP, awaiting the host bridge
-    irq: bool,                // ETH IRQ (61) pending (set on TX/RX completion)
+    tx_frames: Vec<Vec<u8>>, // frames emitted by the SP, awaiting the host bridge
+    irq: bool,               // ETH IRQ (61) pending (set on TX/RX completion)
     pending_vid: Option<u16>, // VID from the last TX VLAN context descriptor
-    mdio_page: u16,           // VSC85x2 PHY page selected via reg 31 (PAGE)
+    mdio_page: u16,          // VSC85x2 PHY page selected via reg 31 (PAGE)
 }
 
 const MACMDIODR: u32 = 0x0204; // MDIO data register (read/write payload)
@@ -227,8 +228,12 @@ impl Bus {
             pend_pendsv: false,
             dev_touched: false,
             eth: EthDma::default(),
-            uart_tx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
-            uart_rx: std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::new())),
+            uart_tx: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::VecDeque::new(),
+            )),
+            uart_rx: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::VecDeque::new(),
+            )),
             tim5_base: 0,
             tim5_regs: [0; TIM5_NREGS],
             reset_pending: false,
@@ -253,8 +258,8 @@ impl Bus {
         if !self.secure_alias {
             return addr;
         }
-        let flash_secure =
-            LPC55_SECURE_ALIAS_BIT..(LPC55_SECURE_ALIAS_BIT | crate::rot_flash::SIZE as u32);
+        let flash_secure = LPC55_SECURE_ALIAS_BIT
+            ..(LPC55_SECURE_ALIAS_BIT | crate::rot_flash::SIZE as u32);
         let sram_secure = (LPC55_SECURE_ALIAS_BIT | LPC55_SRAM_BASE)
             ..(LPC55_SECURE_ALIAS_BIT | (LPC55_SRAM_BASE + LPC55_SRAM_SIZE));
         if flash_secure.contains(&addr) || sram_secure.contains(&addr) {
@@ -357,7 +362,7 @@ impl Bus {
             eprintln!("[eth] DMACSR read = {:#x} (net on_interrupt)", v);
         }
         match off & !3 {
-            DMAMR => v & !1,     // SWR self-clears once the reset "completes"
+            DMAMR => v & !1, // SWR self-clears once the reset "completes"
             MACMDIOAR => v & !1, // MB clears once the MDIO op "completes"
             _ => v,
         }
@@ -370,9 +375,11 @@ impl Bus {
         match (page, reg) {
             // BMCR (reg 0): the soft-reset bit (15) self-clears when reset completes;
             // the driver spins on it. Return the stored value with reset cleared.
-            (0, 0) => *self.eth.regs.get(&0x1_0000).unwrap_or(&0) as u16 & !0x8000,
-            (0, 2) => 0x0007,  // IDENTIFIER_1: high half of id 0x0007_04e2 = VSC8552_ID
-            (0, 3) => 0x04e2,  // IDENTIFIER_2: low half of the same id
+            (0, 0) => {
+                *self.eth.regs.get(&0x1_0000).unwrap_or(&0) as u16 & !0x8000
+            }
+            (0, 2) => 0x0007, // IDENTIFIER_1: high half of id 0x0007_04e2 = VSC8552_ID
+            (0, 3) => 0x04e2, // IDENTIFIER_2: low half of the same id
             (1, 23) => 0x0000, // EXTENDED_PHY_CONTROL_4: port>>11 == 0 (base port)
             (1, 25) => 0x29e8, // VERIPHY_CTRL_REG2: 8051 CRC == EXPECTED_CRC -> skip patch
             // MICRO_PAGE: the driver writes a command (bit15=go) and polls until
@@ -424,7 +431,9 @@ impl Bus {
                         );
                     }
                     self.eth.regs.insert(
-                        0x1_0000 | (self.eth.mdio_page as u32) << 8 | rda as u32,
+                        0x1_0000
+                            | (self.eth.mdio_page as u32) << 8
+                            | rda as u32,
                         data as u32,
                     );
                 }
@@ -466,8 +475,8 @@ impl Bus {
                 continue;
             } // driver owns it: nothing to send
             self.write32(d + 12, tdes3 & !(1 << 31)); // clear OWN: back to the driver
-                                                      // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
-                                                      // insert into the following packet. Not a packet itself; don't emit.
+            // VLAN context descriptor (CTXT bit30): captures the VID the MAC will
+            // insert into the following packet. Not a packet itself; don't emit.
             if tdes3 & (1 << 30) != 0 {
                 if tdes3 & (1 << 16) != 0 {
                     self.eth.pending_vid = Some((tdes3 & 0xFFF) as u16);
@@ -514,7 +523,11 @@ impl Bus {
     ///   humility -a <archive> hydrate <zip>  &&  humility -d <core> tasks
     /// reads the live (possibly wedged) task table/ringbufs off the emulated SP
     /// with no probe or gdb attach.
-    pub fn write_hydrate_dump(&self, dir: &str, archive_id: &str) -> std::io::Result<()> {
+    pub fn write_hydrate_dump(
+        &self,
+        dir: &str,
+        archive_id: &str,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         for r in &self.rams {
             if r.base == FLASH_WIN_LO {
@@ -594,8 +607,10 @@ impl Bus {
         if rdes3 & (1 << 31) == 0 {
             // driver still owns it -> ring full (DMA can't write)
             if ring_dbg {
-                eprintln!("[rx-drop] ring full: rx_next={} ringlen={} d={:#x} rdes3={:#x} (OWN clear) cyc={}",
-                    self.eth.rx_next, ring_len, d, rdes3, self.cur_cyc);
+                eprintln!(
+                    "[rx-drop] ring full: rx_next={} ringlen={} d={:#x} rdes3={:#x} (OWN clear) cyc={}",
+                    self.eth.rx_next, ring_len, d, rdes3, self.cur_cyc
+                );
             }
             return false;
         }
@@ -608,7 +623,8 @@ impl Bus {
         // The bridge supplies a tagged wire frame. The MAC strips the 802.1Q tag
         // and reports the VID in RDES0 (RS0V); net drops frames lacking a valid
         // VID, and reads the untagged frame from the buffer.
-        let tagged = frame.len() >= 16 && u16::from_be_bytes([frame[12], frame[13]]) == VLAN_TPID;
+        let tagged = frame.len() >= 16
+            && u16::from_be_bytes([frame[12], frame[13]]) == VLAN_TPID;
         let vid = if tagged {
             u16::from_be_bytes([frame[14], frame[15]]) & 0xFFF
         } else {
@@ -628,9 +644,7 @@ impl Bus {
                 vid,
                 self.cur_cyc,
                 d,
-                data.iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<String>()
+                data.iter().map(|b| format!("{:02x}", b)).collect::<String>()
             );
         }
         let buf = self.read32(d);
@@ -658,10 +672,18 @@ impl Bus {
 
     fn nvic_read(&self, addr: u32) -> Option<u32> {
         match addr {
-            0xE000_E100..=0xE000_E11C => Some(self.nvic_en[((addr - 0xE000_E100) / 4) as usize]),
-            0xE000_E180..=0xE000_E19C => Some(self.nvic_en[((addr - 0xE000_E180) / 4) as usize]),
-            0xE000_E200..=0xE000_E21C => Some(self.nvic_pend[((addr - 0xE000_E200) / 4) as usize]),
-            0xE000_E280..=0xE000_E29C => Some(self.nvic_pend[((addr - 0xE000_E280) / 4) as usize]),
+            0xE000_E100..=0xE000_E11C => {
+                Some(self.nvic_en[((addr - 0xE000_E100) / 4) as usize])
+            }
+            0xE000_E180..=0xE000_E19C => {
+                Some(self.nvic_en[((addr - 0xE000_E180) / 4) as usize])
+            }
+            0xE000_E200..=0xE000_E21C => {
+                Some(self.nvic_pend[((addr - 0xE000_E200) / 4) as usize])
+            }
+            0xE000_E280..=0xE000_E29C => {
+                Some(self.nvic_pend[((addr - 0xE000_E280) / 4) as usize])
+            }
             0xE000_E300..=0xE000_E31C => Some(0), // IABR (active): report none
             0xE000_E400..=0xE000_E4EF => {
                 let i = (addr - 0xE000_E400) as usize;
@@ -677,9 +699,15 @@ impl Bus {
 
     fn nvic_write(&mut self, addr: u32, val: u32) -> bool {
         match addr {
-            0xE000_E100..=0xE000_E11C => self.nvic_en[((addr - 0xE000_E100) / 4) as usize] |= val,
-            0xE000_E180..=0xE000_E19C => self.nvic_en[((addr - 0xE000_E180) / 4) as usize] &= !val,
-            0xE000_E200..=0xE000_E21C => self.nvic_pend[((addr - 0xE000_E200) / 4) as usize] |= val,
+            0xE000_E100..=0xE000_E11C => {
+                self.nvic_en[((addr - 0xE000_E100) / 4) as usize] |= val
+            }
+            0xE000_E180..=0xE000_E19C => {
+                self.nvic_en[((addr - 0xE000_E180) / 4) as usize] &= !val
+            }
+            0xE000_E200..=0xE000_E21C => {
+                self.nvic_pend[((addr - 0xE000_E200) / 4) as usize] |= val
+            }
             0xE000_E280..=0xE000_E29C => {
                 self.nvic_pend[((addr - 0xE000_E280) / 4) as usize] &= !val
             }
@@ -789,10 +817,7 @@ impl Bus {
     }
 
     pub fn add_ram(&mut self, base: u32, size: u32) {
-        self.rams.push(Ram {
-            base,
-            data: vec![0u8; size as usize],
-        });
+        self.rams.push(Ram { base, data: vec![0u8; size as usize] });
     }
 
     pub fn add_device(&mut self, base: u32, size: u32, dev: Box<dyn Mmio>) {
@@ -998,7 +1023,8 @@ impl Bus {
                 return;
             }
         }
-        if (NVIC_LO..NVIC_HI).contains(&addr) && self.nvic_write(addr & !3, val) {
+        if (NVIC_LO..NVIC_HI).contains(&addr) && self.nvic_write(addr & !3, val)
+        {
             self.mmio_hit = true;
             return;
         }
@@ -1040,7 +1066,9 @@ impl Bus {
             // registers are stored for read-back; the counter free-runs
             // regardless of CR1/PSC/ARR.
             match addr & !3 {
-                TIM5_CNT => self.tim5_base = self.cur_cyc.wrapping_sub(val as u64),
+                TIM5_CNT => {
+                    self.tim5_base = self.cur_cyc.wrapping_sub(val as u64)
+                }
                 TIM5_EGR => {
                     if val & 1 != 0 {
                         self.tim5_base = self.cur_cyc
@@ -1053,7 +1081,10 @@ impl Bus {
         } else {
             self.unmapped_writes += 1;
             if self.log_unmapped {
-                eprintln!("[mem] unmapped write32 @ {:#010x} = {:#010x}", addr, val);
+                eprintln!(
+                    "[mem] unmapped write32 @ {:#010x} = {:#010x}",
+                    addr, val
+                );
             }
         }
     }
@@ -1068,7 +1099,10 @@ impl Bus {
         } else {
             let sh = 8 * (addr & 2);
             let w = self.read32(addr & !3);
-            self.write32(addr & !3, (w & !(0xffffu32 << sh)) | ((val as u32) << sh));
+            self.write32(
+                addr & !3,
+                (w & !(0xffffu32 << sh)) | ((val as u32) << sh),
+            );
         }
     }
 
@@ -1082,7 +1116,10 @@ impl Bus {
         } else {
             let sh = 8 * (addr & 3);
             let w = self.read32(addr & !3);
-            self.write32(addr & !3, (w & !(0xffu32 << sh)) | ((val as u32) << sh));
+            self.write32(
+                addr & !3,
+                (w & !(0xffu32 << sh)) | ((val as u32) << sh),
+            );
         }
     }
 }
@@ -1238,12 +1275,13 @@ mod tests {
 
         bus.reset_exception_sources();
 
-        assert!(
-            !bus.any_pending_irq(),
-            "reset drops the enabled+pending IRQ"
-        );
+        assert!(!bus.any_pending_irq(), "reset drops the enabled+pending IRQ");
         assert!(!bus.irq_enabled(15), "reset disables the IRQ");
-        assert_eq!(bus.read32(SYST_CSR) & 0b111, 0, "SYST_CSR cleared on reset");
+        assert_eq!(
+            bus.read32(SYST_CSR) & 0b111,
+            0,
+            "SYST_CSR cleared on reset"
+        );
         assert_eq!(bus.read32(SYST_RVR), 0, "SYST_RVR cleared on reset");
     }
 
@@ -1304,7 +1342,11 @@ mod tests {
         let mut img = vec![flash::ERASED; flash::TOTAL];
         img[0..4].copy_from_slice(&BANK1_VEC.to_le_bytes());
         let mut bus = Bus::new();
-        bus.install_flash(flash::Flash::new(&path, img, flash::NvState::default()));
+        bus.install_flash(flash::Flash::new(
+            &path,
+            img,
+            flash::NvState::default(),
+        ));
         bus.write32(0xE000_E100, 1 << flash::FLASH_IRQ); // NVIC enable IRQ 4
 
         // 1. Unlock bank2 (KEYR2) and the option bytes (OPTKEYR).
@@ -1399,7 +1441,11 @@ mod tests {
         let nv2 = flash::load_nv(&nv_file);
         let mut bus2 = Bus::new();
         bus2.install_flash(flash::Flash::new(&path, img2, nv2));
-        assert_eq!(bus2.read32(0x0800_0000), BANK2_VEC, "swapped bank persists");
+        assert_eq!(
+            bus2.read32(0x0800_0000),
+            BANK2_VEC,
+            "swapped bank persists"
+        );
         assert_eq!(
             bus2.read32(0x0810_0000),
             BANK1_VEC,

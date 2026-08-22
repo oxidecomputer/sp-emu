@@ -10,7 +10,7 @@
 //! image persisted to a host file so that, as on real silicon, flash contents
 //! persist across runs. Program a slot once, then `run`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -35,7 +35,8 @@ pub fn slot_base(slot: char) -> Result<u32> {
 /// Load the persistent flash image, or a fully-erased image if none exists yet.
 pub fn load_nvm(path: &str) -> Result<Vec<u8>> {
     if Path::new(path).exists() {
-        let mut data = std::fs::read(path).with_context(|| format!("read {path}"))?;
+        let mut data =
+            std::fs::read(path).with_context(|| format!("read {path}"))?;
         data.resize(TOTAL, ERASED);
         Ok(data)
     } else {
@@ -54,8 +55,9 @@ pub fn save_nvm(path: &str, data: &[u8]) -> Result<()> {
 pub fn load_image(path: &str) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {path}"))?;
     if raw.starts_with(b"PK") {
-        archive_entry(&raw, "img/final.bin")
-            .context("no img/final.bin in archive; is this a Hubris build archive?")
+        archive_entry(&raw, "img/final.bin").context(
+            "no img/final.bin in archive; is this a Hubris build archive?",
+        )
     } else {
         Ok(raw)
     }
@@ -106,7 +108,9 @@ pub fn instance_base(flash_path: &str) -> &std::path::Path {
 /// byte comparison only runs when the sizes already match.
 fn files_identical(a: &Path, b: &Path) -> bool {
     match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => std::fs::read(a).ok() == std::fs::read(b).ok(),
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {
+            std::fs::read(a).ok() == std::fs::read(b).ok()
+        }
         _ => false,
     }
 }
@@ -118,17 +122,23 @@ fn files_identical(a: &Path, b: &Path) -> bool {
 /// or a byte-identical copy (an unchanged instance re-run, e.g. the RoT re-stows on
 /// every serve). The instance is thus self-contained: the archive travels with the
 /// flash image, and `pack` is just a zip of the base directory.
-pub fn stow_archive(flash_path: &str, archive_src: &str, name: &str) -> Result<String> {
+pub fn stow_archive(
+    flash_path: &str,
+    archive_src: &str,
+    name: &str,
+) -> Result<String> {
     let base = instance_base(flash_path);
     let dir = base.join("archives");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create {}", dir.display()))?;
     let rel = format!("archives/{name}.zip");
     let dst = base.join(&rel);
     let src = std::path::Path::new(archive_src);
     let same_path = matches!((src.canonicalize(), dst.canonicalize()), (Ok(a), Ok(b)) if a == b);
     if !same_path && !files_identical(src, &dst) {
-        std::fs::copy(src, &dst)
-            .with_context(|| format!("copy {archive_src} -> {}", dst.display()))?;
+        std::fs::copy(src, &dst).with_context(|| {
+            format!("copy {archive_src} -> {}", dst.display())
+        })?;
     }
     Ok(rel)
 }
@@ -234,7 +244,8 @@ pub fn load_nv(path: &str) -> NvState {
             "swap_bank" => nv.swap_bank = matches!(v, "1" | "true"),
             // Stored as a basic string; tolerate surrounding quotes. Empty = None.
             "archive" => {
-                nv.archive = Some(v.trim_matches('"').to_string()).filter(|s| !s.is_empty())
+                nv.archive = Some(v.trim_matches('"').to_string())
+                    .filter(|s| !s.is_empty())
             }
             _ => {}
         }
@@ -283,7 +294,8 @@ pub fn load_rot_meta(path: &str) -> RotMeta {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        let v = Some(v.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty());
+        let v = Some(v.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty());
         match k.trim() {
             "slot_a_archive" => m.slot_a_archive = v,
             "slot_b_archive" => m.slot_b_archive = v,
@@ -389,13 +401,13 @@ pub struct Flash {
 
     bank2_locked: bool,
     opt_locked: bool,
-    key2_state: u8,          // progress through the 2-write KEYR2 unlock sequence
-    optkey_state: u8,        // progress through the 2-write OPTKEYR unlock sequence
-    cr2: u32,                // last CR2 write (PG/PSIZE/SNB/IE bits read back)
-    sr2: u32,                // EOP + error bits (BSY/QW always read 0)
-    erase_irq: bool,         // an erase completed with EOPIE armed -> pend FLASH_IRQ
+    key2_state: u8, // progress through the 2-write KEYR2 unlock sequence
+    optkey_state: u8, // progress through the 2-write OPTKEYR unlock sequence
+    cr2: u32,       // last CR2 write (PG/PSIZE/SNB/IE bits read back)
+    sr2: u32,       // EOP + error bits (BSY/QW always read 0)
+    erase_irq: bool, // an erase completed with EOPIE armed -> pend FLASH_IRQ
     regs: HashMap<u32, u32>, // ACR, bank1 stubs, other store/return registers
-    dbg: bool,               // $SP_EMU_FLASHDBG: trace controller register traffic
+    dbg: bool,      // $SP_EMU_FLASHDBG: trace controller register traffic
 }
 
 impl Flash {
@@ -411,7 +423,9 @@ impl Flash {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|e| eprintln!("[flash] open {path} for write-through failed: {e}"))
+            .map_err(|e| {
+                eprintln!("[flash] open {path} for write-through failed: {e}")
+            })
             .ok();
         if let Some(f) = file.as_mut() {
             use std::io::{Seek, SeekFrom, Write};
@@ -451,11 +465,7 @@ impl Flash {
     #[inline]
     fn phys_off(&self, addr: u32) -> usize {
         let rel = (addr - FLASH_BASE) as usize;
-        if self.effective_swap {
-            rel ^ BANK_SIZE
-        } else {
-            rel
-        }
+        if self.effective_swap { rel ^ BANK_SIZE } else { rel }
     }
 
     /// Read `N` bytes from the aperture, tolerating an access that straddles the
@@ -559,11 +569,7 @@ impl Flash {
             }
             REG_OPTSR_CUR => {
                 // OPT_BUSY reads 0 (instant). SWAP_BANK_OPT = committed value.
-                let v = if self.committed_swap {
-                    OPT_SWAP_BANK
-                } else {
-                    0
-                };
+                let v = if self.committed_swap { OPT_SWAP_BANK } else { 0 };
                 if self.dbg {
                     eprintln!(
                         "[flashdbg] rd OPTSR_CUR={v:#010x} committed={}",
@@ -629,7 +635,10 @@ impl Flash {
                     self.bank2_locked = true;
                 }
                 // Bank erase: BER + START, on an unlocked bank.
-                if val & CR_BER != 0 && val & CR_START != 0 && !self.bank2_locked {
+                if val & CR_BER != 0
+                    && val & CR_START != 0
+                    && !self.bank2_locked
+                {
                     self.erase_bank2();
                     self.sr2 |= SR_EOP;
                     if val & CR_EOPIE != 0 {
@@ -744,8 +753,8 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         // Include the pid so concurrent runs (CI matrix) don't share a temp dir.
-        let d =
-            std::env::temp_dir().join(format!("sp-emu-flashtest-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir()
+            .join(format!("sp-emu-flashtest-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -764,10 +773,7 @@ mod tests {
         };
         save_nv(ps, &nv).unwrap();
         assert_eq!(load_nv(ps), nv);
-        let bare = NvState {
-            swap_bank: false,
-            archive: None,
-        };
+        let bare = NvState { swap_bank: false, archive: None };
         save_nv(ps, &bare).unwrap();
         assert_eq!(load_nv(ps), bare);
         assert!(!std::fs::read_to_string(ps).unwrap().contains("archive"));
@@ -812,22 +818,29 @@ mod tests {
         std::fs::write(&flash, b"nvm").unwrap();
         let src = d.join("orig-base-a.zip");
         std::fs::write(&src, b"PKarchive-bytes").unwrap();
-        let rel = stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        let rel =
+            stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp")
+                .unwrap();
         assert_eq!(rel, "archives/sp.zip");
         let dst = d.join("archives/sp.zip");
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
         // Idempotent: stowing the already-stowed file (src == dst) must not error/truncate.
-        let rel2 = stow_archive(flash.to_str().unwrap(), dst.to_str().unwrap(), "sp").unwrap();
+        let rel2 =
+            stow_archive(flash.to_str().unwrap(), dst.to_str().unwrap(), "sp")
+                .unwrap();
         assert_eq!(rel2, "archives/sp.zip");
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
         // Re-run case: stowing the external src again while dst already holds identical
         // bytes takes the skip path, with no error and dst unchanged.
-        let rel3 = stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        let rel3 =
+            stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp")
+                .unwrap();
         assert_eq!(rel3, "archives/sp.zip");
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
         // A changed source is re-copied.
         std::fs::write(&src, b"PKarchive-bytes-v2").unwrap();
-        stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp")
+            .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes-v2");
         let _ = std::fs::remove_dir_all(&d);
     }

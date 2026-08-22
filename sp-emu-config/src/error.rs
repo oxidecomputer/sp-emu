@@ -14,10 +14,7 @@ use std::fmt;
 #[non_exhaustive]
 pub enum ConfigError {
     /// A config file could not be read from disk.
-    Io {
-        path: String,
-        source: std::io::Error,
-    },
+    Io { path: String, source: std::io::Error },
     /// The input is not well-formed TOML.
     Parse(toml::de::Error),
     /// A config could not be serialized back to TOML.
@@ -34,20 +31,24 @@ pub enum ConfigError {
 impl ConfigError {
     /// Build a [`ConfigError::Validation`] for `path` with a human-readable
     /// `problem`.
-    pub(crate) fn invalid(path: impl Into<String>, problem: impl Into<String>) -> Self {
-        ConfigError::Validation {
-            path: path.into(),
-            problem: problem.into(),
-        }
+    pub(crate) fn invalid(
+        path: impl Into<String>,
+        problem: impl Into<String>,
+    ) -> Self {
+        ConfigError::Validation { path: path.into(), problem: problem.into() }
     }
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Io { path, source } => write!(f, "reading {path}: {source}"),
+            ConfigError::Io { path, source } => {
+                write!(f, "reading {path}: {source}")
+            }
             ConfigError::Parse(e) => write!(f, "config is not valid TOML: {e}"),
-            ConfigError::Serialize(e) => write!(f, "config could not be serialized: {e}"),
+            ConfigError::Serialize(e) => {
+                write!(f, "config could not be serialized: {e}")
+            }
             ConfigError::Validation { path, problem } => {
                 write!(f, "config `{path}`: {problem}")
             }
@@ -66,7 +67,8 @@ impl std::error::Error for ConfigError {
             ConfigError::Io { source, .. } => Some(source),
             ConfigError::Parse(e) => Some(e),
             ConfigError::Serialize(e) => Some(e),
-            ConfigError::Validation { .. } | ConfigError::NewerSchema { .. } => None,
+            ConfigError::Validation { .. }
+            | ConfigError::NewerSchema { .. } => None,
         }
     }
 }

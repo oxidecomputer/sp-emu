@@ -59,15 +59,21 @@ impl I2cBridge {
                     // Bounds on_read()'s blocking wait so a hung device server
                     // can't stall the emulator. Set before try_clone so the read
                     // half inherits it; warn if it didn't take.
-                    if let Err(e) = s.set_read_timeout(Some(Duration::from_secs(2))) {
-                        eprintln!("[i2c-device] WARNING: could not set read timeout ({e})");
+                    if let Err(e) =
+                        s.set_read_timeout(Some(Duration::from_secs(2)))
+                    {
+                        eprintln!(
+                            "[i2c-device] WARNING: could not set read timeout ({e})"
+                        );
                     }
                     let r = s.try_clone().ok().map(BufReader::new);
                     eprintln!("[i2c-device] delegating I2C reads to {addr}");
                     return Self::wrap(Mode::Device, Some(s), r);
                 }
                 Err(e) => {
-                    eprintln!("[i2c-device] connect {addr} failed: {e}; using the built-in model")
+                    eprintln!(
+                        "[i2c-device] connect {addr} failed: {e}; using the built-in model"
+                    )
                 }
             }
         }
@@ -78,13 +84,19 @@ impl I2cBridge {
                     eprintln!("[i2c-sniff] connected to {addr}");
                     return Self::wrap(Mode::Sniff, Some(s), None);
                 }
-                Err(e) => eprintln!("[i2c-sniff] connect {addr} failed: {e}; I2C sniff disabled"),
+                Err(e) => eprintln!(
+                    "[i2c-sniff] connect {addr} failed: {e}; I2C sniff disabled"
+                ),
             }
         }
         Self::wrap(Mode::Off, None, None)
     }
 
-    fn wrap(mode: Mode, w: Option<TcpStream>, r: Option<BufReader<TcpStream>>) -> Self {
+    fn wrap(
+        mode: Mode,
+        w: Option<TcpStream>,
+        r: Option<BufReader<TcpStream>>,
+    ) -> Self {
         I2cBridge(Rc::new(RefCell::new(Inner { mode, w, r })))
     }
 
@@ -117,7 +129,10 @@ impl I2cBridge {
                 "i2c{bus} START addr={addr:#04x} {} nbytes={nbytes}",
                 if is_read { "RD" } else { "WR" }
             ),
-            Mode::Device => format!("S {bus} {addr:#04x} {}", if is_read { "R" } else { "W" }),
+            Mode::Device => format!(
+                "S {bus} {addr:#04x} {}",
+                if is_read { "R" } else { "W" }
+            ),
             Mode::Off => return,
         };
         drop(g);
@@ -131,7 +146,9 @@ impl I2cBridge {
         }
         let g = self.0.borrow();
         let line = match g.mode {
-            Mode::Sniff => format!("i2c{bus} WR addr={addr:#04x} <- {byte:#04x}"),
+            Mode::Sniff => {
+                format!("i2c{bus} WR addr={addr:#04x} <- {byte:#04x}")
+            }
             Mode::Device => format!("W {bus} {addr:#04x} {byte:#04x}"),
             Mode::Off => return,
         };
@@ -162,7 +179,14 @@ impl I2cBridge {
 
     /// SNIFF only: tee the value the built-in model served for a read (so the
     /// sniff trace shows reads). No-op in device/off mode.
-    pub fn on_read_served(&self, bus: u8, addr: u8, reg: u8, idx: u16, byte: u8) {
+    pub fn on_read_served(
+        &self,
+        bus: u8,
+        addr: u8,
+        reg: u8,
+        idx: u16,
+        byte: u8,
+    ) {
         if !matches!(self.0.borrow().mode, Mode::Sniff) {
             return;
         }
@@ -204,8 +228,11 @@ fn device_name(addr: u8) -> &'static str {
 /// `sp-emu i2c-sniff <listen-addr>`: listen + pretty-print the SNIFF trace,
 /// annotating known device addresses. Loops across emulator relaunches.
 pub fn serve(addr: &str) -> anyhow::Result<()> {
-    let l = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
-    eprintln!("[i2c-sniff] listening on {addr} - start the emulator with SP_EMU_I2C_BRIDGE={addr}");
+    let l = TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+    eprintln!(
+        "[i2c-sniff] listening on {addr} - start the emulator with SP_EMU_I2C_BRIDGE={addr}"
+    );
     for conn in l.incoming() {
         let conn = match conn {
             Ok(c) => c,
@@ -223,7 +250,9 @@ pub fn serve(addr: &str) -> anyhow::Result<()> {
             let note = line
                 .split_whitespace()
                 .find_map(|t| t.strip_prefix("addr="))
-                .and_then(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .and_then(|h| {
+                    u8::from_str_radix(h.trim_start_matches("0x"), 16).ok()
+                })
                 .map(device_name)
                 .filter(|n| *n != "?");
             match note {
@@ -249,20 +278,29 @@ enum Override {
 ///   `<addr>@<file>`        e.g. `0x50@my-vpd.bin`   (serve a file as the EEPROM)
 fn parse_override(s: &str) -> anyhow::Result<Override> {
     if let Some((addr, file)) = s.split_once('@') {
-        let addr = parse_hex(addr).ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))? as u8;
-        let bytes = std::fs::read(file.trim()).map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
+        let addr = parse_hex(addr)
+            .ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))?
+            as u8;
+        let bytes = std::fs::read(file.trim())
+            .map_err(|e| anyhow::anyhow!("read {file}: {e}"))?;
         return Ok(Override::Image { addr, bytes });
     }
-    let (lhs, val) = s
-        .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val` or `addr@file`"))?;
+    let (lhs, val) = s.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!("spec {s:?} needs `addr/reg=val` or `addr@file`")
+    })?;
     let (addr, reg) = lhs
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("spec {s:?} needs `addr/reg=val`"))?;
     Ok(Override::Reg {
-        addr: parse_hex(addr).ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))? as u8,
-        reg: parse_hex(reg).ok_or_else(|| anyhow::anyhow!("bad reg in {s:?}"))? as u8,
-        val: parse_hex(val).ok_or_else(|| anyhow::anyhow!("bad val in {s:?}"))? as u16,
+        addr: parse_hex(addr)
+            .ok_or_else(|| anyhow::anyhow!("bad addr in {s:?}"))?
+            as u8,
+        reg: parse_hex(reg)
+            .ok_or_else(|| anyhow::anyhow!("bad reg in {s:?}"))?
+            as u8,
+        val: parse_hex(val)
+            .ok_or_else(|| anyhow::anyhow!("bad val in {s:?}"))?
+            as u16,
     })
 }
 
@@ -277,7 +315,8 @@ pub fn serve_device(addr: &str, specs: &[String]) -> anyhow::Result<()> {
         .iter()
         .map(|s| parse_override(s))
         .collect::<anyhow::Result<_>>()?;
-    let l = TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+    let l = TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
     eprintln!(
         "[i2c-device] listening on {addr} - start the emulator with SP_EMU_I2C_DEVICE={addr}"
     );
@@ -324,31 +363,35 @@ pub fn serve_device(addr: &str, specs: &[String]) -> anyhow::Result<()> {
             if f.first() != Some(&"R") || f.len() < 5 {
                 continue;
             }
-            let (addr, reg, idx) =
-                match (parse_hex(f[2]), parse_hex(f[3]), f[4].parse::<usize>().ok()) {
-                    (Some(a), Some(r), Some(i)) => (a as u8, r as u8, i),
-                    _ => continue,
-                };
+            let (addr, reg, idx) = match (
+                parse_hex(f[2]),
+                parse_hex(f[3]),
+                f[4].parse::<usize>().ok(),
+            ) {
+                (Some(a), Some(r), Some(i)) => (a as u8, r as u8, i),
+                _ => continue,
+            };
             let ans: Option<u8> = overrides.iter().find_map(|o| match o {
-                Override::Reg {
-                    addr: a,
-                    reg: r,
-                    val,
-                } if *a == addr && *r == reg => Some(if idx == 0 {
-                    (*val >> 8) as u8
-                } else {
-                    *val as u8
-                }),
+                Override::Reg { addr: a, reg: r, val }
+                    if *a == addr && *r == reg =>
+                {
+                    Some(if idx == 0 { (*val >> 8) as u8 } else { *val as u8 })
+                }
                 Override::Image { addr: a, bytes } if *a == addr => Some(
                     *bytes
-                        .get((reg as usize).wrapping_add(idx) % bytes.len().max(1))
+                        .get(
+                            (reg as usize).wrapping_add(idx)
+                                % bytes.len().max(1),
+                        )
                         .unwrap_or(&0),
                 ),
                 _ => None,
             });
             let reply = match ans {
                 Some(b) => {
-                    eprintln!("[i2c-device] SP read {addr:#04x} reg {reg:#04x} idx {idx} -> injecting {b:#04x}");
+                    eprintln!(
+                        "[i2c-device] SP read {addr:#04x} reg {reg:#04x} idx {idx} -> injecting {b:#04x}"
+                    );
                     format!("{b:#04x}")
                 }
                 None => "-".to_string(),

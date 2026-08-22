@@ -134,7 +134,10 @@ impl RotSwdSpi {
         let data = (val & 0xFFFF) as u16;
         self.n_fwr += 1;
         if self.trace && self.n_fwr <= 60 {
-            eprintln!("[swd] FIFOWR#{} raw={:#010x} len={} data={:#06x}", self.n_fwr, val, len, data);
+            eprintln!(
+                "[swd] FIFOWR#{} raw={:#010x} len={} data={:#06x}",
+                self.n_fwr, val, len, data
+            );
         }
         match &mut self.phase {
             Phase::Idle => {
@@ -151,14 +154,20 @@ impl RotSwdSpi {
                     // serve loop runs the actual transfer.
                     self.rx.push_back(ACK_OK);
                     if rnw {
-                        self.link.lock().req.push_back(SwdReq { ap, rnw: true, a, wdata: 0 });
+                        self.link.lock().req.push_back(SwdReq {
+                            ap,
+                            rnw: true,
+                            a,
+                            wdata: 0,
+                        });
                         // The SP thread drains SWD requests; it may be parked idle.
                         if let Some(l) = crate::sprot::link() {
                             l.wake_sp();
                         }
                         self.phase = Phase::ReadData;
                     } else {
-                        self.phase = Phase::WriteData { acc: 0, bits: 0, ap, a };
+                        self.phase =
+                            Phase::WriteData { acc: 0, bits: 0, ap, a };
                     }
                     if self.trace {
                         eprintln!(
@@ -192,7 +201,10 @@ impl RotSwdSpi {
                         l.wake_sp();
                     }
                     if self.trace {
-                        eprintln!("[swd] write ap={} a={:#x} data={:#010x}", ap as u8, a, wdata);
+                        eprintln!(
+                            "[swd] write ap={} a={:#x} data={:#010x}",
+                            ap as u8, a, wdata
+                        );
                     }
                     self.phase = Phase::Idle;
                 }
@@ -212,11 +224,7 @@ impl Mmio for RotSwdSpi {
             FIFOSTAT => {
                 self.maybe_supply_read_data();
                 FIFOSTAT_TXNOTFULL
-                    | if self.rx.is_empty() {
-                        0
-                    } else {
-                        FIFOSTAT_RXNOTEMPTY
-                    }
+                    | if self.rx.is_empty() { 0 } else { FIFOSTAT_RXNOTEMPTY }
             }
             FIFORD => {
                 self.maybe_supply_read_data();

@@ -41,7 +41,7 @@
 //! take priority. Every place that treats this material as readable carries a
 //! note pointing back here.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use sha3::{Digest, Sha3_256};
 use std::sync::OnceLock;
 
@@ -50,7 +50,10 @@ use std::sync::OnceLock;
 /// way to run a fleet; two instances sharing one cwd without setting this would
 /// share an identity, so a fleet must give each its own path.
 fn identity_path() -> String {
-    crate::config::instance_file("SP_EMU_IDENTITY", crate::config::get().identity_path())
+    crate::config::instance_file(
+        "SP_EMU_IDENTITY",
+        crate::config::get().identity_path(),
+    )
 }
 
 /// Domain tags. Changing a tag changes that field's value for a given seed, so
@@ -87,8 +90,9 @@ const LEGACY_DICE_CDI_WORDS: [u32; 8] = [
     0xc3d2_e1f0,
 ];
 const LEGACY_PUF_UDS: [u8; 32] = [
-    0x53, 0x50, 0x2d, 0x45, 0x4d, 0x55, 0x2d, 0x50, 0x55, 0x46, 0x2d, 0x64, 0x69, 0x63, 0x65, 0x2d,
-    0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x2d, 0x21, 0x21, 0x21, 0x21,
+    0x53, 0x50, 0x2d, 0x45, 0x4d, 0x55, 0x2d, 0x50, 0x55, 0x46, 0x2d, 0x64,
+    0x69, 0x63, 0x65, 0x2d, 0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x2e,
+    0x30, 0x2e, 0x30, 0x2d, 0x21, 0x21, 0x21, 0x21,
 ];
 
 /// Master seed used for a legacy identity's derived fields (RoT UUID, VPD MAC),
@@ -125,7 +129,9 @@ fn derive(master: &[u8; 32], tag: &[u8], out: &mut [u8]) {
     out.copy_from_slice(&d[..out.len()]);
 }
 
-fn words_to_le_bytes<const N: usize, const B: usize>(words: [u32; N]) -> [u8; B] {
+fn words_to_le_bytes<const N: usize, const B: usize>(
+    words: [u32; N],
+) -> [u8; B] {
     debug_assert_eq!(B, N * 4);
     let mut b = [0u8; B];
     for (i, w) in words.iter().enumerate() {
@@ -152,7 +158,8 @@ impl Identity {
         // version and variant sees a UUID of the same class rather than 16
         // bytes that decode as no valid version at all.
         id.rot_uuid[6] = (id.rot_uuid[6] & UUID_VERSION_MASK) | UUID_VERSION_3;
-        id.rot_uuid[8] = (id.rot_uuid[8] & UUID_VARIANT_MASK) | UUID_VARIANT_RFC4122;
+        id.rot_uuid[8] =
+            (id.rot_uuid[8] & UUID_VARIANT_MASK) | UUID_VARIANT_RFC4122;
         derive(&master, TAG_DICE_CDI, &mut id.dice_cdi);
         derive(&master, TAG_PUF_UDS, &mut id.puf_uds);
         derive(&master, TAG_MAC, &mut id.mac);
@@ -186,7 +193,9 @@ impl Identity {
     pub fn dice_cdi_words(&self) -> [u32; 8] {
         let mut w = [0u32; 8];
         for (i, wo) in w.iter_mut().enumerate() {
-            *wo = u32::from_le_bytes(self.dice_cdi[i * 4..i * 4 + 4].try_into().unwrap());
+            *wo = u32::from_le_bytes(
+                self.dice_cdi[i * 4..i * 4 + 4].try_into().unwrap(),
+            );
         }
         w
     }
@@ -278,10 +287,14 @@ fn save_source(path: &str, source: &str) {
 fn random_source() -> String {
     use std::io::Read;
     let mut b = [0u8; 8];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)) {
+    match std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+    {
         Ok(()) => format!("0x{:016x}", u64::from_le_bytes(b)),
         Err(e) => {
-            eprintln!("[identity] /dev/urandom read failed ({e}); using legacy identity");
+            eprintln!(
+                "[identity] /dev/urandom read failed ({e}); using legacy identity"
+            );
             LEGACY_SOURCE.to_string()
         }
     }

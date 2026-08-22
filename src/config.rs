@@ -29,7 +29,7 @@
 //! a default); the strict validation the crate applies is reserved for
 //! the typed config file.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::sync::OnceLock;
 
 pub use sp_emu_config::Config;
@@ -65,8 +65,8 @@ fn resolve(
     if let Some(seed) = seed_override {
         external.op.seed = Some(seed); // --seed beats $SP_EMU_SEED
     }
-    let config =
-        sp_emu_config::ingest(external).map_err(|e| anyhow!("invalid configuration: {e}"))?;
+    let config = sp_emu_config::ingest(external)
+        .map_err(|e| anyhow!("invalid configuration: {e}"))?;
     Ok(Resolved { config, inputs })
 }
 
@@ -77,9 +77,7 @@ fn is_set_in(inputs: &[(&'static str, String)], name: &str) -> bool {
 
 /// Escape a value for a TOML basic string (`"..."`).
 pub(crate) fn escape_toml(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// Serialize the explicitly-set variables as a round-trippable flat TOML file, keyed
@@ -107,7 +105,9 @@ fn flat_toml(inputs: &[(&'static str, String)]) -> String {
 fn render(r: &Resolved) -> String {
     let mut out = sp_emu_config::dump(&r.config)
         .unwrap_or_else(|e| format!("# <effective-config dump failed: {e}>\n"));
-    out.push_str("\n# explicitly set via SP_EMU_* (environment or config file):\n");
+    out.push_str(
+        "\n# explicitly set via SP_EMU_* (environment or config file):\n",
+    );
     for (name, val) in &r.inputs {
         out.push_str(&format!("#   {name} = {val:?}\n"));
     }
@@ -117,7 +117,9 @@ fn render(r: &Resolved) -> String {
 /// Parse a flat config file into `(SP_EMU_NAME, value)` pairs, coercing scalar
 /// values to the string the resolver expects (a boolean `false` means "unset",
 /// a flag left off). A malformed file is a parse error the caller reports.
-fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, toml::de::Error> {
+fn parse_config_toml(
+    text: &str,
+) -> std::result::Result<Vec<(String, String)>, toml::de::Error> {
     let table: toml::Table = text.parse()?;
     let mut out = Vec::new();
     for (k, v) in table {
@@ -127,7 +129,7 @@ fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, t
             toml::Value::Float(f) => f.to_string(),
             toml::Value::Boolean(true) => "1".to_string(),
             toml::Value::Boolean(false) => continue, // presence flag left off
-            _ => continue,                           // arrays/tables/datetimes: not a knob
+            _ => continue, // arrays/tables/datetimes: not a knob
         };
         out.push((k, s));
     }
@@ -194,7 +196,9 @@ pub fn init(
                 path,
                 file.len()
             );
-            let get = |k: &str| file.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            let get = |k: &str| {
+                file.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+            };
             resolve(&get, seed_override)?
         }
         None => resolve(&|k| std::env::var(k).ok(), seed_override)?,
@@ -202,7 +206,11 @@ pub fn init(
 
     if let Some(path) = &dump_config {
         match std::fs::write(path, flat_toml(&resolved.inputs)) {
-            Ok(()) => eprintln!("[config] wrote {} ({} set)", path, resolved.inputs.len()),
+            Ok(()) => eprintln!(
+                "[config] wrote {} ({} set)",
+                path,
+                resolved.inputs.len()
+            ),
             Err(e) => eprintln!("[config] writing {path} failed: {e}"),
         }
     }
@@ -211,17 +219,21 @@ pub fn init(
     }
     // Loud, not silent: if this fails, `get()` already resolved a config (without
     // the seed override) before `init` ran, so the process would run mis-seeded.
-    CONFIG
-        .set(resolved)
-        .map_err(|_| anyhow!("config::init called after config was already resolved by get()"))?;
+    CONFIG.set(resolved).map_err(|_| {
+        anyhow!(
+            "config::init called after config was already resolved by get()"
+        )
+    })?;
     Ok(())
 }
 
 /// The resolved config plus presence map. Lazily defaults from a clean environment
 /// if `init` was never called (unit tests / non-CLI paths), so accessors never panic.
 fn resolved() -> &'static Resolved {
-    CONFIG
-        .get_or_init(|| resolve(&|k| std::env::var(k).ok(), None).expect("default config resolves"))
+    CONFIG.get_or_init(|| {
+        resolve(&|k| std::env::var(k).ok(), None)
+            .expect("default config resolves")
+    })
 }
 
 /// The process configuration.
@@ -268,7 +280,8 @@ pub fn state_dir() -> String {
 /// hubris checkout. `$SP_EMU_ROT_BOOTLEBY` names one explicitly;
 /// `$SP_EMU_ROT_NO_BOOTLEBY` opts out.
 pub fn rot_bootleby_path() -> &'static Option<String> {
-    static RESOLVED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static RESOLVED: std::sync::OnceLock<Option<String>> =
+        std::sync::OnceLock::new();
     RESOLVED.get_or_init(resolve_rot_bootleby)
 }
 
@@ -297,9 +310,8 @@ fn resolve_rot_bootleby() -> Option<String> {
     if let Ok(h) = std::env::var("HUBRIS") {
         candidates.push(format!("{h}/app/oxide-rot-1/{NAME}"));
     }
-    let found = candidates
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists());
+    let found =
+        candidates.into_iter().find(|p| std::path::Path::new(p).exists());
     if found.is_none() {
         eprintln!(
             "[rot] no {NAME} found next to the RoT archive or under $HUBRIS; \
@@ -356,7 +368,10 @@ mod tests {
 
     /// Resolve from an in-memory map instead of the process environment, so tests
     /// are hermetic regardless of the developer's / CI's ambient `SP_EMU_*`.
-    fn resolve_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Resolved {
+    fn resolve_map(
+        vars: &[(&str, &str)],
+        seed_override: Option<String>,
+    ) -> Resolved {
         resolve(
             &|k| {
                 vars.iter()
@@ -369,7 +384,10 @@ mod tests {
     }
 
     /// The validated config for a set of `SP_EMU_*` values.
-    fn from_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Config {
+    fn from_map(
+        vars: &[(&str, &str)],
+        seed_override: Option<String>,
+    ) -> Config {
         resolve_map(vars, seed_override).config
     }
 
@@ -407,7 +425,8 @@ mod tests {
     #[test]
     fn seed_override_wins() {
         // --seed beats $SP_EMU_SEED.
-        let c = from_map(&[("SP_EMU_SEED", "from-env")], Some("from-cli".into()));
+        let c =
+            from_map(&[("SP_EMU_SEED", "from-env")], Some("from-cli".into()));
         assert_eq!(c.seed(), Some("from-cli"));
         // absent flag falls back to the environment.
         let c = from_map(&[("SP_EMU_SEED", "from-env")], None);
@@ -436,7 +455,10 @@ mod tests {
         assert_eq!(c.run_max(), Some(0));
 
         // Empty strings are treated as unset; a non-numeric budget is ignored.
-        let c = from_map(&[("SP_EMU_MODE", ""), ("SP_EMU_RUN_MAX", "forever")], None);
+        let c = from_map(
+            &[("SP_EMU_MODE", ""), ("SP_EMU_RUN_MAX", "forever")],
+            None,
+        );
         assert_eq!(c.mode(), None);
         assert_eq!(c.run_max(), None);
     }
@@ -496,10 +518,8 @@ mod tests {
         );
         let toml = flat_toml(&orig.inputs);
         let loaded = parse_config_toml(&toml).expect("our own output parses");
-        let pairs: Vec<(&str, &str)> = loaded
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let pairs: Vec<(&str, &str)> =
+            loaded.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let round = from_map(&pairs, None);
         assert_eq!(round.board(), Board::Sidecar);
         assert_eq!(round.eth_quantum(), 256);
@@ -519,13 +539,14 @@ mod tests {
              SP_EMU_FLASHDBG = true\nSP_EMU_ETHDBG = false\n",
         )
         .unwrap();
-        let pairs: Vec<(&str, &str)> = m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let pairs: Vec<(&str, &str)> =
+            m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let c = from_map(&pairs, None);
         assert_eq!(c.eth_quantum(), 256);
         assert_eq!(c.ambient_c(), 42.5);
         assert!(c.flashdbg()); // true -> on
         assert!(!c.ethdbg()); // false -> absent -> off
-                              // a malformed file is rejected (callers fall back to no file layer)
+        // a malformed file is rejected (callers fall back to no file layer)
         assert!(parse_config_toml("this is not = = toml").is_err());
     }
 
@@ -608,7 +629,8 @@ mod tests {
             if path.file_name().and_then(|n| n.to_str()) == Some("config.rs") {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).expect("read source file");
+            let text =
+                std::fs::read_to_string(&path).expect("read source file");
             assert!(
                 !text.contains("env::var"),
                 "{} reads the environment directly; route it through config.rs",

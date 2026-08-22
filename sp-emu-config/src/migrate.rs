@@ -16,7 +16,7 @@
 use crate::error::ConfigError;
 use crate::legacy::flat_to_v1;
 use crate::schema::v1::ConfigFileV1;
-use crate::version::{peek_version, SchemaVersion, CURRENT};
+use crate::version::{CURRENT, SchemaVersion, peek_version};
 
 /// Read `text` in whatever known version it declares and return it as the
 /// current external schema.
@@ -32,10 +32,9 @@ pub fn migrate(text: &str) -> Result<ConfigFileV1, ConfigError> {
             "schema_version",
             format!("no migration path for version {n}"),
         )),
-        SchemaVersion::Newer(found) => Err(ConfigError::NewerSchema {
-            found,
-            known: CURRENT,
-        }),
+        SchemaVersion::Newer(found) => {
+            Err(ConfigError::NewerSchema { found, known: CURRENT })
+        }
     }
 }
 
@@ -47,7 +46,8 @@ mod tests {
 
     #[test]
     fn a_legacy_flat_file_migrates_and_ingests() {
-        let flat = "SP_EMU_BOARD = \"sidecar\"\nSP_EMU_ROT_FLASH = \"rot.bin\"\n";
+        let flat =
+            "SP_EMU_BOARD = \"sidecar\"\nSP_EMU_ROT_FLASH = \"rot.bin\"\n";
         let c = ingest(migrate(flat).unwrap()).unwrap();
         assert_eq!(c.board(), Board::Sidecar);
         assert_eq!(c.rot_flash(), Some("rot.bin"));

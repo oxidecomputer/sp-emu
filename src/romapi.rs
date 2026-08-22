@@ -69,11 +69,7 @@ pub enum RomCall {
     #[default]
     Idle,
     /// `skboot_authenticate` result computed; settling before returning to `LR`.
-    Settling {
-        left: u32,
-        is_verified_ptr: u32,
-        ok: bool,
-    },
+    Settling { left: u32, is_verified_ptr: u32, ok: bool },
 }
 
 /// Synthesize the ROM pointer-graph words the guest loads (data reads). Returns
@@ -81,12 +77,16 @@ pub enum RomCall {
 pub fn rom_read32(addr: u32) -> Option<u32> {
     match addr {
         SKBOOT_PTR_ADDR => Some(SKBOOT_FNS_ADDR), // BootloaderTree.skboot
-        SKBOOT_FNS_ADDR => Some(AUTH_TRAP | 1),   // SKBootFns.skboot_authenticate
+        SKBOOT_FNS_ADDR => Some(AUTH_TRAP | 1), // SKBootFns.skboot_authenticate
         a if a == SKBOOT_FNS_ADDR + 4 => Some(HASHCRYPT_TRAP | 1), // .._irq_handler
         // Any other read in the ROM table / boot-ROM window reads as 0 (a guest
         // dereference of an unmodeled field lands here rather than faulting).
         a if (LPC55_ROM_TABLE..LPC55_ROM_TABLE + 0x40).contains(&a) => Some(0),
-        a if (LPC55_BOOT_ROM..LPC55_BOOT_ROM + LPC55_BOOT_ROM_SIZE).contains(&a) => Some(0),
+        a if (LPC55_BOOT_ROM..LPC55_BOOT_ROM + LPC55_BOOT_ROM_SIZE)
+            .contains(&a) =>
+        {
+            Some(0)
+        }
         _ => None,
     }
 }
@@ -117,10 +117,14 @@ pub fn rom_dispatch(cpu: &mut Cpu, bus: &mut Bus) {
             if crate::config::get().romdbg() {
                 match &result {
                     Ok(()) => {
-                        eprintln!("[rom] skboot_authenticate(start={start:#010x}) -> OK")
+                        eprintln!(
+                            "[rom] skboot_authenticate(start={start:#010x}) -> OK"
+                        )
                     }
                     Err(e) => {
-                        eprintln!("[rom] skboot_authenticate(start={start:#010x}) -> FAIL ({e:?})")
+                        eprintln!(
+                            "[rom] skboot_authenticate(start={start:#010x}) -> FAIL ({e:?})"
+                        )
                     }
                 }
             }
@@ -131,30 +135,15 @@ pub fn rom_dispatch(cpu: &mut Cpu, bus: &mut Bus) {
                 ok: result.is_ok(),
             };
         }
-        RomCall::Settling {
-            left,
-            is_verified_ptr,
-            ok,
-        } if left > 0 => {
-            cpu.rom_call = RomCall::Settling {
-                left: left - 1,
-                is_verified_ptr,
-                ok,
-            };
+        RomCall::Settling { left, is_verified_ptr, ok } if left > 0 => {
+            cpu.rom_call =
+                RomCall::Settling { left: left - 1, is_verified_ptr, ok };
         }
-        RomCall::Settling {
-            is_verified_ptr,
-            ok,
-            ..
-        } => {
+        RomCall::Settling { is_verified_ptr, ok, .. } => {
             // Settle complete: write the out-param and return the status in r0.
             bus.write32(
                 is_verified_ptr,
-                if ok {
-                    SECURE_TRACKER_VERIFIED
-                } else {
-                    SECURE_FALSE
-                },
+                if ok { SECURE_TRACKER_VERIFIED } else { SECURE_FALSE },
             );
             cpu.r[0] = if ok { SKBOOT_SUCCESS } else { SKBOOT_FAIL };
             cpu.pc = cpu.r[14] & !1; // rom_call left Idle by take()
@@ -187,15 +176,17 @@ fn verify_slot(bus: &Bus, start: u32) -> Result<(), VerifyError> {
     let start = start & !crate::mem::LPC55_SECURE_ALIAS_BIT;
     // Total signed length from the NXP image header; fall back to the whole window
     // from `start` if the field is implausible.
-    let hdr_len = f.read_mem32(start.wrapping_add(NXP_IMAGE_LENGTH_OFFSET)) as usize;
+    let hdr_len =
+        f.read_mem32(start.wrapping_add(NXP_IMAGE_LENGTH_OFFSET)) as usize;
     let len = if (0x100..=crate::rot_flash::SIZE).contains(&hdr_len) {
         hdr_len
     } else {
         crate::rot_flash::SIZE
     };
-    let cmpa = lpc55_areas::CMPAPage::from_bytes(&f.cmpa_bytes()).map_err(|_| VerifyError::Cmpa)?;
-    let cfpa =
-        lpc55_areas::CFPAPage::from_bytes(&f.active_cfpa_bytes()).map_err(|_| VerifyError::Cfpa)?;
+    let cmpa = lpc55_areas::CMPAPage::from_bytes(&f.cmpa_bytes())
+        .map_err(|_| VerifyError::Cmpa)?;
+    let cfpa = lpc55_areas::CFPAPage::from_bytes(&f.active_cfpa_bytes())
+        .map_err(|_| VerifyError::Cfpa)?;
     lpc55_sign::verify::verify_image(f.slice(start, len), cmpa, cfpa)
         .map_err(|_| VerifyError::Signature)
 }

@@ -35,7 +35,10 @@ pub fn synthetic_stage0() -> Vec<u8> {
     let mut tlvc = Vec::new();
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"BORD", b"oxide-rot-1"));
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"NAME", b"bootleby"));
-    tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"GITC", b"0000000000000000000000000000000000000000"));
+    tlvc.extend_from_slice(&crate::soc::tlvc_chunk(
+        b"GITC",
+        b"0000000000000000000000000000000000000000",
+    ));
     tlvc.extend_from_slice(&crate::soc::tlvc_chunk(b"VERS", b"0.0.0-sp-emu"));
     // SIGN: the staging/devel RKTH sp-sim compiles in for its RoT/stage0
     // cabooses, so one update payload repo's artifact tags match both fleets.
@@ -50,11 +53,16 @@ pub fn synthetic_stage0() -> Vec<u8> {
     let image_end: u32 = 0x0800;
     let caboose_start = (image_end - caboose_size) as usize;
     let mut buf = vec![0xFFu8; image_end as usize];
-    buf[HEADER_OFFSET..HEADER_OFFSET + 4].copy_from_slice(&HEADER_MAGIC.to_le_bytes());
-    buf[HEADER_OFFSET + 4..HEADER_OFFSET + 8].copy_from_slice(&image_end.to_le_bytes()); // total_image_len
-    buf[caboose_start..caboose_start + 4].copy_from_slice(&CABOOSE_MAGIC.to_le_bytes());
-    buf[caboose_start + 4..caboose_start + 4 + tlvc.len()].copy_from_slice(&tlvc);
-    buf[(image_end - 4) as usize..image_end as usize].copy_from_slice(&caboose_size.to_le_bytes());
+    buf[HEADER_OFFSET..HEADER_OFFSET + 4]
+        .copy_from_slice(&HEADER_MAGIC.to_le_bytes());
+    buf[HEADER_OFFSET + 4..HEADER_OFFSET + 8]
+        .copy_from_slice(&image_end.to_le_bytes()); // total_image_len
+    buf[caboose_start..caboose_start + 4]
+        .copy_from_slice(&CABOOSE_MAGIC.to_le_bytes());
+    buf[caboose_start + 4..caboose_start + 4 + tlvc.len()]
+        .copy_from_slice(&tlvc);
+    buf[(image_end - 4) as usize..image_end as usize]
+        .copy_from_slice(&caboose_size.to_le_bytes());
     buf
 }
 

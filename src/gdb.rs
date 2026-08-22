@@ -74,7 +74,12 @@ fn sp_burst_for(
 /// per ms (must be nonzero; callers use `tick_divisor` or the config SP clock, both
 /// positive), and `cap` the per-iteration credit ceiling. Returns the whole-ms credit to
 /// add this iteration and the new accumulator.
-fn endoscope_credit(acc: u64, d_cycles: u64, divisor: u64, cap: u32) -> (u32, u64) {
+fn endoscope_credit(
+    acc: u64,
+    d_cycles: u64,
+    divisor: u64,
+    cap: u32,
+) -> (u32, u64) {
     let total = acc + d_cycles;
     let ms = (total / divisor).min(cap as u64) as u32;
     (ms, total % divisor)
@@ -84,7 +89,11 @@ fn endoscope_credit(acc: u64, d_cycles: u64, divisor: u64, cap: u32) -> (u32, u6
 /// RoT is watching (its swd task armed SP_RESET, `rot_armed`); not if the SP is
 /// already halted (a vector catch caught the reset). While the RoT is unarmed (early
 /// boot), the SP's measurement loop must keep free-running, so this stays false.
-fn enter_sp_reset_service(sp_reset_edge: bool, rot_armed: bool, sp_halted: bool) -> bool {
+fn enter_sp_reset_service(
+    sp_reset_edge: bool,
+    rot_armed: bool,
+    sp_halted: bool,
+) -> bool {
     sp_reset_edge && rot_armed && !sp_halted
 }
 
@@ -218,7 +227,14 @@ fn rot_thread_main(
             if (f..=t).contains(&pc_before) {
                 eprintln!(
                     "[rotpb] {:#010x}: {:<24} r0={:08x} r1={:08x} r2={:08x} r4={:08x} r5={:08x} r6={:08x}",
-                    pc_before, rc.last_disasm, rc.r[0], rc.r[1], rc.r[2], rc.r[4], rc.r[5], rc.r[6]
+                    pc_before,
+                    rc.last_disasm,
+                    rc.r[0],
+                    rc.r[1],
+                    rc.r[2],
+                    rc.r[4],
+                    rc.r[5],
+                    rc.r[6]
                 );
             }
         }
@@ -231,7 +247,9 @@ fn rot_thread_main(
         // which is minutes of pegged CPU that block SP bring-up and read as a
         // hang. Always report where; the register and stack dump stays behind
         // SP_EMU_SPROTDBG.
-        if rc.pc == pc_before && matches!(rc.rom_call, crate::romapi::RomCall::Idle) {
+        if rc.pc == pc_before
+            && matches!(rc.rom_call, crate::romapi::RomCall::Idle)
+        {
             eprintln!(
                 "[rot] preboot: RoT is spinning at pc={:#010x} (a panic or \
                  fault loop?); ending preboot. Set SP_EMU_SPROTDBG=1 for a \
@@ -281,7 +299,8 @@ fn rot_thread_main(
     let rotpc_every = crate::config::get().rotpc();
     let mut rotpc_next = 0u64;
     // Distinct pcs already reported by the RoT trap log (mirrors sp_unimpl).
-    let mut rot_trap_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut rot_trap_seen: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
     // SP_EMU_ROT_TRACE_FROM/TO="0xADDR": per-instruction pc window trace.
     let rot_trace_from = crate::config::get().rot_trace_from();
     let rot_trace_to = crate::config::get().rot_trace_to();
@@ -302,7 +321,9 @@ fn rot_thread_main(
             match l.accept() {
                 Ok((stream, peer)) => {
                     eprintln!("[gdb] RoT SWD (Glasgow applet) client {peer}");
-                    let r = crate::glasgow::serve(stream, &mut rc, &mut rb, &mut host);
+                    let r = crate::glasgow::serve(
+                        stream, &mut rc, &mut rb, &mut host,
+                    );
                     rc.halted = false;
                     rc.debug_en = false;
                     rc.bkpt_hit = false;
@@ -338,9 +359,7 @@ fn rot_thread_main(
         if jtag_pint && inject_jtag_detect(&mut rb) {
             link.borrow_mut().jtag_pint = false;
         }
-        shared
-            .armed_sp_reset
-            .store(rb.irq_enabled(4), Ordering::Relaxed);
+        shared.armed_sp_reset.store(rb.irq_enabled(4), Ordering::Relaxed);
         // Wake the FLEXCOMM8 slave (irq 59) whenever it owes a receive: an
         // un-processed slave-select assert is latched (ssa), a transfer is
         // active (cs), or a reply is pending (rot_irq). Keying off the latched
@@ -356,7 +375,8 @@ fn rot_thread_main(
         if endo {
             let credit = shared.endo_credit_ms.swap(0, Ordering::Relaxed);
             if credit > 0 {
-                rc.sp_tick_credit = rc.sp_tick_credit.saturating_add(credit).min(CREDIT_CAP);
+                rc.sp_tick_credit =
+                    rc.sp_tick_credit.saturating_add(credit).min(CREDIT_CAP);
             }
         } else {
             rc.sp_tick_credit = 0;
@@ -397,7 +417,13 @@ fn rot_thread_main(
                 if (f..=t).contains(&rpc) {
                     eprintln!(
                         "[rottrace] {:#010x}: {:<26} r0={:08x} r1={:08x} r2={:08x} r3={:08x} r6={:08x}",
-                        rpc, rc.last_disasm, rc.r[0], rc.r[1], rc.r[2], rc.r[3], rc.r[6]
+                        rpc,
+                        rc.last_disasm,
+                        rc.r[0],
+                        rc.r[1],
+                        rc.r[2],
+                        rc.r[3],
+                        rc.r[6]
                     );
                 }
             }
@@ -472,14 +498,9 @@ pub fn serve(
     preboot: u64,
 ) -> Result<()> {
     let has_rot = rot_image.is_some();
-    eprintln!(
-        "[gdb] pre-booting {} instructions to steady state...",
-        preboot
-    );
-    let (twin_from, twin_to) = (
-        crate::config::get().trace_from(),
-        crate::config::get().trace_to(),
-    );
+    eprintln!("[gdb] pre-booting {} instructions to steady state...", preboot);
+    let (twin_from, twin_to) =
+        (crate::config::get().trace_from(), crate::config::get().trace_to());
     // Pay the per-instruction disasm-formatting cost only when the windowed trace is on.
     cpu.record_disasm = twin_from.is_some();
     let preboot_start = std::time::Instant::now();
@@ -490,9 +511,22 @@ pub fn serve(
         }
         if let (Some(lo), Some(hi)) = (twin_from, twin_to) {
             if cpu.cycles >= lo && cpu.cycles <= hi {
-                eprintln!("c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
-                    cpu.cycles, pc, cpu.last_disasm,
-                    cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7], cpu.r[13], cpu.r[14]);
+                eprintln!(
+                    "c{} {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} sp={:08x} lr={:08x}",
+                    cpu.cycles,
+                    pc,
+                    cpu.last_disasm,
+                    cpu.r[0],
+                    cpu.r[1],
+                    cpu.r[2],
+                    cpu.r[3],
+                    cpu.r[4],
+                    cpu.r[5],
+                    cpu.r[6],
+                    cpu.r[7],
+                    cpu.r[13],
+                    cpu.r[14]
+                );
             }
         }
         cpu.maybe_tick(&mut bus);
@@ -506,7 +540,6 @@ pub fn serve(
         secs,
         cpu.cycles as f64 / secs / 1e6
     );
-
 
     // Post-preboot: enable the WFI idle-throttle so an idle SP sleeps the host
     // instead of pegging a core (preboot ran with it off, at full spin speed).
@@ -565,14 +598,18 @@ pub fn serve(
         None => 0,
     };
     let listeners = if crate::config::get().no_debug() {
-        eprintln!("[gdb] debug servers disabled (SP_EMU_NO_DEBUG); serving the bridge only");
+        eprintln!(
+            "[gdb] debug servers disabled (SP_EMU_NO_DEBUG); serving the bridge only"
+        );
         None
     } else {
         let swd_port = 4444u16 + swd_off; // swd_off < 1000, no overflow
         let swd_l = TcpListener::bind(("127.0.0.1", swd_port))?;
         swd_l.set_nonblocking(true)?;
         eprintln!("[gdb] ready (swd :{swd_port}). attach with:");
-        eprintln!("[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (SP Glasgow SWD debug port: halt/run/hiffy; stock humility)");
+        eprintln!(
+            "[gdb]   humility -a <archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{swd_port} <cmd>   (SP Glasgow SWD debug port: halt/run/hiffy; stock humility)"
+        );
         Some(swd_l)
     };
     // Second Glasgow SWD probe bound to the in-process RoT core, so humility can
@@ -586,7 +623,9 @@ pub fn serve(
         let l = TcpListener::bind(("127.0.0.1", rot_swd_port))?;
         l.set_nonblocking(true)?;
         eprintln!("[gdb] ready (rot swd :{rot_swd_port}). attach with:");
-        eprintln!("[gdb]   humility -a <rot-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{rot_swd_port} <cmd>   (RoT Glasgow SWD debug port)");
+        eprintln!(
+            "[gdb]   humility -a <rot-archive.zip> -p 20b7:9db1:tcp:127.0.0.1:{rot_swd_port} <cmd>   (RoT Glasgow SWD debug port)"
+        );
         Some(l)
     };
 
@@ -609,7 +648,8 @@ pub fn serve(
     // OS descheduled the whole process (only CPU priority helps, not the quantum).
     // Logged only for gaps over the threshold (default 50ms).
     let pumpstats = crate::config::get().pumpstats();
-    let pump_thresh_us: u128 = crate::config::get().pumpstats_ms() as u128 * 1000;
+    let pump_thresh_us: u128 =
+        crate::config::get().pumpstats_ms() as u128 * 1000;
     let mut last_pump = std::time::Instant::now();
     let mut last_cyc = cpu.cycles;
 
@@ -618,7 +658,8 @@ pub fn serve(
     // Sampled every 256 instrs; cumulative top-30 dumped every 15s. Map PCs to
     // functions offline with the Hubris archive (addr2line/nm).
     let pcprof = crate::config::get().pcprof();
-    let mut pchist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let mut pchist: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
     let mut pcprof_samp: u64 = 0;
     let mut pcprof_last = std::time::Instant::now();
 
@@ -659,7 +700,8 @@ pub fn serve(
     let mut prev_endo_couple = false; // coupledbg: edge-detect the coupling window
 
     // Distinct pcs already reported by the unimplemented-instruction log.
-    let mut sp_unimpl: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut sp_unimpl: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
 
     // Debug: SP_EMU_PCWIN pc windows for the instruction trace in the burst
     // loop below.
@@ -694,7 +736,8 @@ pub fn serve(
                     }
                     // Restore the running-halt state on disconnect so the main
                     // loop resumes the SP after a humility command detaches.
-                    let r = crate::glasgow::serve(stream, &mut cpu, &mut bus, host);
+                    let r =
+                        crate::glasgow::serve(stream, &mut cpu, &mut bus, host);
                     cpu.halted = false;
                     cpu.debug_en = false;
                     cpu.bkpt_hit = false;
@@ -708,7 +751,9 @@ pub fn serve(
                     }
                     continue;
                 }
-                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e.into()),
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                    return Err(e.into());
+                }
                 Err(_) => {}
             }
         }
@@ -743,11 +788,8 @@ pub fn serve(
         // freezes the RoT's clock and advances it by the SP's endoscope progress, so the
         // RoT records a realistic halt time. Otherwise sprint in one shot so the SP halts
         // before the RoT (whose timer is frozen meanwhile) times out (DidNotHalt).
-        let endoscope_burst = if endoscope_couple {
-            ENDOSCOPE_BURST
-        } else {
-            ENDOSCOPE_SPRINT
-        };
+        let endoscope_burst =
+            if endoscope_couple { ENDOSCOPE_BURST } else { ENDOSCOPE_SPRINT };
         let sp_burst = sp_burst_for(
             cpu.halted,
             sp_reset_halt_pending,
@@ -770,7 +812,10 @@ pub fn serve(
                 // instead of appearing as firmware bugs downstream.
                 if let crate::cpu::Trap::Unimplemented { pc, disasm, .. } = &t {
                     if sp_unimpl.insert(*pc) {
-                        eprintln!("[sptrap] UNIMPL pc={:#010x}: {}", pc, disasm);
+                        eprintln!(
+                            "[sptrap] UNIMPL pc={:#010x}: {}",
+                            pc, disasm
+                        );
                     }
                 }
                 break;
@@ -781,10 +826,20 @@ pub fn serve(
                 if wins.iter().any(|(lo, hi)| (*lo..=*hi).contains(&trace_pc)) {
                     eprintln!(
                         "[pcwin] {:08x}: {:<28} | r0={:08x} r1={:08x} r2={:08x} r3={:08x} r4={:08x} r5={:08x} r6={:08x} r7={:08x} r8={:08x} r12={:08x} sp={:08x} lr={:08x}",
-                        trace_pc, cpu.last_disasm,
-                        cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[4],
-                        cpu.r[5], cpu.r[6], cpu.r[7], cpu.r[8], cpu.r[12],
-                        cpu.r[13], cpu.r[14]
+                        trace_pc,
+                        cpu.last_disasm,
+                        cpu.r[0],
+                        cpu.r[1],
+                        cpu.r[2],
+                        cpu.r[3],
+                        cpu.r[4],
+                        cpu.r[5],
+                        cpu.r[6],
+                        cpu.r[7],
+                        cpu.r[8],
+                        cpu.r[12],
+                        cpu.r[13],
+                        cpu.r[14]
                     );
                 }
             }
@@ -871,9 +926,13 @@ pub fn serve(
                 }
             } else if sp_reset_edge && coupledbg {
                 if cpu.halted {
-                    eprintln!("[reset] SP self-reset: vector-caught at the reset vector (0 reset-vector instrs)");
+                    eprintln!(
+                        "[reset] SP self-reset: vector-caught at the reset vector (0 reset-vector instrs)"
+                    );
                 } else {
-                    eprintln!("[reset] SP self-reset: RoT not armed (SP_RESET IRQ disabled); SP free-runs (early boot)");
+                    eprintln!(
+                        "[reset] SP self-reset: RoT not armed (SP_RESET IRQ disabled); SP free-runs (early boot)"
+                    );
                 }
             }
             // SP_EMU_JTAG_TRIGGER: one synthetic JTAG_DETECT edge; the RoT thread
@@ -896,7 +955,10 @@ pub fn serve(
             if cs_now {
                 bus.pend_irq(84);
             }
-            rot_busy = ssa_or_cs || req_in_flight || sp_reset_halt_pending || cpu.debug_en;
+            rot_busy = ssa_or_cs
+                || req_in_flight
+                || sp_reset_halt_pending
+                || cpu.debug_en;
             // Freeze the SP's own SysTick while an accepted request is in
             // flight: its sprot timeout then advances only at the credited RoT
             // rate (the WFI credit-drain in cpu.rs). Unfrozen, the idle
@@ -912,8 +974,12 @@ pub fn serve(
             prev_sp_cycles = cpu.cycles;
             if now_endo {
                 let divisor = cpu.tick_divisor().unwrap_or(sp_clock_khz) as u64;
-                let (ms, new_acc) =
-                    endoscope_credit(endoscope_acc, d_sp_cyc, divisor, CREDIT_CAP);
+                let (ms, new_acc) = endoscope_credit(
+                    endoscope_acc,
+                    d_sp_cyc,
+                    divisor,
+                    CREDIT_CAP,
+                );
                 endoscope_acc = new_acc;
                 if ms > 0 {
                     shared.endo_credit_ms.fetch_add(ms, Ordering::Relaxed);
@@ -944,8 +1010,8 @@ pub fn serve(
                 loop {
                     let req = swd.lock().req.pop_front();
                     let Some(r) = req else { break };
-                    if let crate::debugport::Ack::Ok(Some(d)) =
-                        sp_swdp.transfer(&mut cpu, &mut bus, r.ap, r.rnw, r.a, r.wdata)
+                    if let crate::debugport::Ack::Ok(Some(d)) = sp_swdp
+                        .transfer(&mut cpu, &mut bus, r.ap, r.rnw, r.a, r.wdata)
                     {
                         swd.lock().resp = Some(d);
                     }
@@ -977,7 +1043,8 @@ pub fn serve(
             prev_rot_ticks = cur_rot_ticks;
             if sprot_couple && req_in_flight && !cpu.halted {
                 let add = d_rot.min(CREDIT_CAP as u64) as u32;
-                cpu.sp_tick_credit = cpu.sp_tick_credit.saturating_add(add).min(CREDIT_CAP);
+                cpu.sp_tick_credit =
+                    cpu.sp_tick_credit.saturating_add(add).min(CREDIT_CAP);
                 if coupledbg && (add > 0 || !prev_req_dbg) {
                     eprintln!(
                         "[couple] req_in_flight +{} credit={} sp_ticks={} rot_ticks={}",
@@ -1012,11 +1079,17 @@ pub fn serve(
             if coupledbg && was_servicing && !sp_reset_halt_pending {
                 let iters = SP_RESET_HALT_ITERS - sp_reset_halt_iters;
                 if cpu.halted {
-                    eprintln!("[reset] RoT halted the SP after {iters} serve iterations, SP ran 0 reset-vector instrs (prompt)");
+                    eprintln!(
+                        "[reset] RoT halted the SP after {iters} serve iterations, SP ran 0 reset-vector instrs (prompt)"
+                    );
                 } else if cpu.debug_en {
-                    eprintln!("[reset] RoT resumed the SP under debug after {iters} serve iterations (endoscope), SP ran 0 reset-vector instrs");
+                    eprintln!(
+                        "[reset] RoT resumed the SP under debug after {iters} serve iterations (endoscope), SP ran 0 reset-vector instrs"
+                    );
                 } else {
-                    eprintln!("[reset] backstop: RoT did not halt within {SP_RESET_HALT_ITERS} iterations; SP resumes free-running");
+                    eprintln!(
+                        "[reset] backstop: RoT did not halt within {SP_RESET_HALT_ITERS} iterations; SP resumes free-running"
+                    );
                 }
             }
         } else if let Some(client) = rot_client.as_mut() {
@@ -1096,16 +1169,22 @@ pub fn serve(
                 let trig = format!("{}/.trigger", ddir);
                 if std::path::Path::new(&trig).exists() {
                     match bus.write_hydrate_dump(ddir, dump_archive_id) {
-                        Ok(_) => eprintln!("[dump] wrote hydrate RAM dump to {}", ddir),
+                        Ok(_) => eprintln!(
+                            "[dump] wrote hydrate RAM dump to {}",
+                            ddir
+                        ),
                         Err(e) => eprintln!("[dump] FAILED: {}", e),
                     }
                     if let Err(e) = std::fs::remove_file(&trig) {
                         // Can't consume the trigger: it would re-fire every poll.
                         // Warn once and disarm the poller for the rest of the run.
-                        eprintln!("[dump] cannot remove trigger {trig}: {e}; disarming");
+                        eprintln!(
+                            "[dump] cannot remove trigger {trig}: {e}; disarming"
+                        );
                         dump_dir = None;
                     }
-                    let _ = std::fs::write(format!("{}/.done", ddir), b"done\n");
+                    let _ =
+                        std::fs::write(format!("{}/.done", ddir), b"done\n");
                 }
             }
         }
@@ -1124,9 +1203,13 @@ pub fn serve(
         }
         if pcprof && pcprof_last.elapsed().as_secs() >= 15 {
             let total: u64 = pchist.values().sum();
-            let mut v: Vec<(u64, u32)> = pchist.iter().map(|(&pc, &c)| (c, pc)).collect();
+            let mut v: Vec<(u64, u32)> =
+                pchist.iter().map(|(&pc, &c)| (c, pc)).collect();
             v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            eprintln!("[pcprof] total_samples={} (every 256th instr) top:", total);
+            eprintln!(
+                "[pcprof] total_samples={} (every 256th instr) top:",
+                total
+            );
             for (c, pc) in v.iter().take(30) {
                 eprintln!(
                     "[pcprof] {:#010x} {} ({:.1}%)",
@@ -1170,9 +1253,9 @@ pub fn serve(
                             let g = l.borrow_mut();
                             let _unused = l.wait_sp(g, ms);
                         }
-                        None => {
-                            std::thread::sleep(std::time::Duration::from_millis(ms))
-                        }
+                        None => std::thread::sleep(
+                            std::time::Duration::from_millis(ms),
+                        ),
                     }
                 }
             }

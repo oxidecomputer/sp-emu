@@ -7,7 +7,7 @@
 //! Decodes the executable sections of a Hubris ELF (kernel or task), using the
 //! ARM `$t`/`$d` mapping symbols to separate Thumb code from inline literal
 //! pools (the same technique Hubris's own xtask uses), and histograms every
-//! opcode and operand-variant shape encountered. 
+//! opcode and operand-variant shape encountered.
 //!
 //! Usage: analyze <elf>
 
@@ -17,7 +17,10 @@ use yaxpeax_arch::{Decoder, LengthedInstruction, U8Reader};
 use yaxpeax_arm::armv7::{InstDecoder, Operand};
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode { Code, Data }
+enum Mode {
+    Code,
+    Data,
+}
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args()
@@ -85,12 +88,18 @@ fn main() -> anyhow::Result<()> {
                     let len = inst.len().to_const().max(2) as u64;
                     let key = format!("{:?}", inst.opcode);
                     examples.entry(key.clone()).or_insert_with(|| {
-                        format!("{:<26} ops={:?}", format!("{}", inst), inst.operands)
+                        format!(
+                            "{:<26} ops={:?}",
+                            format!("{}", inst),
+                            inst.operands
+                        )
                     });
                     *opcodes.entry(key).or_default() += 1;
                     for op in &inst.operands {
                         if !matches!(op, Operand::Nothing) {
-                            *operand_variants.entry(variant_name(op)).or_default() += 1;
+                            *operand_variants
+                                .entry(variant_name(op))
+                                .or_default() += 1;
                         }
                     }
                     total += 1;
@@ -107,7 +116,10 @@ fn main() -> anyhow::Result<()> {
     let mut by_count: Vec<_> = opcodes.iter().collect();
     by_count.sort_by(|a, b| b.1.cmp(a.1));
     println!("== {} ==", path);
-    println!("decoded {total} instructions, {decode_errors} decode errors, {} distinct opcodes\n", opcodes.len());
+    println!(
+        "decoded {total} instructions, {decode_errors} decode errors, {} distinct opcodes\n",
+        opcodes.len()
+    );
     println!("-- opcodes by frequency --");
     for (op, n) in &by_count {
         println!("  {:>7}  {}", n, op);

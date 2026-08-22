@@ -21,8 +21,13 @@ fn main() {
     if head.exists() {
         println!("cargo:rerun-if-changed={}", head.display());
         if let Ok(c) = std::fs::read_to_string(&head) {
-            if let Some(r) = c.strip_prefix("ref: ").and_then(|s| s.lines().next()) {
-                println!("cargo:rerun-if-changed={}", dot_git.join(r).display());
+            if let Some(r) =
+                c.strip_prefix("ref: ").and_then(|s| s.lines().next())
+            {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    dot_git.join(r).display()
+                );
             }
         }
     }
@@ -48,9 +53,5 @@ fn git_hash(root: &PathBuf) -> String {
     let dirty = run(&["status", "--porcelain"])
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    if dirty {
-        format!("{hash}-dirty")
-    } else {
-        hash
-    }
+    if dirty { format!("{hash}-dirty") } else { hash }
 }

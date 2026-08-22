@@ -71,10 +71,10 @@ pub struct Puf {
     busy: bool,
     success: bool,
     error: bool,
-    seed: [u8; 32],          // per-instance device seed (UDS) streamed from GETKEY
-    codeout: VecDeque<u32>,  // keycode words to emit (GENERATEKEY)
-    codein_left: usize,      // keycode words still to consume (GETKEY)
-    keyout: VecDeque<u32>,   // key/seed words to emit (GETKEY)
+    seed: [u8; 32], // per-instance device seed (UDS) streamed from GETKEY
+    codeout: VecDeque<u32>, // keycode words to emit (GENERATEKEY)
+    codein_left: usize, // keycode words still to consume (GETKEY)
+    keyout: VecDeque<u32>, // key/seed words to emit (GETKEY)
     regs: HashMap<u32, u32>, // catch-all for plain registers (idxblk_l_dp, cfg, ...)
 }
 
@@ -184,7 +184,8 @@ impl Puf {
                 // seed clamps to the seed; the driver only asks for 256 bits.
                 let words = self.key_bytes().min(self.seed.len()) / 4;
                 for i in 0..words {
-                    let b: [u8; 4] = self.seed[i * 4..i * 4 + 4].try_into().unwrap();
+                    let b: [u8; 4] =
+                        self.seed[i * 4..i * 4 + 4].try_into().unwrap();
                     self.keyout.push_back(u32::from_le_bytes(b));
                 }
             }

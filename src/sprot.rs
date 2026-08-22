@@ -55,8 +55,8 @@ pub struct SprotLink {
     // silicon these flags are latched in the SPI block independent of the CPU;
     // this mirrors that. Cleared by the RoT via STAT write-1-clear (ssa/ssd) or
     // consumed on the first FIFORD read (sot).
-    pub ssa: bool,         // slave-select asserted latch (CS went low/asserted)
-    pub ssd: bool,         // slave-select de-asserted latch (CS went high)
+    pub ssa: bool, // slave-select asserted latch (CS went low/asserted)
+    pub ssd: bool, // slave-select de-asserted latch (CS went high)
     pub sot_pending: bool, // next FIFORD frame carries Start-Of-Transfer
     // SP-side EXTI pending latch for the ROT_IRQ line (PE3 = EXTI line 3). Set by
     // the serve loop when the RoT toggles rot-irq, surfaced on the SP's EXTI
@@ -166,13 +166,15 @@ pub use crate::dbg::sprot as dbg;
 // One-shot RoT instruction-trace window: armed when the first sprot request frame
 // is read, consumed by the gdb serve loop to log the RoT pc for N instructions so
 // the exact path through wait_for_request/handler.handle can be reconstructed.
-static ROT_TRACE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ROT_TRACE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 pub fn arm_rot_trace(n: u32) {
     use std::sync::atomic::Ordering;
     if dbg() {
         eprintln!("[rottr] ARM called n={}", n);
     }
-    let _ = ROT_TRACE.compare_exchange(0, n, Ordering::SeqCst, Ordering::SeqCst);
+    let _ =
+        ROT_TRACE.compare_exchange(0, n, Ordering::SeqCst, Ordering::SeqCst);
 }
 pub fn rot_trace_tick() -> bool {
     use std::sync::atomic::Ordering;
@@ -299,7 +301,11 @@ impl Mmio for SpiMaster {
                     // Phase 2: an empty `miso` mid-reply would clock a zero
                     // into the response and corrupt its CRC; wait for refill.
                     let mut budget = STALL_BUDGET_ITERS;
-                    while lk.rot_irq && lk.cs && lk.miso.is_empty() && budget > 0 {
+                    while lk.rot_irq
+                        && lk.cs
+                        && lk.miso.is_empty()
+                        && budget > 0
+                    {
                         lk = self.link.wait_sp(lk, WAIT_STEP_MS);
                         budget -= 1;
                     }
@@ -307,7 +313,10 @@ impl Mmio for SpiMaster {
                     // !rot_irq: during a reply the SP's dummy clock-outs land
                     // in `mosi` but the RoT is sending, not draining.
                     budget = STALL_BUDGET_ITERS;
-                    while !lk.rot_irq && lk.mosi.len() >= SPROT_FIFO_BYTES && budget > 0 {
+                    while !lk.rot_irq
+                        && lk.mosi.len() >= SPROT_FIFO_BYTES
+                        && budget > 0
+                    {
                         lk = self.link.wait_sp(lk, WAIT_STEP_MS);
                         budget -= 1;
                     }
@@ -328,7 +337,11 @@ impl Mmio for SpiMaster {
                 self.rx.push_back(inb);
                 self.sent = self.sent.wrapping_add(1);
                 if dbg() {
-                    eprintln!("[spi] TXDR <- {:#04x} (sent={})", val & 0xFF, self.sent);
+                    eprintln!(
+                        "[spi] TXDR <- {:#04x} (sent={})",
+                        val & 0xFF,
+                        self.sent
+                    );
                 }
             }
             _ => {}
@@ -346,12 +359,7 @@ pub struct RotSpiSlave {
 }
 impl RotSpiSlave {
     pub fn new(link: Link) -> Self {
-        RotSpiSlave {
-            link,
-            n_ford: 0,
-            n_fwr: 0,
-            n_stat: 0,
-        }
+        RotSpiSlave { link, n_ford: 0, n_fwr: 0, n_stat: 0 }
     }
 }
 impl Mmio for RotSpiSlave {
@@ -363,7 +371,8 @@ impl Mmio for RotSpiSlave {
             0x408 | 0x428 => {
                 // STAT / INTSTAT: SSA(4), SSD(5), read from the link latches
                 let lk = self.link.borrow();
-                let v = (if lk.ssa { 1 << 4 } else { 0 }) | (if lk.ssd { 1 << 5 } else { 0 });
+                let v = (if lk.ssa { 1 << 4 } else { 0 })
+                    | (if lk.ssd { 1 << 5 } else { 0 });
                 self.n_stat += 1;
                 if dbg() && self.n_stat <= 60 {
                     eprintln!(
@@ -381,11 +390,8 @@ impl Mmio for RotSpiSlave {
                 // FIFOSTAT: TXNOTFULL(5) until 8 frames (16 bytes) queued,
                 // RXNOTEMPTY(6) once a full 16-bit frame (>=2 bytes) is available.
                 let lk = self.link.borrow();
-                (if lk.miso.len() < SPROT_FIFO_BYTES {
-                    1 << 5
-                } else {
-                    0
-                }) | (if lk.mosi.len() >= 2 { 1 << 6 } else { 0 })
+                (if lk.miso.len() < SPROT_FIFO_BYTES { 1 << 5 } else { 0 })
+                    | (if lk.mosi.len() >= 2 { 1 << 6 } else { 0 })
             }
             0xE30 => {
                 // FIFORD: 16-bit frame (RXDATA[15:0]) + SOT(20). The SP clocks
@@ -494,11 +500,7 @@ pub struct LpcGpio {
 }
 impl LpcGpio {
     pub fn new(link: Link) -> Self {
-        LpcGpio {
-            link,
-            p0: 0xFFFF_FFFF,
-            sp_reset_asserted: false,
-        }
+        LpcGpio { link, p0: 0xFFFF_FFFF, sp_reset_asserted: false }
     }
     fn refresh(&mut self) {
         let asserted = (self.p0 >> 18) & 1 == 0;
@@ -562,11 +564,7 @@ impl Mmio for LpcGpio {
                 // -> 0, de-asserted -> 1. Without this the RoT never observes CS go
                 // high and loops forever after a transfer.
                 let cs = self.link.borrow().cs;
-                if cs {
-                    0
-                } else {
-                    1 << 1
-                }
+                if cs { 0 } else { 1 << 1 }
             }
             _ => 0,
         }
@@ -634,10 +632,7 @@ pub struct SpExti {
 }
 impl SpExti {
     pub fn new(link: Link) -> Self {
-        SpExti {
-            link,
-            regs: std::collections::HashMap::new(),
-        }
+        SpExti { link, regs: std::collections::HashMap::new() }
     }
 }
 impl Mmio for SpExti {
@@ -653,7 +648,9 @@ impl Mmio for SpExti {
             } else {
                 0
             };
-            return (self.regs.get(&off).copied().unwrap_or(0) & !ROT_IRQ_EXTI_BIT) | p;
+            return (self.regs.get(&off).copied().unwrap_or(0)
+                & !ROT_IRQ_EXTI_BIT)
+                | p;
         }
         *self.regs.get(&off).unwrap_or(&0)
     }
