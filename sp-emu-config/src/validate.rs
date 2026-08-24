@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Check a config without keeping the result.
 //!
 //! [`validate`] runs the whole load path (version detection, migration,
@@ -8,7 +12,7 @@
 use crate::error::ConfigError;
 use crate::ingest::ingest;
 use crate::migrate::migrate;
-use crate::version::{peek_version, SchemaVersion};
+use crate::version::{SchemaVersion, peek_version};
 
 /// Validate config `text`. Returns the detected [`SchemaVersion`] when the config
 /// is well-formed and every value passes ingest; otherwise the error describing
@@ -38,7 +42,9 @@ mod tests {
     #[test]
     fn an_invalid_value_surfaces_as_an_error() {
         match validate("schema_version = 1\n[op]\nboard = \"gymlet\"\n") {
-            Err(ConfigError::Validation { path, .. }) => assert_eq!(path, "op.board"),
+            Err(ConfigError::Validation { path, .. }) => {
+                assert_eq!(path, "op.board")
+            }
             other => panic!("expected a validation error, got {other:?}"),
         }
     }

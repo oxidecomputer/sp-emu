@@ -1,9 +1,10 @@
-//! Host-integration boundary.
-//!
-//! Phase 1 exposes a serial/console sink. Phase 2 (networking, letting a switch
-//! zone talk to the emulated SP) adds a tap method here. Keeping the core behind
-//! this trait lets the emulator run on macOS today and later target
-//! illumos/Helios by swapping only this shim.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Host-integration boundary: the console sink, Ethernet frames to and from
+//! the network bridge, and the host-facing UART. Keeping the core behind this
+//! trait confines host-OS differences (macOS vs illumos/Helios) to this shim.
 
 pub trait HostIo {
     /// Emit one byte from an emulated UART / semihosting console.
@@ -19,14 +20,14 @@ pub trait HostIo {
     /// losing) a frame the ring can't yet accept. The default does nothing.
     fn eth_poll(&mut self) {}
 
-    /// Pop one already-queued Ethernet frame for the SP, if any. Does NOT poll
+    /// Pop one already-queued Ethernet frame for the SP, if any. Does not poll
     /// the host (call `eth_poll` first). The default has none.
     fn eth_rx(&mut self) -> Option<Vec<u8>> {
         None
     }
 
-    /// A byte the emulated SP wrote to the host-facing UART (UART7 / the
-    /// `host_sp_comms` link to the host CPU - IPCC + host console). The default
+    /// A byte the emulated SP wrote to the host-facing UART (UART7, the
+    /// `host_sp_comms` link to the host CPU: IPCC + host console). The default
     /// drops it; the bridge queues it and forwards it in `host_uart_flush`.
     fn host_uart_tx(&mut self, _byte: u8) {}
 

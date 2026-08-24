@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Turn the external schema into the validated [`Config`].
 //!
 //! This is the "validate" half of parse-don't-validate: every value that needs
@@ -33,8 +37,12 @@ pub fn ingest(ext: ConfigFileV1) -> Result<Config, ConfigError> {
     Ok(Config {
         // paths
         flash_path: paths.flash.unwrap_or_else(|| "sp-flash.bin".into()),
-        rot_nvm_path: paths.rot_nvm.unwrap_or_else(|| "sp-rot-flash.bin".into()),
-        identity_path: paths.identity.unwrap_or_else(|| "sp-emu-identity".into()),
+        rot_nvm_path: paths
+            .rot_nvm
+            .unwrap_or_else(|| "sp-rot-flash.bin".into()),
+        identity_path: paths
+            .identity
+            .unwrap_or_else(|| "sp-emu-identity".into()),
         state_dir: paths.state_dir,
         archive: paths.archive,
 
@@ -158,7 +166,11 @@ fn nonempty(o: Option<String>) -> Option<String> {
 
 /// Accept only one of `allowed` (after dropping an empty string); anything else
 /// is a validation error naming the offending value.
-fn one_of(o: Option<String>, path: &str, allowed: &[&str]) -> Result<Option<String>, ConfigError> {
+fn one_of(
+    o: Option<String>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<Option<String>, ConfigError> {
     match nonempty(o) {
         None => Ok(None),
         Some(s) if allowed.contains(&s.as_str()) => Ok(Some(s)),
@@ -186,7 +198,8 @@ fn board(o: Option<String>) -> Result<Board, ConfigError> {
 /// single source of the format, shared with the flat v0 bridge's leniency check.
 pub(crate) fn parse_rotdump(s: &str) -> Option<(u32, u32)> {
     let (a, l) = s.split_once(':')?;
-    let addr = u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+    let addr =
+        u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
     let len: u32 = l.trim().parse().ok()?;
     Some((addr, len))
 }

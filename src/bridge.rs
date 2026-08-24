@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Host network bridge
 //!
 //! The emulated SP's `net` task speaks IPv6/UDP over Ethernet (with NDP for
@@ -28,23 +32,53 @@ const ICMP6_NEIGHBOR_ADVERT: u8 = 136;
 const SP_PORT: u16 = 11111; // control_plane_agent's MGS socket
 const EREPORT_PORT: u16 = 57005; // snitch's ereport socket (SP side)
 const EREPORT_OFFSET: u16 = 11100; // host ereport port = mgmt port + this (33300->44400)
+
+/// Base management port of the a4x2 fleet layout: instance k's bridge binds
+/// `33300 + 10*k`. Per-instance derived values (SWD debug ports, VPD
+/// identity) key off this base.
+pub(crate) const A4X2_BASE_PORT: u16 = 33300;
+
+/// The a4x2 per-instance port offset (0, 10, 20, ...) for a bridge address,
+/// or None when the address is not from the a4x2 layout. Callers fall back
+/// to their instance-0 defaults on None.
+pub(crate) fn a4x2_offset(bridge: &str) -> Option<u16> {
+    let port: u16 = bridge.rsplit(':').next()?.parse().ok()?;
+    port.checked_sub(A4X2_BASE_PORT).filter(|off| off % 10 == 0 && *off < 1000)
+}
 const VLAN_TPID: u16 = 0x8100;
 
-/// The SP's two management VLANs (gimlet app.toml): sidecar1 (vid 0x301) is the
-/// SP's port-1 = switch0 uplink; sidecar2 (vid 0x302) is port-2 = switch1. The
-/// a4x2 port map exposes switch0 at base_port+0 and switch1 at base_port+1, so
-/// each bound socket is tied to the matching VLAN. control_plane_agent listens
-/// on BOTH, so a centralized emulator must answer on both switch views per SP.
-// Trusted management-VLAN defaults, shared with the well-known-port host in
-// main.rs so the two bind paths can't drift. Gimlet uses switch0/switch1; the
-// sidecar swaps switch0 for its local_sidecar VLAN. SP_EMU_VID0/VID1 override.
+/// Trusted management-VLAN ids, shared with the well-known-port host in
+/// main.rs so the two bind paths cannot drift. Each bound socket is one switch
+/// view: base_port+0 = switch0, base_port+1 = switch1 (the a4x2 port map), and
+/// each view is tied to the VLAN the SP's net task serves on that port.
+/// control_plane_agent listens on both views, so the bridge answers on both
+/// per SP. Per-board defaults (see `Bridge::new`): the gimlet's views ride
+/// sidecar1 (0x301) and sidecar2 (0x302); the sidecar's ride local_sidecar
+/// (0x130) and peer_sidecar (0x302). MGS state/inventory require trusted
+/// VLANs (the tech-port VLANs 0x12c/0x12d are untrusted). SP_EMU_VID0/VID1
+/// override either default.
 pub(crate) const VID_SWITCH0: u16 = 0x301;
 pub(crate) const VID_SWITCH1: u16 = 0x302;
 pub(crate) const VID_SIDECAR0: u16 = 0x130;
 
+/// The (switch0, switch1) VLAN ids for this run: the per-board defaults above
+/// with the SP_EMU_VID0/VID1 overrides applied. Single source for both bind
+/// paths (`Bridge::new` and main.rs's well-known-port host).
+pub(crate) fn default_vids(sidecar: bool) -> (u16, u16) {
+    let (def0, def1) = if sidecar {
+        (VID_SIDECAR0, VID_SWITCH1)
+    } else {
+        (VID_SWITCH0, VID_SWITCH1)
+    };
+    (
+        crate::config::get().vid0().unwrap_or(def0),
+        crate::config::get().vid1().unwrap_or(def1),
+    )
+}
+
 /// A bidirectional byte channel to the host CPU over the host-facing UART. A
-/// unix socket (voxel/propolis) and a pty master (faux-ipcc and other serial
-/// tools) both satisfy it.
+/// unix socket (propolis) and a pty master (faux-ipcc and other serial tools)
+/// both satisfy it.
 trait HostUartIo: Read + Write {}
 impl<T: Read + Write> HostUartIo for T {}
 
@@ -79,12 +113,10 @@ fn open_host_pty() -> Option<Box<dyn HostUartIo>> {
         let path = if name_ptr.is_null() {
             String::new()
         } else {
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
+            std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
         };
         libc::close(slave); // the tool opens the slave by path
-                            // Non-blocking master: host_uart_rx polls it.
+        // Non-blocking master: host_uart_rx polls it.
         let fl = libc::fcntl(master, libc::F_GETFL);
         libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
         eprintln!(
@@ -103,7 +135,14 @@ fn open_host_uart() -> Option<Box<dyn HostUartIo>> {
     let p = crate::config::get().host_uart()?;
     match UnixStream::connect(p) {
         Ok(s) => {
-            let _ = s.set_nonblocking(true);
+            // A blocking socket would hang host_uart_rx's poll; treat a failed
+            // set_nonblocking like a failed connect.
+            if let Err(e) = s.set_nonblocking(true) {
+                eprintln!(
+                    "[bridge] host-uart set_nonblocking on {p} failed: {e}"
+                );
+                return None;
+            }
             eprintln!("[bridge] host-uart (UART7/IPCC) connected: {p}");
             Some(Box::new(s))
         }
@@ -141,10 +180,12 @@ pub struct Bridge {
     /// the sensor-poll flood.
     rx: VecDeque<(u16, Vec<u8>)>,
     /// RX-path drop diagnostics (SP_EMU_RXSTATS): frames received from the host
-    /// sockets, evicted by the flow-fair cap, and delivered to the SP.
+    /// sockets, evicted by the flow-fair cap, delivered to the SP, and SP->MGS
+    /// replies the host socket failed to send.
     n_recv: u64,
     n_evict: u64,
     n_pop: u64,
+    n_send_err: u64,
     /// SP round-trip diagnostics (SP_EMU_RTTSTATS): arrival time of the most
     /// recent client request injected toward the SP, and accumulated request->
     /// reply latency through the emulator (excludes faux-mgs/process/kernel time).
@@ -153,11 +194,11 @@ pub struct Bridge {
     rtt_n: u64,
     rtt_sum_us: u128,
     rtt_max_us: u128,
-    /// host-sp-comms (UART7) bytes to/from the host CPU. In voxel this is the
-    /// propolis IPCC COM port, a unix socket (`$SP_EMU_HOST_UART`). Serial-port
-    /// tools like faux-ipcc want a tty instead: `$SP_EMU_HOST_PTY=1` makes
-    /// sp-emu open a pty and print its slave path. Both back-ends are just a
-    /// bidirectional byte channel.
+    /// host-sp-comms (UART7) bytes to/from the host CPU. A propolis IPCC COM
+    /// port is a unix socket (`$SP_EMU_HOST_UART`); serial-port tools like
+    /// faux-ipcc want a tty instead, so `$SP_EMU_HOST_PTY=1` makes sp-emu open
+    /// a pty and print its slave path. Both back-ends are just a bidirectional
+    /// byte channel.
     host_uart: Option<Box<dyn HostUartIo>>,
     /// Bytes the SP has written toward the host UART but the (non-blocking)
     /// socket has not yet accepted. The channel is low-rate but bursty (an IPCC
@@ -177,24 +218,12 @@ impl Bridge {
                 format!("SP_EMU_BRIDGE bind addr {:?} must be host:port", bind),
             )
         })?;
-        // The management VLAN ids differ by board (gimlet app.toml uses 0x301/
-        // 0x302; the sidecar uses 0x12c/0x12d). Env overrides let the bridge
-        // inject MGS traffic on the VLAN the SP's net task listens on; otherwise
-        // the SP drops it (no per-VLAN smoltcp iface for the wrong vid). Defaults
-        // to the gimlet VLANs.
-        // Per-board trusted-VLAN defaults: the sidecar's management VLANs are
-        // local_sidecar (0x130, port 1 -> switch0 view) and peer_sidecar (0x302,
-        // port 2 -> switch1 view); both are `trusted=true`, which MGS state/
-        // inventory require (the tech-port VLANs 0x12c/0x12d are untrusted). The
-        // gimlet uses 0x301/0x302. SP_EMU_VID0/VID1 still override either default.
-        let sidecar = crate::config::get().board().is_sidecar();
-        let (def0, def1) = if sidecar {
-            (VID_SIDECAR0, VID_SWITCH1)
-        } else {
-            (VID_SWITCH0, VID_SWITCH1)
-        };
-        let vid0 = crate::config::get().vid0().unwrap_or(def0);
-        let vid1 = crate::config::get().vid1().unwrap_or(def1);
+        // Per-board trusted-VLAN defaults (`default_vids` above): the bridge
+        // must inject MGS traffic on the VLAN the SP's net task listens on, or
+        // the SP drops it (no per-VLAN smoltcp iface for the wrong vid).
+        // SP_EMU_VID0/VID1 override either default.
+        let (vid0, vid1) =
+            default_vids(crate::config::get().board().is_sidecar());
         let mut socks = Vec::new();
         for (off, vid) in [(0u16, vid0), (1u16, vid1)] {
             let mut a = base;
@@ -205,19 +234,18 @@ impl Bridge {
                 "[bridge] listening on {} (switch{} view, vid {:#x})",
                 a, off, vid
             );
-            socks.push(BoundSock {
-                sock,
-                vid,
-                sp_port: SP_PORT,
-            });
+            socks.push(BoundSock { sock, vid, sp_port: SP_PORT });
             // ereport relay: MGS expects the SP ereport endpoint at mgmt+OFFSET
             // (33300->44400); relay it to the SP snitch socket (57005). Without
             // this MGS ereport polls hit an unbound port and retry-storm.
             let mut ea = base;
-            ea.set_port(base.port().wrapping_add(off).wrapping_add(EREPORT_OFFSET));
-            match UdpSocket::bind(ea) {
+            ea.set_port(
+                base.port().wrapping_add(off).wrapping_add(EREPORT_OFFSET),
+            );
+            match UdpSocket::bind(ea)
+                .and_then(|es| es.set_nonblocking(true).map(|()| es))
+            {
                 Ok(es) => {
-                    let _ = es.set_nonblocking(true);
                     eprintln!(
                         "[bridge] ereport listening on {} (switch{} view, vid {:#x})",
                         ea, off, vid
@@ -229,7 +257,7 @@ impl Bridge {
                     });
                 }
                 Err(e) => eprintln!(
-                    "[bridge] ereport bind {} failed: {} (ereport relay off)",
+                    "[bridge] ereport socket {} failed: {} (ereport relay off)",
                     ea, e
                 ),
             }
@@ -240,10 +268,14 @@ impl Bridge {
         // first owns it, and the offset relay still serves the rest.
         let mut ra = base;
         ra.set_port(EREPORT_PORT);
-        match UdpSocket::bind(ra) {
+        match UdpSocket::bind(ra)
+            .and_then(|rs| rs.set_nonblocking(true).map(|()| rs))
+        {
             Ok(rs) => {
-                let _ = rs.set_nonblocking(true);
-                eprintln!("[bridge] ereport also listening on {} (switch0 view)", ra);
+                eprintln!(
+                    "[bridge] ereport also listening on {} (switch0 view)",
+                    ra
+                );
                 socks.push(BoundSock {
                     sock: rs,
                     vid: vid0,
@@ -251,7 +283,7 @@ impl Bridge {
                 });
             }
             Err(e) => eprintln!(
-                "[bridge] ereport bind {} skipped: {} (another instance owns it)",
+                "[bridge] ereport socket {} skipped: {} (likely another instance owns it)",
                 ra, e
             ),
         }
@@ -263,13 +295,16 @@ impl Bridge {
     }
 
     /// Well-known-port mode (additive; opt-in). Each `(addr, vid)` view binds the
-    /// SP's real socket `ports` on `addr` -- host port == SP socket port, no
-    /// offset arithmetic -- so faux-mgs/humility/sp-test reach the emulated SP at
+    /// SP's real socket `ports` on `addr` (host port == SP socket port, no
+    /// offset arithmetic), so faux-mgs/humility/sp-test reach the emulated SP at
     /// exactly the addresses and ports they would use against real hardware
     /// (`<addr>:11111` for MGS, `:57005` for ereport, ...). Instances never
     /// collide because they live on different addresses, not different ports. The
     /// default `Bridge::new` (port-offset, loopback-multiplexed) is untouched.
-    pub fn new_well_known(views: &[(SocketAddr, u16)], ports: &[u16]) -> std::io::Result<Self> {
+    pub fn new_well_known(
+        views: &[(SocketAddr, u16)],
+        ports: &[u16],
+    ) -> std::io::Result<Self> {
         let mut socks = Vec::new();
         for &(addr, vid) in views {
             for &port in ports {
@@ -280,18 +315,15 @@ impl Bridge {
                 // container has but a bare dev shell may not. Skip-and-warn so a
                 // privileged-port failure never takes down mgmt/ereport; the
                 // warning keeps the capability signal honest.
-                match UdpSocket::bind(a) {
+                match UdpSocket::bind(a)
+                    .and_then(|s| s.set_nonblocking(true).map(|()| s))
+                {
                     Ok(sock) => {
-                        let _ = sock.set_nonblocking(true);
                         eprintln!(
                             "[bridge] listening on {} (vid {:#x}, SP port {})",
                             a, vid, port
                         );
-                        socks.push(BoundSock {
-                            sock,
-                            vid,
-                            sp_port: port,
-                        });
+                        socks.push(BoundSock { sock, vid, sp_port: port });
                     }
                     Err(e) => eprintln!(
                         "[bridge] skip SP port {} on {} (vid {:#x}): {} (socket not bridged)",
@@ -322,6 +354,7 @@ impl Bridge {
             n_recv: 0,
             n_evict: 0,
             n_pop: 0,
+            n_send_err: 0,
             last_req_at: None,
             rtt_n: 0,
             rtt_sum_us: 0,
@@ -345,7 +378,8 @@ impl Bridge {
         }
         let src_mac: [u8; 6] = f[6..12].try_into().unwrap();
         // Strip the 802.1Q tag if present to find the EtherType + IPv6 header.
-        let (vid, eth_off) = if u16::from_be_bytes([f[12], f[13]]) == VLAN_TPID {
+        let (vid, eth_off) = if u16::from_be_bytes([f[12], f[13]]) == VLAN_TPID
+        {
             (u16::from_be_bytes([f[14], f[15]]) & 0xFFF, 18)
         } else {
             (0, 14)
@@ -370,8 +404,8 @@ impl Bridge {
             self.sp_by_vid.insert(vid, (src_mac, src_ip));
             if first {
                 // Readiness marker: the SP's net stack is up and transmitting,
-                // so it is reachable by MGS. A supervisor (voxel-init /
-                // run-fleet.sh) gates bring-up by waiting for this line.
+                // so it is reachable by MGS. Fleet supervisors gate bring-up by
+                // waiting for this exact line; keep its format stable.
                 if self.sp_by_vid.len() == 1 {
                     eprintln!(
                         "[sp-emu] online: SP reachable on the management network (first vid {:#x})",
@@ -379,14 +413,20 @@ impl Bridge {
                     );
                 }
                 if self.dbg() {
-                    eprintln!("[bridge] learned SP vid {:#x} mac {:02x?}", vid, src_mac);
+                    eprintln!(
+                        "[bridge] learned SP vid {:#x} mac {:02x?}",
+                        vid, src_mac
+                    );
                 }
                 // Unsolicited NA pre-warms this VLAN's neighbor cache so the SP's
                 // first reply isn't dropped pending NDP resolution.
                 let na = self.build_neighbor_advert(vid, src_mac, &src_ip);
                 self.push_rx(0, na);
                 if crate::config::get().pingtest() {
-                    eprintln!("[bridge] PINGTEST: echo-request -> SP vid {:#x}", vid);
+                    eprintln!(
+                        "[bridge] PINGTEST: echo-request -> SP vid {:#x}",
+                        vid
+                    );
                     let ping = self.build_echo_request(vid, src_mac, &src_ip);
                     self.push_rx(0, ping);
                 }
@@ -410,7 +450,13 @@ impl Bridge {
         }
     }
 
-    fn handle_icmp6(&mut self, vid: u16, src_ip: &[u8; 16], _dst_ip: &[u8; 16], p: &[u8]) {
+    fn handle_icmp6(
+        &mut self,
+        vid: u16,
+        src_ip: &[u8; 16],
+        _dst_ip: &[u8; 16],
+        p: &[u8],
+    ) {
         if p.len() < 4 {
             return;
         }
@@ -448,21 +494,17 @@ impl Bridge {
         // broadcast/echo chatter from unbridged sockets. In the default mode that
         // is exactly {mgmt 11111, ereport 57005}; in well-known-port mode it is
         // whatever socket set the instance binds.
-        if !self
-            .socks
-            .iter()
-            .any(|s| s.vid == vid && s.sp_port == src_port)
-        {
+        if !self.socks.iter().any(|s| s.vid == vid && s.sp_port == src_port) {
             return;
         }
         // Route the reply to the specific MGS client that sent the request: the
         // SP echoes that client's ephemeral port as the UDP destination port
         // (poll_host injects requests with the real client port as the UDP
-        // source). Real MGS opens many concurrent sockets, so routing to a
-        // single last-seen peer per VLAN starves all but the busiest client
-        // (symptom: discover/state intermittently "no SP discovered" while a
-        // sensor-polling socket hogs the replies). The MGS IP comes from the
-        // learned peer (all clients share the in-zone loopback) + this port.
+        // source). Real MGS opens many concurrent sockets, and a low-rate flow
+        // (discover/state) must keep receiving its replies while a sensor-poll
+        // flood runs; routing to a single last-seen peer per VLAN would starve
+        // all but the busiest client. The MGS IP comes from the learned peer
+        // (all clients share the in-zone loopback) + this port.
         let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let peer_ip = match self.peer_by_vid.get(&(vid, src_port)) {
             Some(p) => p.ip(),
@@ -471,7 +513,8 @@ impl Bridge {
         let peer = std::net::SocketAddr::new(peer_ip, dst_port);
         let payload = &udp[8..];
         if self.dbg() {
-            let hex: String = payload.iter().map(|b| format!("{:02x}", b)).collect();
+            let hex: String =
+                payload.iter().map(|b| format!("{:02x}", b)).collect();
             eprintln!(
                 "[bridge] SP->MGS vid {:#x} {} bytes -> {} payload={}",
                 vid,
@@ -480,12 +523,11 @@ impl Bridge {
                 hex
             );
         }
-        if let Some(bs) = self
-            .socks
-            .iter()
-            .find(|s| s.vid == vid && s.sp_port == src_port)
+        if let Some(bs) =
+            self.socks.iter().find(|s| s.vid == vid && s.sp_port == src_port)
+            && bs.sock.send_to(payload, peer).is_err()
         {
-            let _ = bs.sock.send_to(payload, peer);
+            self.n_send_err += 1;
         }
         // Round-trip latency through the emulator: request-injected -> reply-sent.
         if let Some(t) = self.last_req_at.take() {
@@ -515,19 +557,28 @@ impl Bridge {
         for bs in &self.socks {
             loop {
                 match bs.sock.recv_from(&mut buf) {
-                    Ok((n, src)) => got.push((bs.vid, bs.sp_port, src, buf[..n].to_vec())),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Ok((n, src)) => {
+                        got.push((bs.vid, bs.sp_port, src, buf[..n].to_vec()))
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        break;
+                    }
                     Err(_) => break,
                 }
             }
         }
         self.n_recv += got.len() as u64;
-        if crate::config::get().rxstats() && self.n_recv % 500 < got.len() as u64 {
+        if crate::config::get().rxstats()
+            && self.n_recv % 500 < got.len() as u64
+        {
             eprintln!(
-                "[rxstats] recv={} evict={} pop={} qdepth={}",
+                "[rxstats] recv={} evict={} pop={} send_err={} qdepth={}",
                 self.n_recv,
                 self.n_evict,
                 self.n_pop,
+                self.n_send_err,
                 self.rx.len()
             );
         }
@@ -537,13 +588,17 @@ impl Bridge {
                 Some(t) => *t,
                 None => {
                     if self.dbg() {
-                        eprintln!("[bridge] drop MGS pkt (vid {:#x}): SP not yet learned", vid);
+                        eprintln!(
+                            "[bridge] drop MGS pkt (vid {:#x}): SP not yet learned",
+                            vid
+                        );
                     }
                     continue;
                 }
             };
             if self.dbg() {
-                let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+                let hex: String =
+                    data.iter().map(|b| format!("{:02x}", b)).collect();
                 eprintln!(
                     "[bridge] MGS->SP {} bytes from {} (vid {:#x}) payload={}",
                     data.len(),
@@ -554,7 +609,8 @@ impl Bridge {
             }
             // Inject with the MGS client's real ephemeral source port
             // (src.port()) so the SP echoes it back as the reply's dest port.
-            let frame = self.build_udp6(vid, sp_mac, sp_ip, sp_port, src.port(), &data);
+            let frame =
+                self.build_udp6(vid, sp_mac, sp_ip, sp_port, src.port(), &data);
             self.push_rx(src.port(), frame);
         }
     }
@@ -585,7 +641,9 @@ impl Bridge {
                 .filter(|(f, _)| **f != 0)
                 .max_by_key(|(_, c)| **c)
                 .map(|(f, _)| *f);
-            match victim.and_then(|vf| self.rx.iter().position(|(f, _)| *f == vf)) {
+            match victim
+                .and_then(|vf| self.rx.iter().position(|(f, _)| *f == vf))
+            {
                 Some(pos) => {
                     self.rx.remove(pos);
                 }
@@ -621,7 +679,12 @@ impl Bridge {
         self.build_ipv6_from(vid, dst_mac, dst_ip, IPPROTO_UDP, 64, &udp)
     }
 
-    fn build_neighbor_advert(&self, vid: u16, dst_mac: [u8; 6], dst_ip: &[u8; 16]) -> Vec<u8> {
+    fn build_neighbor_advert(
+        &self,
+        vid: u16,
+        dst_mac: [u8; 6],
+        dst_ip: &[u8; 16],
+    ) -> Vec<u8> {
         // ICMPv6 NA: flags S|O set, target = my_ip, option = target LL addr.
         let mut icmp = vec![ICMP6_NEIGHBOR_ADVERT, 0, 0, 0, 0x60, 0, 0, 0];
         icmp.extend_from_slice(&self.my_ip);
@@ -632,7 +695,12 @@ impl Bridge {
         self.build_ipv6_from(vid, dst_mac, *dst_ip, IPPROTO_ICMPV6, 255, &icmp)
     }
 
-    fn build_echo_request(&self, vid: u16, dst_mac: [u8; 6], dst_ip: &[u8; 16]) -> Vec<u8> {
+    fn build_echo_request(
+        &self,
+        vid: u16,
+        dst_mac: [u8; 6],
+        dst_ip: &[u8; 16],
+    ) -> Vec<u8> {
         // ICMPv6 Echo Request (type 128): id=1, seq=1, 4 bytes of data.
         let mut icmp = vec![
             ICMP6_ECHO_REQUEST,
@@ -663,7 +731,7 @@ impl Bridge {
         let mut icmp = req.to_vec();
         icmp[0] = ICMP6_ECHO_REPLY;
         icmp[2] = 0;
-        icmp[3] = 0; // clear checksum
+        icmp[3] = 0; // checksum is computed over a zeroed checksum field
         let ck = checksum6(&self.my_ip, dst_ip, IPPROTO_ICMPV6, &icmp);
         icmp[2..4].copy_from_slice(&ck.to_be_bytes());
         self.build_ipv6_from(vid, dst_mac, *dst_ip, IPPROTO_ICMPV6, 64, &icmp)
@@ -736,7 +804,9 @@ impl HostIo for Bridge {
                     wrote += 1;
                 }
                 Ok(_) => break, // 0 bytes written: try again next flush
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
                 Err(_) => {
                     // Broken pipe / disconnect: drop the backlog, nothing to do.
                     self.host_uart_txq.clear();
@@ -783,7 +853,9 @@ impl HostIo for Bridge {
 
 fn fmt_ip6(ip: &[u8; 16]) -> String {
     (0..8)
-        .map(|i| format!("{:x}", u16::from_be_bytes([ip[2 * i], ip[2 * i + 1]])))
+        .map(|i| {
+            format!("{:x}", u16::from_be_bytes([ip[2 * i], ip[2 * i + 1]]))
+        })
         .collect::<Vec<_>>()
         .join(":")
 }
@@ -811,9 +883,5 @@ fn checksum6(src: &[u8; 16], dst: &[u8; 16], next: u8, data: &[u8]) -> u16 {
     }
     let ck = !(sum as u16);
     // UDP sends a zero checksum as 0xFFFF (0 = "no checksum"); ICMPv6 keeps zero.
-    if ck == 0 && next == IPPROTO_UDP {
-        0xFFFF
-    } else {
-        ck
-    }
+    if ck == 0 && next == IPPROTO_UDP { 0xFFFF } else { ck }
 }

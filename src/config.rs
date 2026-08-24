@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Central configuration: ingest every `SP_EMU_*` input (the environment, or a
 //! config file) exactly once, resolve it into a validated [`Config`], and store
 //! it. After `init`, no other module reads the environment; they call
@@ -12,7 +16,7 @@
 //! `SP_EMU_NAME = "value"` dump the bundle format still consumes.
 //!
 //! Sources and precedence: flag > (config file | environment) > default. The
-//! environment and a config file are two *alternative* sources, never stacked:
+//! environment and a config file are two alternative sources, never stacked:
 //! `--load-config <path>` reads all `SP_EMU_*` settings from a flat
 //! `SP_EMU_NAME = "value"` TOML table and ignores the environment, so a saved
 //! configuration reproduces exactly; without it, the environment is read as usual.
@@ -22,10 +26,10 @@
 //!
 //! Backward compatibility: every `SP_EMU_*` variable keeps its name, default, and
 //! leniency. The env/file path stays lenient (a typo or malformed value coerces to
-//! a default, as before); the strict validation the crate applies is reserved for
+//! a default); the strict validation the crate applies is reserved for
 //! the typed config file.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::sync::OnceLock;
 
 pub use sp_emu_config::Config;
@@ -61,8 +65,8 @@ fn resolve(
     if let Some(seed) = seed_override {
         external.op.seed = Some(seed); // --seed beats $SP_EMU_SEED
     }
-    let config =
-        sp_emu_config::ingest(external).map_err(|e| anyhow!("invalid configuration: {e}"))?;
+    let config = sp_emu_config::ingest(external)
+        .map_err(|e| anyhow!("invalid configuration: {e}"))?;
     Ok(Resolved { config, inputs })
 }
 
@@ -72,10 +76,8 @@ fn is_set_in(inputs: &[(&'static str, String)], name: &str) -> bool {
 }
 
 /// Escape a value for a TOML basic string (`"..."`).
-fn escape_toml(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
+pub(crate) fn escape_toml(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// Serialize the explicitly-set variables as a round-trippable flat TOML file, keyed
@@ -103,7 +105,9 @@ fn flat_toml(inputs: &[(&'static str, String)]) -> String {
 fn render(r: &Resolved) -> String {
     let mut out = sp_emu_config::dump(&r.config)
         .unwrap_or_else(|e| format!("# <effective-config dump failed: {e}>\n"));
-    out.push_str("\n# explicitly set via SP_EMU_* (environment or config file):\n");
+    out.push_str(
+        "\n# explicitly set via SP_EMU_* (environment or config file):\n",
+    );
     for (name, val) in &r.inputs {
         out.push_str(&format!("#   {name} = {val:?}\n"));
     }
@@ -111,9 +115,11 @@ fn render(r: &Resolved) -> String {
 }
 
 /// Parse a flat config file into `(SP_EMU_NAME, value)` pairs, coercing scalar
-/// values to the string the resolver expects (a boolean `false` means "unset" -- a
-/// flag left off). A malformed file is a parse error the caller reports.
-fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, toml::de::Error> {
+/// values to the string the resolver expects (a boolean `false` means "unset",
+/// a flag left off). A malformed file is a parse error the caller reports.
+fn parse_config_toml(
+    text: &str,
+) -> std::result::Result<Vec<(String, String)>, toml::de::Error> {
     let table: toml::Table = text.parse()?;
     let mut out = Vec::new();
     for (k, v) in table {
@@ -123,7 +129,7 @@ fn parse_config_toml(text: &str) -> std::result::Result<Vec<(String, String)>, t
             toml::Value::Float(f) => f.to_string(),
             toml::Value::Boolean(true) => "1".to_string(),
             toml::Value::Boolean(false) => continue, // presence flag left off
-            _ => continue,                           // arrays/tables/datetimes: not a knob
+            _ => continue, // arrays/tables/datetimes: not a knob
         };
         out.push((k, s));
     }
@@ -135,8 +141,8 @@ static CONFIG: OnceLock<Resolved> = OnceLock::new();
 /// Resolve and store the process configuration. Call once, early in `main`, before
 /// any subsystem is built.
 ///
-/// sp-emu takes its `SP_EMU_*` settings from the environment -- or, with the
-/// `--load-config <path>` flag, from a TOML config file *instead of* the environment,
+/// sp-emu takes its `SP_EMU_*` settings from the environment, or, with the
+/// `--load-config <path>` flag, from a TOML config file instead of the environment,
 /// so a saved configuration reproduces exactly regardless of the shell. The two
 /// sources are never mixed; command-line flags always win. Precedence is
 /// flag > (config file | environment) > default. `--dump-config <path>` writes the
@@ -172,16 +178,27 @@ pub fn init(
                     );
                 }
             }
-            let file = parse_config_toml(&text).unwrap_or_else(|e| {
-                eprintln!("[config] ignoring malformed {path}: {e}");
-                Vec::new()
-            });
+            // Malformed TOML is an error for the same reason an unreadable
+            // path is: the flag exists to reproduce a run, so failing open
+            // to an all-defaults instance defeats it.
+            let file = parse_config_toml(&text)
+                .map_err(|e| anyhow!("malformed --load-config {path}: {e}"))?;
+            // Unknown keys stay non-fatal (forward compatibility with a file
+            // carrying a knob this build dropped) but are named, so a typo'd
+            // knob does not silently resolve to its default.
+            for (k, _) in &file {
+                if !sp_emu_config::ENV_NAMES.contains(&k.as_str()) {
+                    eprintln!("[config] {path}: unrecognized key {k} ignored");
+                }
+            }
             eprintln!(
                 "[config] loaded {} ({} vars); ignoring the SP_EMU_* environment",
                 path,
                 file.len()
             );
-            let get = |k: &str| file.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            let get = |k: &str| {
+                file.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+            };
             resolve(&get, seed_override)?
         }
         None => resolve(&|k| std::env::var(k).ok(), seed_override)?,
@@ -189,7 +206,11 @@ pub fn init(
 
     if let Some(path) = &dump_config {
         match std::fs::write(path, flat_toml(&resolved.inputs)) {
-            Ok(()) => eprintln!("[config] wrote {} ({} set)", path, resolved.inputs.len()),
+            Ok(()) => eprintln!(
+                "[config] wrote {} ({} set)",
+                path,
+                resolved.inputs.len()
+            ),
             Err(e) => eprintln!("[config] writing {path} failed: {e}"),
         }
     }
@@ -198,17 +219,21 @@ pub fn init(
     }
     // Loud, not silent: if this fails, `get()` already resolved a config (without
     // the seed override) before `init` ran, so the process would run mis-seeded.
-    CONFIG
-        .set(resolved)
-        .map_err(|_| anyhow!("config::init called after config was already resolved by get()"))?;
+    CONFIG.set(resolved).map_err(|_| {
+        anyhow!(
+            "config::init called after config was already resolved by get()"
+        )
+    })?;
     Ok(())
 }
 
 /// The resolved config plus presence map. Lazily defaults from a clean environment
 /// if `init` was never called (unit tests / non-CLI paths), so accessors never panic.
 fn resolved() -> &'static Resolved {
-    CONFIG
-        .get_or_init(|| resolve(&|k| std::env::var(k).ok(), None).expect("default config resolves"))
+    CONFIG.get_or_init(|| {
+        resolve(&|k| std::env::var(k).ok(), None)
+            .expect("default config resolves")
+    })
 }
 
 /// The process configuration.
@@ -255,7 +280,8 @@ pub fn state_dir() -> String {
 /// hubris checkout. `$SP_EMU_ROT_BOOTLEBY` names one explicitly;
 /// `$SP_EMU_ROT_NO_BOOTLEBY` opts out.
 pub fn rot_bootleby_path() -> &'static Option<String> {
-    static RESOLVED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static RESOLVED: std::sync::OnceLock<Option<String>> =
+        std::sync::OnceLock::new();
     RESOLVED.get_or_init(resolve_rot_bootleby)
 }
 
@@ -284,9 +310,8 @@ fn resolve_rot_bootleby() -> Option<String> {
     if let Ok(h) = std::env::var("HUBRIS") {
         candidates.push(format!("{h}/app/oxide-rot-1/{NAME}"));
     }
-    let found = candidates
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists());
+    let found =
+        candidates.into_iter().find(|p| std::path::Path::new(p).exists());
     if found.is_none() {
         eprintln!(
             "[rot] no {NAME} found next to the RoT archive or under $HUBRIS; \
@@ -307,8 +332,6 @@ pub fn is_set(name: &str) -> bool {
     is_set_in(&resolved().inputs, name)
 }
 
-/// Resolve an instance file path: the explicit knob value when it was set (or already
-/// absolute), otherwise `value` under the instance state directory (`state_dir`).
 /// Debug: SP-core pc-window instruction trace ranges, from
 /// `SP_EMU_PCWIN=lo-hi[,lo-hi...]` (hex, 0x prefix optional). An emulator
 /// bring-up tracing aid, not instance configuration, so it bypasses the
@@ -328,6 +351,8 @@ pub fn pcwin() -> Option<Vec<(u32, u32)>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Resolve an instance file path: the explicit knob value when it was set (or already
+/// absolute), otherwise `value` under the instance state directory (`state_dir`).
 pub fn instance_file(env_name: &str, value: &str) -> String {
     if is_set(env_name) || std::path::Path::new(value).is_absolute() {
         value.to_string()
@@ -343,7 +368,10 @@ mod tests {
 
     /// Resolve from an in-memory map instead of the process environment, so tests
     /// are hermetic regardless of the developer's / CI's ambient `SP_EMU_*`.
-    fn resolve_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Resolved {
+    fn resolve_map(
+        vars: &[(&str, &str)],
+        seed_override: Option<String>,
+    ) -> Resolved {
         resolve(
             &|k| {
                 vars.iter()
@@ -356,7 +384,10 @@ mod tests {
     }
 
     /// The validated config for a set of `SP_EMU_*` values.
-    fn from_map(vars: &[(&str, &str)], seed_override: Option<String>) -> Config {
+    fn from_map(
+        vars: &[(&str, &str)],
+        seed_override: Option<String>,
+    ) -> Config {
         resolve_map(vars, seed_override).config
     }
 
@@ -394,7 +425,8 @@ mod tests {
     #[test]
     fn seed_override_wins() {
         // --seed beats $SP_EMU_SEED.
-        let c = from_map(&[("SP_EMU_SEED", "from-env")], Some("from-cli".into()));
+        let c =
+            from_map(&[("SP_EMU_SEED", "from-env")], Some("from-cli".into()));
         assert_eq!(c.seed(), Some("from-cli"));
         // absent flag falls back to the environment.
         let c = from_map(&[("SP_EMU_SEED", "from-env")], None);
@@ -423,7 +455,10 @@ mod tests {
         assert_eq!(c.run_max(), Some(0));
 
         // Empty strings are treated as unset; a non-numeric budget is ignored.
-        let c = from_map(&[("SP_EMU_MODE", ""), ("SP_EMU_RUN_MAX", "forever")], None);
+        let c = from_map(
+            &[("SP_EMU_MODE", ""), ("SP_EMU_RUN_MAX", "forever")],
+            None,
+        );
         assert_eq!(c.mode(), None);
         assert_eq!(c.run_max(), None);
     }
@@ -460,7 +495,7 @@ mod tests {
             from_map(&[("SP_EMU_BOARD", "sidecar")], None).board(),
             Board::Sidecar
         );
-        // a board typo is lenient: it falls back to gimlet, as on master.
+        // a board typo is lenient: it falls back to gimlet.
         assert_eq!(
             from_map(&[("SP_EMU_BOARD", "typo")], None).board(),
             Board::Gimlet
@@ -483,10 +518,8 @@ mod tests {
         );
         let toml = flat_toml(&orig.inputs);
         let loaded = parse_config_toml(&toml).expect("our own output parses");
-        let pairs: Vec<(&str, &str)> = loaded
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let pairs: Vec<(&str, &str)> =
+            loaded.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let round = from_map(&pairs, None);
         assert_eq!(round.board(), Board::Sidecar);
         assert_eq!(round.eth_quantum(), 256);
@@ -506,21 +539,21 @@ mod tests {
              SP_EMU_FLASHDBG = true\nSP_EMU_ETHDBG = false\n",
         )
         .unwrap();
-        let pairs: Vec<(&str, &str)> = m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let pairs: Vec<(&str, &str)> =
+            m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let c = from_map(&pairs, None);
         assert_eq!(c.eth_quantum(), 256);
         assert_eq!(c.ambient_c(), 42.5);
         assert!(c.flashdbg()); // true -> on
         assert!(!c.ethdbg()); // false -> absent -> off
-                              // a malformed file is rejected (callers fall back to no file layer)
+        // a malformed file is rejected (callers fall back to no file layer)
         assert!(parse_config_toml("this is not = = toml").is_err());
     }
 
-    /// Backward-compatibility contract: every `SP_EMU_*` variable that configured
-    /// sp-emu on the `master` branch must remain resolvable, with the same name. This
-    /// is the exact set read on master (see git history); removing one silently would
-    /// break existing environments. If a removal is ever intentional, delete it here
-    /// too and call it out in the commit -- never let this list quietly shrink.
+    /// Backward-compatibility contract: every `SP_EMU_*` variable in this list must
+    /// remain resolvable, with the same name; removing one silently would break
+    /// existing environments. If a removal is ever intentional, delete it here too
+    /// and call it out in the commit; never let this list quietly shrink.
     #[test]
     fn supports_all_master_env_vars() {
         const MASTER_VARS: &[&str] = &[
@@ -584,7 +617,7 @@ mod tests {
     }
 
     /// Guard: `config.rs` is the sole reader of the environment. No other module
-    /// may call `env::var` -- everything routes through this adapter.
+    /// may call `env::var`; everything routes through this adapter.
     #[test]
     fn env_reads_confined_to_config_module() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -596,7 +629,8 @@ mod tests {
             if path.file_name().and_then(|n| n.to_str()) == Some("config.rs") {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).expect("read source file");
+            let text =
+                std::fs::read_to_string(&path).expect("read source file");
             assert!(
                 !text.contains("env::var"),
                 "{} reads the environment directly; route it through config.rs",

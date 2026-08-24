@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! LPC55S69 HASHCRYPT SHA-256 engine.
 //!
 //! Real bootleby folds a measurement of the selected image into the DICE CDI with
@@ -128,11 +132,15 @@ impl Mmio for HashCrypt {
 
     fn write(&mut self, off: u32, val: u32) {
         match off {
-            // Start a fresh SHA2-256 hash: MODE=SHA2-256 AND NEW_HASH asserted
+            // Start a fresh SHA2-256 hash: MODE=SHA2-256 and NEW_HASH asserted
             // together (as bootleby writes). A MODE write without NEW_HASH selects
-            // the algorithm without resetting -- we don't model that (the mode is
+            // the algorithm without resetting; that path is not modeled (the mode is
             // implicitly SHA-256), so such writes are ignored rather than restarting.
-            REG_CTRL if val & MODE_MASK == MODE_SHA2_256 && val & NEW_HASH != 0 => self.start(),
+            REG_CTRL
+                if val & MODE_MASK == MODE_SHA2_256 && val & NEW_HASH != 0 =>
+            {
+                self.start()
+            }
             REG_INDATA => self.feed(val),
             _ => {}
         }
@@ -164,11 +172,13 @@ mod tests {
         h.write(REG_INDATA, u32::swap_bytes(bits as u32));
         assert_eq!(h.read(REG_STATUS) & ST_DIGEST, ST_DIGEST, "digest ready");
         (0..8)
-            .flat_map(|i| h.read(REG_DIGEST0 + i * 4).swap_bytes().to_be_bytes())
+            .flat_map(|i| {
+                h.read(REG_DIGEST0 + i * 4).swap_bytes().to_be_bytes()
+            })
             .collect()
     }
 
-    /// Reference SHA-256 over the words' little-endian encodings -- the byte order
+    /// Reference SHA-256 over the words' little-endian encodings, the byte order
     /// the engine consumes INDATA in.
     fn reference_digest(msg: &[u32]) -> Vec<u8> {
         let mut r = Sha256::new();
@@ -189,8 +199,9 @@ mod tests {
     /// `fill == 16` compress/reset and the cross-block state carry.
     #[test]
     fn matches_reference_sha256_multi_block() {
-        let msg: [u32; 20] =
-            core::array::from_fn(|i| (i as u32).wrapping_mul(0x0101_0101) ^ 0xdead_beef);
+        let msg: [u32; 20] = core::array::from_fn(|i| {
+            (i as u32).wrapping_mul(0x0101_0101) ^ 0xdead_beef
+        });
         assert_eq!(engine_digest(&msg), reference_digest(&msg));
     }
 
@@ -216,7 +227,9 @@ mod tests {
         h.write(REG_INDATA, u32::swap_bytes((bits >> 32) as u32));
         h.write(REG_INDATA, u32::swap_bytes(bits as u32));
         let got: Vec<u8> = (0..8)
-            .flat_map(|i| h.read(REG_DIGEST0 + i * 4).swap_bytes().to_be_bytes())
+            .flat_map(|i| {
+                h.read(REG_DIGEST0 + i * 4).swap_bytes().to_be_bytes()
+            })
             .collect();
         assert_eq!(got, reference_digest(&msg));
     }

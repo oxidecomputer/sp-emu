@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Embed the sp-emu git revision so `--version` can report it,
 //! The hash carries a `-dirty` marker when the working tree has
 //! uncommitted changes.
@@ -16,10 +20,11 @@ fn main() {
     let head = dot_git.join("HEAD");
     if head.exists() {
         println!("cargo:rerun-if-changed={}", head.display());
-        if let Ok(c) = std::fs::read_to_string(&head) {
-            if let Some(r) = c.strip_prefix("ref: ").and_then(|s| s.lines().next()) {
-                println!("cargo:rerun-if-changed={}", dot_git.join(r).display());
-            }
+        if let Ok(c) = std::fs::read_to_string(&head)
+            && let Some(r) =
+                c.strip_prefix("ref: ").and_then(|s| s.lines().next())
+        {
+            println!("cargo:rerun-if-changed={}", dot_git.join(r).display());
         }
     }
     let packed = dot_git.join("packed-refs");
@@ -44,9 +49,5 @@ fn git_hash(root: &PathBuf) -> String {
     let dirty = run(&["status", "--porcelain"])
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    if dirty {
-        format!("{hash}-dirty")
-    } else {
-        hash
-    }
+    if dirty { format!("{hash}-dirty") } else { hash }
 }

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Serialize configs back to the typed TOML schema.
 //!
 //! [`to_toml`] emits an external form as written, so a still-`None` field is
@@ -29,7 +33,8 @@ pub fn dump(config: &Config) -> Result<String, ConfigError> {
 /// as commented example lines, so every configurable item is discoverable. Active
 /// values are read from the default `Config`, so they cannot drift from `ingest`.
 pub fn template() -> String {
-    let d = ingest(ConfigFileV1::default()).expect("the empty config is always valid");
+    let d = ingest(ConfigFileV1::default())
+        .expect("the empty config is always valid");
     let mut out = String::new();
     // Append one formatted line. An active knob is `key = value`; an optional one
     // is a commented `# key = value` example with a trailing hint. Sequential
@@ -39,14 +44,20 @@ pub fn template() -> String {
     }
 
     line!("# sp-emu configuration, schema v{CURRENT}.");
-    line!("# Active lines are the defaults; commented lines are optional knobs with");
-    line!("# example values. (Loaded today as the flat SP_EMU_* form; see `sp-emu config`.)");
+    line!(
+        "# Active lines are the defaults; commented lines are optional knobs with"
+    );
+    line!(
+        "# example values. (Loaded today as the flat SP_EMU_* form; see `sp-emu config`.)"
+    );
     line!("schema_version = {CURRENT}");
 
     line!("\n# What this instance is and how it runs.");
     line!("[op]");
     line!("# mode = \"run\"          # run | gdb; unset prints usage");
-    line!("# slot = \"a\"            # a | b; unset uses the persisted swap bank");
+    line!(
+        "# slot = \"a\"            # a | b; unset uses the persisted swap bank"
+    );
     line!("# run_max = 0            # instruction budget; 0 serves forever");
     line!("board = {:?}", board_str(d.board()));
     line!("# seed = \"0xC0FFEE\"     # per-instance identity seed");
@@ -57,12 +68,16 @@ pub fn template() -> String {
     line!("flash = {:?}", d.flash_path());
     line!("rot_nvm = {:?}", d.rot_nvm_path());
     line!("identity = {:?}", d.identity_path());
-    line!("# state_dir = \"/path/to/state\"   # default: $XDG_STATE_HOME/sp-emu");
+    line!(
+        "# state_dir = \"/path/to/state\"   # default: $XDG_STATE_HOME/sp-emu"
+    );
     line!("# archive = \"gimlet.zip\"         # the SP Hubris archive");
 
     line!("\n# Host bridge and Ethernet.");
     line!("[net]");
-    line!("# bridge = \"1\"          # MGS bind address, or \"1\" for the default");
+    line!(
+        "# bridge = \"1\"          # MGS bind address, or \"1\" for the default"
+    );
     line!("well_known_ports = {}", d.well_known_ports());
     line!("# addr0 = \"::1\"");
     line!("# addr1 = \"::1\"");
@@ -74,13 +89,19 @@ pub fn template() -> String {
 
     line!("\n# Host UART / IPCC.");
     line!("[host]");
-    line!("# uart = \"/path/to/socket\"       # connect the host UART to a unix socket");
+    line!(
+        "# uart = \"/path/to/socket\"       # connect the host UART to a unix socket"
+    );
     line!("pty = {}", d.host_pty());
 
     line!("\n# Companion I2C bridge.");
     line!("[i2c]");
-    line!("# bridge = \"127.0.0.1:9100\"      # SNIFF: tee transactions to this address");
-    line!("# device = \"127.0.0.1:9100\"      # DELEGATE: serve reads from this device");
+    line!(
+        "# bridge = \"127.0.0.1:9100\"      # SNIFF: tee transactions to this address"
+    );
+    line!(
+        "# device = \"127.0.0.1:9100\"      # DELEGATE: serve reads from this device"
+    );
 
     line!("\n# Root of Trust.");
     line!("[rot]");
@@ -94,9 +115,13 @@ pub fn template() -> String {
     line!("# cmpa = \"cmpa.bin\"");
     line!("# cfpa = \"cfpa.bin\"");
     line!("# nmpa = \"nmpa.bin\"");
-    line!("# image_b = \"rot-b.bin\"          # slot-B image, for A/B selection");
+    line!(
+        "# image_b = \"rot-b.bin\"          # slot-B image, for A/B selection"
+    );
     line!("erase_a = {}", d.rot_erase_a());
-    line!("# boot_pref = \"a\"       # a | b; the synthesized CFPA boot preference");
+    line!(
+        "# boot_pref = \"a\"       # a | b; the synthesized CFPA boot preference"
+    );
     line!("# dice = \"dice-dir\"              # DICE handoff blob directory");
     line!("# preboot = 400000000            # RoT preboot instruction budget");
 
@@ -115,7 +140,9 @@ pub fn template() -> String {
 
     line!("\n# Sensor model.");
     line!("[sensors]");
-    line!("# overrides = \"0x48=30.0,0x49=31.5\"   # per-address temperature overrides");
+    line!(
+        "# overrides = \"0x48=30.0,0x49=31.5\"   # per-address temperature overrides"
+    );
     line!("ambient_c = {}", d.ambient_c());
 
     line!("\n# Hydrate RAM-dump trigger.");
@@ -133,7 +160,9 @@ pub fn template() -> String {
     line!("# rotpc = 0");
     line!("# rotdump = \"0x20000000:256\"      # RoT RAM window, 0xADDR:LEN");
     line!("# watch = 0");
-    line!("# diff = \"diff.log\"               # differential-trace output file");
+    line!(
+        "# diff = \"diff.log\"               # differential-trace output file"
+    );
     line!("pcprof = {}", d.pcprof());
 
     line!("\n# Periodic counters.");
@@ -204,10 +233,7 @@ fn config_to_external(c: &Config) -> ConfigFileV1 {
             eth_txbreak: Some(c.eth_txbreak),
             idle_ms: Some(c.idle_ms),
         },
-        host: v1::Host {
-            uart: c.host_uart.clone(),
-            pty: Some(c.host_pty),
-        },
+        host: v1::Host { uart: c.host_uart.clone(), pty: Some(c.host_pty) },
         i2c: v1::I2c {
             bridge: c.i2c_bridge.clone(),
             device: c.i2c_device.clone(),
@@ -352,7 +378,7 @@ mod tests {
         // Optional knobs are surfaced as commented example lines, not omitted.
         assert!(text.contains("# mode = "));
         assert!(text.contains("# rot_from = "));
-        // Comments and all, it still migrates + ingests to the defaults.
+        // The template, comments included, migrates and ingests to the defaults.
         let cfg = crate::migrate::migrate(&text).and_then(ingest).unwrap();
         assert_eq!(cfg.flash_path(), "sp-flash.bin");
         assert_eq!(cfg.eth_quantum(), 4096);
@@ -371,8 +397,11 @@ mod tests {
                 let body = l.strip_prefix("# ").unwrap_or(l);
                 body.split_once(" = ").is_some_and(|(k, _)| {
                     !k.is_empty()
-                        && k.bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                        && k.bytes().all(|b| {
+                            b.is_ascii_lowercase()
+                                || b.is_ascii_digit()
+                                || b == b'_'
+                        })
                 })
             })
             .count();

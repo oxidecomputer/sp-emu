@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! `sp-emu-config`: the versioned, validated configuration format for sp-emu
 //! instances.
 //!
@@ -39,9 +43,9 @@ pub use config::{Board, Config};
 pub use dump::{dump, template, to_toml};
 pub use error::ConfigError;
 pub use ingest::ingest;
-pub use legacy::{flat_pairs_to_v1, flat_to_v1, ENV_NAMES};
+pub use legacy::{ENV_NAMES, flat_pairs_to_v1, flat_to_v1};
 pub use load::{load, load_str};
 pub use migrate::migrate;
-pub use schema::{v1::ConfigFileV1, SchemaCurrent};
+pub use schema::{SchemaCurrent, v1::ConfigFileV1};
 pub use validate::validate;
-pub use version::{peek_version, SchemaVersion, CURRENT};
+pub use version::{CURRENT, SchemaVersion, peek_version};

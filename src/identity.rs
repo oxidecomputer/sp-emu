@@ -1,11 +1,15 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Per-instance device identity for an sp-emu instance.
 //!
-//! Every identity-bearing value the emulated SP and RoT expose used to be a fixed
-//! constant baked into the binary: the STM32H753 96-bit UID (`soc.rs`), the LPC55
-//! DICE CDI (`lpc55.rs`), and the PUF seed / UDS (`puf.rs`). So every sp-emu
-//! instance produced the *same* self-signed DICE certificate and the same UID --
-//! fine for one emulator, wrong for a fleet (voxel runs many) and for any test
-//! that distinguishes instances or discovers them like real hardware.
+//! Every identity-bearing value the emulated SP and RoT expose is derived per
+//! instance: the STM32H753 96-bit UID (`soc.rs`), the LPC55 DICE CDI
+//! (`lpc55.rs`), and the PUF seed / UDS (`puf.rs`). Fixed constants would give
+//! every instance the same self-signed DICE certificate and the same UID, which
+//! breaks a fleet of emulators and any test that distinguishes instances or
+//! discovers them like real hardware.
 //!
 //! This module derives all per-instance identity from a single 32-byte master
 //! seed. Fields are domain-separated: `field = SHA3-256(master || tag)`, truncated
@@ -17,7 +21,7 @@
 //!   3. otherwise a fresh random source, persisted once.
 //!
 //! A seed source is one of: the reserved word `legacy` (reproduces the previous
-//! fixed constants exactly, so an old UID/CDI/cert can be recovered); a
+//! fixed constants exactly, so a legacy UID/CDI/cert can be recovered); a
 //! `0x`-prefixed hex u64 (`--seed 0x1234`); or any other string (hashed). The
 //! resolved source is written to the identity file so it round-trips.
 //!
@@ -37,7 +41,7 @@
 //! take priority. Every place that treats this material as readable carries a
 //! note pointing back here.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use sha3::{Digest, Sha3_256};
 use std::sync::OnceLock;
 
@@ -46,7 +50,10 @@ use std::sync::OnceLock;
 /// way to run a fleet; two instances sharing one cwd without setting this would
 /// share an identity, so a fleet must give each its own path.
 fn identity_path() -> String {
-    crate::config::instance_file("SP_EMU_IDENTITY", crate::config::get().identity_path())
+    crate::config::instance_file(
+        "SP_EMU_IDENTITY",
+        crate::config::get().identity_path(),
+    )
 }
 
 /// Domain tags. Changing a tag changes that field's value for a given seed, so
@@ -83,11 +90,12 @@ const LEGACY_DICE_CDI_WORDS: [u32; 8] = [
     0xc3d2_e1f0,
 ];
 const LEGACY_PUF_UDS: [u8; 32] = [
-    0x53, 0x50, 0x2d, 0x45, 0x4d, 0x55, 0x2d, 0x50, 0x55, 0x46, 0x2d, 0x64, 0x69, 0x63, 0x65, 0x2d,
-    0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x2d, 0x21, 0x21, 0x21, 0x21,
+    0x53, 0x50, 0x2d, 0x45, 0x4d, 0x55, 0x2d, 0x50, 0x55, 0x46, 0x2d, 0x64,
+    0x69, 0x63, 0x65, 0x2d, 0x73, 0x65, 0x65, 0x64, 0x2d, 0x76, 0x31, 0x2e,
+    0x30, 0x2e, 0x30, 0x2d, 0x21, 0x21, 0x21, 0x21,
 ];
 
-/// Master seed used for a legacy identity's *derived* fields (RoT UUID, VPD MAC),
+/// Master seed used for a legacy identity's derived fields (RoT UUID, VPD MAC),
 /// which had no historical constant; the SP UID / DICE CDI / PUF UDS are then
 /// overridden with the exact old values above.
 const LEGACY_MASTER: [u8; 32] = *b"sp-emu-legacy-identity-master-v1";
@@ -121,7 +129,9 @@ fn derive(master: &[u8; 32], tag: &[u8], out: &mut [u8]) {
     out.copy_from_slice(&d[..out.len()]);
 }
 
-fn words_to_le_bytes<const N: usize, const B: usize>(words: [u32; N]) -> [u8; B] {
+fn words_to_le_bytes<const N: usize, const B: usize>(
+    words: [u32; N],
+) -> [u8; B] {
     debug_assert_eq!(B, N * 4);
     let mut b = [0u8; B];
     for (i, w) in words.iter().enumerate() {
@@ -148,12 +158,13 @@ impl Identity {
         // version and variant sees a UUID of the same class rather than 16
         // bytes that decode as no valid version at all.
         id.rot_uuid[6] = (id.rot_uuid[6] & UUID_VERSION_MASK) | UUID_VERSION_3;
-        id.rot_uuid[8] = (id.rot_uuid[8] & UUID_VARIANT_MASK) | UUID_VARIANT_RFC4122;
+        id.rot_uuid[8] =
+            (id.rot_uuid[8] & UUID_VARIANT_MASK) | UUID_VARIANT_RFC4122;
         derive(&master, TAG_DICE_CDI, &mut id.dice_cdi);
         derive(&master, TAG_PUF_UDS, &mut id.puf_uds);
         derive(&master, TAG_MAC, &mut id.mac);
-        // Locally-administered, unicast (bit1 set, bit0 clear); a MAC we minted,
-        // not an OUI-assigned one.
+        // Locally-administered, unicast (bit1 set, bit0 clear); a synthesized
+        // MAC, not an OUI-assigned one.
         id.mac[0] = (id.mac[0] | 0x02) & !0x01;
         id
     }
@@ -174,7 +185,7 @@ impl Identity {
         if o + 4 <= self.sp_uid.len() {
             u32::from_le_bytes(self.sp_uid[o..o + 4].try_into().unwrap())
         } else {
-            0x0000_0001 // past the 96-bit UID: a stable non-zero filler, as before
+            0x0000_0001 // past the 96-bit UID: a stable non-zero filler
         }
     }
 
@@ -182,7 +193,9 @@ impl Identity {
     pub fn dice_cdi_words(&self) -> [u32; 8] {
         let mut w = [0u32; 8];
         for (i, wo) in w.iter_mut().enumerate() {
-            *wo = u32::from_le_bytes(self.dice_cdi[i * 4..i * 4 + 4].try_into().unwrap());
+            *wo = u32::from_le_bytes(
+                self.dice_cdi[i * 4..i * 4 + 4].try_into().unwrap(),
+            );
         }
         w
     }
@@ -274,10 +287,14 @@ fn save_source(path: &str, source: &str) {
 fn random_source() -> String {
     use std::io::Read;
     let mut b = [0u8; 8];
-    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)) {
+    match std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+    {
         Ok(()) => format!("0x{:016x}", u64::from_le_bytes(b)),
         Err(e) => {
-            eprintln!("[identity] /dev/urandom read failed ({e}); using legacy identity");
+            eprintln!(
+                "[identity] /dev/urandom read failed ({e}); using legacy identity"
+            );
             LEGACY_SOURCE.to_string()
         }
     }

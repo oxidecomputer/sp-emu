@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Portable instance bundle: pack an sp-emu instance (flash images, their `.nv`
 //! companion files, identity, config, and the stowed Hubris archives) into one
 //! `.zip` so it can be shared or archived and later re-run and inspected with
@@ -9,7 +13,7 @@
 //! Everything anchors to the single instance base (`flash::instance_base` of the SP
 //! flash), so the SP and the RoT pack together as one tree.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -30,9 +34,7 @@ const PATH_KNOBS: &[&str] = &[
 ];
 
 fn basename(path: &str) -> Option<String> {
-    Path::new(path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
+    Path::new(path).file_name().map(|s| s.to_string_lossy().into_owned())
 }
 
 /// Queue `src` under bundle-relative `rel`, skipping it if it isn't a regular file.
@@ -47,8 +49,10 @@ pub fn pack(out: &str) -> Result<()> {
     let cfg = crate::config::get();
     // The instance files live under the resolved state directory, not the bare knob
     // defaults, so resolve them the same way the running emulator does.
-    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
-    let identity = crate::config::instance_file("SP_EMU_IDENTITY", cfg.identity_path());
+    let sp_flash =
+        crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
+    let identity =
+        crate::config::instance_file("SP_EMU_IDENTITY", cfg.identity_path());
     let rot_nvm = crate::rot_flash::nvm_path();
     let base = crate::flash::instance_base(&sp_flash).to_path_buf();
 
@@ -76,8 +80,8 @@ pub fn pack(out: &str) -> Result<()> {
     // Every file already stowed under <base>/archives/ (the Hubris archives).
     let arch_dir = base.join("archives");
     if arch_dir.is_dir() {
-        for e in
-            std::fs::read_dir(&arch_dir).with_context(|| format!("read {}", arch_dir.display()))?
+        for e in std::fs::read_dir(&arch_dir)
+            .with_context(|| format!("read {}", arch_dir.display()))?
         {
             let p = e?.path();
             if p.is_file() {
@@ -100,22 +104,21 @@ pub fn pack(out: &str) -> Result<()> {
     let manifest = build_manifest(cfg, &rot_nvm);
     let config_toml = rewritten_config(&rot_nvm);
 
-    let f = std::fs::File::create(out).with_context(|| format!("create {out}"))?;
+    let f =
+        std::fs::File::create(out).with_context(|| format!("create {out}"))?;
     let mut zw = zip::ZipWriter::new(f);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     write_entry(&mut zw, opts, "manifest.toml", manifest.as_bytes())?;
     write_entry(&mut zw, opts, "config.toml", config_toml.as_bytes())?;
     for (rel, src) in &files {
-        let data = std::fs::read(src).with_context(|| format!("read {}", src.display()))?;
+        let data = std::fs::read(src)
+            .with_context(|| format!("read {}", src.display()))?;
         write_entry(&mut zw, opts, rel, &data)?;
     }
     zw.finish().context("finalize bundle zip")?;
 
-    println!(
-        "packed {} files + manifest + config into {out}",
-        files.len()
-    );
+    println!("packed {} files + manifest + config into {out}", files.len());
     Ok(())
 }
 
@@ -125,21 +128,23 @@ fn write_entry(
     name: &str,
     data: &[u8],
 ) -> Result<()> {
-    zw.start_file(name, opts)
-        .with_context(|| format!("zip entry {name}"))?;
-    zw.write_all(data)
-        .with_context(|| format!("write {name}"))?;
+    zw.start_file(name, opts).with_context(|| format!("zip entry {name}"))?;
+    zw.write_all(data).with_context(|| format!("write {name}"))?;
     Ok(())
 }
 
 /// The packed `config.toml`: the set knobs (from `config::to_toml`), minus the
-/// instance-file path knobs, plus canonical bundle-relative paths for what we bundled.
+/// instance-file path knobs, plus canonical bundle-relative paths for the bundled files.
 fn rewritten_config(rot_nvm: &str) -> String {
     let cfg = crate::config::get();
-    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
-    let identity = crate::config::instance_file("SP_EMU_IDENTITY", cfg.identity_path());
-    let sp_arch = crate::flash::load_nv(&crate::flash::nv_state_path(&sp_flash)).archive;
-    let rot = crate::flash::load_rot_meta(&crate::flash::nv_state_path(rot_nvm));
+    let sp_flash =
+        crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
+    let identity =
+        crate::config::instance_file("SP_EMU_IDENTITY", cfg.identity_path());
+    let sp_arch =
+        crate::flash::load_nv(&crate::flash::nv_state_path(&sp_flash)).archive;
+    let rot =
+        crate::flash::load_rot_meta(&crate::flash::nv_state_path(rot_nvm));
 
     let mut out = String::from(
         "# sp-emu instance bundle config; paths are bundle-relative.\n\
@@ -156,7 +161,9 @@ fn rewritten_config(rot_nvm: &str) -> String {
             out.push('\n');
         }
     }
-    let mut set = |k: &str, v: &str| out.push_str(&format!("{k} = \"{v}\"\n"));
+    let mut set = |k: &str, v: &str| {
+        out.push_str(&format!("{k} = \"{}\"\n", crate::config::escape_toml(v)))
+    };
     set("SP_EMU_FLASH", "sp-flash.bin");
     if Path::new(rot_nvm).is_file() {
         set("SP_EMU_ROT_NVM", "sp-rot-flash.bin");
@@ -191,18 +198,17 @@ fn rewritten_config(rot_nvm: &str) -> String {
 /// original source path as provenance, so an unpacker knows which `humility -a`
 /// to use per target.
 fn build_manifest(cfg: &crate::config::Config, rot_nvm: &str) -> String {
-    let sp_flash = crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
-    let sp_arch = crate::flash::load_nv(&crate::flash::nv_state_path(&sp_flash)).archive;
-    let rot = crate::flash::load_rot_meta(&crate::flash::nv_state_path(rot_nvm));
+    let sp_flash =
+        crate::config::instance_file("SP_EMU_FLASH", cfg.flash_path());
+    let sp_arch =
+        crate::flash::load_nv(&crate::flash::nv_state_path(&sp_flash)).archive;
+    let rot =
+        crate::flash::load_rot_meta(&crate::flash::nv_state_path(rot_nvm));
 
     let mut m = String::from("schema = 1\n");
     m.push_str(&format!(
         "board = \"{}\"\n",
-        if cfg.board().is_sidecar() {
-            "sidecar"
-        } else {
-            "gimlet"
-        }
+        if cfg.board().is_sidecar() { "sidecar" } else { "gimlet" }
     ));
     if let Some(s) = cfg.seed() {
         m.push_str(&format!("seed = \"{s}\"\n"));
@@ -210,7 +216,10 @@ fn build_manifest(cfg: &crate::config::Config, rot_nvm: &str) -> String {
     m.push_str(
         "\n# Which bundled Hubris archive produced each component: humility -a <archive>.\n",
     );
-    let comp = |m: &mut String, name: &str, arch: &Option<String>, source: Option<&str>| {
+    let comp = |m: &mut String,
+                name: &str,
+                arch: &Option<String>,
+                source: Option<&str>| {
         if let Some(a) = arch {
             m.push_str(&format!("\n[components.{name}]\narchive = \"{a}\"\n"));
             if let Some(s) = source {
@@ -228,12 +237,15 @@ fn build_manifest(cfg: &crate::config::Config, rot_nvm: &str) -> String {
 /// Reject a bundle entry name that could escape the destination directory (a
 /// zip-slip): absolute paths and any `..` component. Empty names are unsafe too.
 fn is_safe_entry(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('/') && !name.split('/').any(|c| c == "..")
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.split('/').any(|c| c == "..")
 }
 
 /// Extract a bundle into `dest` and print how to run/inspect it.
 pub fn unpack(bundle: &str, dest: &str) -> Result<()> {
-    let raw = std::fs::read(bundle).with_context(|| format!("read {bundle}"))?;
+    let raw =
+        std::fs::read(bundle).with_context(|| format!("read {bundle}"))?;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(raw))
         .with_context(|| format!("{bundle} is not a valid zip bundle"))?;
     std::fs::create_dir_all(dest).with_context(|| format!("create {dest}"))?;
@@ -253,12 +265,19 @@ pub fn unpack(bundle: &str, dest: &str) -> Result<()> {
         }
         let mut buf = Vec::with_capacity(f.size() as usize);
         std::io::copy(&mut f, &mut buf)?;
-        std::fs::write(&outp, &buf).with_context(|| format!("write {}", outp.display()))?;
+        std::fs::write(&outp, &buf)
+            .with_context(|| format!("write {}", outp.display()))?;
     }
     println!("unpacked {bundle} -> {dest}");
-    println!("  run:     (cd {dest} && sp-emu --load-config config.toml run a 0)");
-    println!("  inspect: humility -a {dest}/archives/<component>.zip -p 20b7:9db1:tcp:127.0.0.1:4444 <cmd>");
-    println!("           (see {dest}/manifest.toml for the component -> archive map)");
+    println!(
+        "  run:     (cd {dest} && sp-emu --load-config config.toml run a 0)"
+    );
+    println!(
+        "  inspect: humility -a {dest}/archives/<component>.zip -p 20b7:9db1:tcp:127.0.0.1:4444 <cmd>"
+    );
+    println!(
+        "           (see {dest}/manifest.toml for the component -> archive map)"
+    );
     Ok(())
 }
 

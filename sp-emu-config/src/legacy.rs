@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The v0 bridge: the flat `SP_EMU_NAME = "value"` form mapped onto the typed v1
 //! schema. This is the single source of the flat-name to typed-field
 //! correspondence, used to migrate a legacy flat file forward and (in a later
@@ -118,7 +122,9 @@ pub fn flat_to_v1(text: &str) -> Result<ConfigFileV1, ConfigError> {
 /// Turn flat `(SP_EMU_NAME, value)` pairs (from a file or the environment) into
 /// the typed v1 schema. Unknown names are ignored; known ones are parsed with the
 /// knob's historical leniency.
-pub fn flat_pairs_to_v1(pairs: impl IntoIterator<Item = (String, String)>) -> ConfigFileV1 {
+pub fn flat_pairs_to_v1(
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> ConfigFileV1 {
     let mut c = ConfigFileV1::default();
     for (name, value) in pairs {
         set(&mut c, &name, &value);
@@ -143,7 +149,8 @@ fn scalar_string(v: &toml::Value) -> String {
 /// input, exactly as the historical `uN::from_str_radix` did (an overflowing
 /// value fell back to the knob's default rather than truncating).
 fn hex<T: TryFrom<u64>>(s: &str) -> Option<T> {
-    let raw = u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()?;
+    let raw =
+        u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()?;
     T::try_from(raw).ok()
 }
 
@@ -323,14 +330,17 @@ SP_EMU_ROT_PREBOOT = \"40000000\"
     fn a_board_typo_stays_lenient_through_ingest() {
         // The old resolver silently made a non-"sidecar" board gimlet; the flat
         // bridge preserves that, so ingest does not reject the typo.
-        let c = ingest(flat_to_v1("SP_EMU_BOARD = \"typo\"\n").unwrap()).unwrap();
+        let c =
+            ingest(flat_to_v1("SP_EMU_BOARD = \"typo\"\n").unwrap()).unwrap();
         assert_eq!(c.board(), Board::Gimlet);
     }
 
     #[test]
     fn txbreak_is_off_only_for_zero() {
-        let on = ingest(flat_to_v1("SP_EMU_ETH_TXBREAK = \"1\"\n").unwrap()).unwrap();
-        let off = ingest(flat_to_v1("SP_EMU_ETH_TXBREAK = \"0\"\n").unwrap()).unwrap();
+        let on = ingest(flat_to_v1("SP_EMU_ETH_TXBREAK = \"1\"\n").unwrap())
+            .unwrap();
+        let off = ingest(flat_to_v1("SP_EMU_ETH_TXBREAK = \"0\"\n").unwrap())
+            .unwrap();
         assert!(on.eth_txbreak());
         assert!(!off.eth_txbreak());
     }
@@ -369,12 +379,9 @@ SP_EMU_ROT_PREBOOT = \"40000000\"
 
     #[test]
     fn env_names_covers_the_backward_compat_knobs() {
-        for name in [
-            "SP_EMU_FLASH",
-            "SP_EMU_BOARD",
-            "SP_EMU_ETHDBG",
-            "SP_EMU_VID0",
-        ] {
+        for name in
+            ["SP_EMU_FLASH", "SP_EMU_BOARD", "SP_EMU_ETHDBG", "SP_EMU_VID0"]
+        {
             assert!(ENV_NAMES.contains(&name), "{name} missing from ENV_NAMES");
         }
     }
@@ -398,7 +405,8 @@ SP_EMU_ROT_PREBOOT = \"40000000\"
     #[test]
     fn every_env_name_is_handled_by_set() {
         for &name in ENV_NAMES {
-            let v1 = flat_pairs_to_v1([(name.to_string(), probe(name).to_string())]);
+            let v1 =
+                flat_pairs_to_v1([(name.to_string(), probe(name).to_string())]);
             assert_ne!(
                 v1,
                 ConfigFileV1::default(),
@@ -407,10 +415,7 @@ SP_EMU_ROT_PREBOOT = \"40000000\"
         }
         assert_eq!(
             ENV_NAMES.len(),
-            ENV_NAMES
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
+            ENV_NAMES.iter().collect::<std::collections::BTreeSet<_>>().len(),
             "ENV_NAMES has a duplicate"
         );
     }
@@ -419,10 +424,16 @@ SP_EMU_ROT_PREBOOT = \"40000000\"
     fn an_out_of_range_hex_falls_back_to_the_default() {
         // 0x10000 overflows u16: historically it dropped to unset (the knob's
         // default), not truncated to 0.
-        let v1 = flat_pairs_to_v1([("SP_EMU_VID0".to_string(), "0x10000".to_string())]);
+        let v1 = flat_pairs_to_v1([(
+            "SP_EMU_VID0".to_string(),
+            "0x10000".to_string(),
+        )]);
         assert_eq!(v1.net.vid0, None);
         // an in-range value still lands.
-        let v1 = flat_pairs_to_v1([("SP_EMU_VID0".to_string(), "0x301".to_string())]);
+        let v1 = flat_pairs_to_v1([(
+            "SP_EMU_VID0".to_string(),
+            "0x301".to_string(),
+        )]);
         assert_eq!(v1.net.vid0, Some(0x301));
     }
 }

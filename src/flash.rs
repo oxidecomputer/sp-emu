@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Flash banks (Slot A / Slot B) backed by a persistent host file: the
 //! non-volatile memory of the emulated SP.
 //!
@@ -6,7 +10,7 @@
 //! image persisted to a host file so that, as on real silicon, flash contents
 //! persist across runs. Program a slot once, then `run`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -31,7 +35,8 @@ pub fn slot_base(slot: char) -> Result<u32> {
 /// Load the persistent flash image, or a fully-erased image if none exists yet.
 pub fn load_nvm(path: &str) -> Result<Vec<u8>> {
     if Path::new(path).exists() {
-        let mut data = std::fs::read(path).with_context(|| format!("read {path}"))?;
+        let mut data =
+            std::fs::read(path).with_context(|| format!("read {path}"))?;
         data.resize(TOTAL, ERASED);
         Ok(data)
     } else {
@@ -50,8 +55,9 @@ pub fn save_nvm(path: &str, data: &[u8]) -> Result<()> {
 pub fn load_image(path: &str) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {path}"))?;
     if raw.starts_with(b"PK") {
-        archive_entry(&raw, "img/final.bin")
-            .context("no img/final.bin in archive — is this a Hubris build archive?")
+        archive_entry(&raw, "img/final.bin").context(
+            "no img/final.bin in archive; is this a Hubris build archive?",
+        )
     } else {
         Ok(raw)
     }
@@ -65,16 +71,6 @@ fn archive_entry(zip_bytes: &[u8], name: &str) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(f.size() as usize);
     f.read_to_end(&mut buf)?;
     Ok(buf)
-}
-
-/// Best-effort read of `img/flash.ron` (the slot layout) for reporting; returns
-/// None for a raw binary or if the entry is absent.
-pub fn archive_flash_ron(path: &str) -> Option<String> {
-    let raw = std::fs::read(path).ok()?;
-    if !raw.starts_with(b"PK") {
-        return None;
-    }
-    String::from_utf8(archive_entry(&raw, "img/flash.ron").ok()?).ok()
 }
 
 /// The image's `app.toml` from a Hubris build archive (root entry). Carries the
@@ -112,7 +108,9 @@ pub fn instance_base(flash_path: &str) -> &std::path::Path {
 /// byte comparison only runs when the sizes already match.
 fn files_identical(a: &Path, b: &Path) -> bool {
     match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => std::fs::read(a).ok() == std::fs::read(b).ok(),
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {
+            std::fs::read(a).ok() == std::fs::read(b).ok()
+        }
         _ => false,
     }
 }
@@ -120,21 +118,27 @@ fn files_identical(a: &Path, b: &Path) -> bool {
 /// Copy a Hubris archive into the instance's `<base>/archives/<name>.zip` (base = the
 /// directory of `flash_path`) and return its base-relative ref (e.g. `archives/sp.zip`)
 /// to store in the `.nv` companion file. Skips the copy when the destination holds
-/// this archive: either it IS the source (re-flash from an already-stowed archive)
+/// this archive: either it is the source (re-flash from an already-stowed archive)
 /// or a byte-identical copy (an unchanged instance re-run, e.g. the RoT re-stows on
 /// every serve). The instance is thus self-contained: the archive travels with the
 /// flash image, and `pack` is just a zip of the base directory.
-pub fn stow_archive(flash_path: &str, archive_src: &str, name: &str) -> Result<String> {
+pub fn stow_archive(
+    flash_path: &str,
+    archive_src: &str,
+    name: &str,
+) -> Result<String> {
     let base = instance_base(flash_path);
     let dir = base.join("archives");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create {}", dir.display()))?;
     let rel = format!("archives/{name}.zip");
     let dst = base.join(&rel);
     let src = std::path::Path::new(archive_src);
     let same_path = matches!((src.canonicalize(), dst.canonicalize()), (Ok(a), Ok(b)) if a == b);
     if !same_path && !files_identical(src, &dst) {
-        std::fs::copy(src, &dst)
-            .with_context(|| format!("copy {archive_src} -> {}", dst.display()))?;
+        std::fs::copy(src, &dst).with_context(|| {
+            format!("copy {archive_src} -> {}", dst.display())
+        })?;
     }
     Ok(rel)
 }
@@ -159,13 +163,13 @@ pub fn program_slot(path: &str, slot: char, image: &[u8]) -> Result<()> {
 /// If exactly one slot is programmed, mirror it into the other bank in-memory.
 ///
 /// sp-emu programs a single slot, but the control-plane inventory (wicketd)
-/// reads the caboose of BOTH banks every poll cycle (~10s per SP). An empty bank
-/// returns NoCaboose, which wicketd never caches and re-fetches forever - and
+/// reads the caboose of both banks every poll cycle (~10s per SP). An empty bank
+/// returns NoCaboose, which wicketd never caches and re-fetches forever, and
 /// each fetch is a ~38ms emulated MGS round-trip, so a real dual-banked SP's
 /// harmless polling becomes a continuous CPU drain here. Presenting the same
 /// image in both banks (as a real SP has) makes the inactive-slot caboose read
 /// succeed and get cached, ending the retries. Only the caboose is read from the
-/// inactive bank, so a byte copy suffices - that image is never executed there.
+/// inactive bank, so a byte copy suffices; that image is never executed there.
 pub fn mirror_unprogrammed_slot(nvm: &mut [u8]) {
     let a = slot_programmed(nvm, 'a').unwrap_or(false);
     let b = slot_programmed(nvm, 'b').unwrap_or(false);
@@ -196,21 +200,21 @@ pub fn slot_programmed(nvm: &[u8], slot: char) -> Result<bool> {
 // Non-volatile register state file
 // ---------------------------------------------------------------------------
 //
-// The flash *contents* live in the raw `sp-flash.bin` image (physical layout:
+// The flash contents live in the raw `sp-flash.bin` image (physical layout:
 // bank1 then bank2). A handful of option-byte bits that survive across a run are
-// not flash data — chiefly the persisted bank-swap selection — so they live in a
+// not flash data (chiefly the persisted bank-swap selection), so they live in a
 // tiny plaintext state file (`sp-flash.bin.nv`, one `key = value` per line). It
 // is deliberately human-inspectable and forward-extensible (Phase 2 adds RoT
 // lines): deleting the state file resets the NV registers to their defaults.
 
-/// Persisted non-volatile state: the STM32H7 option bytes we model, plus the Hubris
+/// Persisted non-volatile state: the modeled STM32H7 option bytes, plus the Hubris
 /// build archive the flashed image came from. The archive ref is a path relative to
 /// the `.nv` file's directory (the instance base), recorded at flash time so a
 /// run-from-flash instance knows its archive for app.toml-derived config and for
 /// humility tooling (which matches the archive's image id).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NvState {
-    /// `OPTSR_CUR.SWAP_BANK_OPT` — which physical bank boots at 0x0800_0000.
+    /// `OPTSR_CUR.SWAP_BANK_OPT`: which physical bank boots at 0x0800_0000.
     pub swap_bank: bool,
     /// The Hubris archive the SP was flashed from, base-relative (e.g.
     /// `archives/sp.zip`). `None` when flashed from a bare image (no archive content).
@@ -240,7 +244,8 @@ pub fn load_nv(path: &str) -> NvState {
             "swap_bank" => nv.swap_bank = matches!(v, "1" | "true"),
             // Stored as a basic string; tolerate surrounding quotes. Empty = None.
             "archive" => {
-                nv.archive = Some(v.trim_matches('"').to_string()).filter(|s| !s.is_empty())
+                nv.archive = Some(v.trim_matches('"').to_string())
+                    .filter(|s| !s.is_empty())
             }
             _ => {}
         }
@@ -265,7 +270,7 @@ pub fn save_nv(path: &str, nv: &NvState) -> Result<()> {
 /// seed time so the instance is self-contained; `None` for a region seeded from a
 /// bare image or absent. Parallel to the SP `NvState`.
 ///
-/// Note: the SP (`sp-flash.bin.nv` = `NvState`) and RoT (`sp-rot-flash.bin.nv` =
+/// The SP (`sp-flash.bin.nv` = `NvState`) and RoT (`sp-rot-flash.bin.nv` =
 /// `RotMeta`) `.nv` files share the extension but are distinct files with distinct
 /// schemas and loaders (`load_nv` vs `load_rot_meta`); loading one with the other's
 /// parser just yields defaults, never a crash.
@@ -289,7 +294,8 @@ pub fn load_rot_meta(path: &str) -> RotMeta {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        let v = Some(v.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty());
+        let v = Some(v.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty());
         match k.trim() {
             "slot_a_archive" => m.slot_a_archive = v,
             "slot_b_archive" => m.slot_b_archive = v,
@@ -320,15 +326,15 @@ pub fn save_rot_meta(path: &str, m: &RotMeta) -> Result<()> {
 // Runtime flash model (STM32H753 embedded flash + FLASH controller)
 // ---------------------------------------------------------------------------
 //
-// Replaces the flat `add_ram` flash window and the store/return FLASH RegFile
-// with a model that behaves like real silicon so unmodified Hubris firmware can
-// perform an in-band MGS firmware update end to end: unlock, whole-bank erase
-// (with the EOP interrupt the driver blocks on), 256-bit word programming with
-// NOR semantics, the option-byte bank swap, and persistence to the host file.
+// Models the flash aperture and FLASH controller with real-silicon behavior so
+// unmodified Hubris firmware can perform an in-band MGS firmware update end to
+// end: unlock, whole-bank erase (with the EOP interrupt the driver blocks on),
+// 256-bit word programming with NOR semantics, the option-byte bank swap, and
+// persistence to the host file.
 //
 // Owned directly by the `Bus` (like the Ethernet DMA), because the data stores
-// that program flash target the *memory aperture* (0x0800_0000/0x0810_0000), not
-// the register block, and must be gated by the controller's lock/PG state — only
+// that program flash target the memory aperture (0x0800_0000/0x0810_0000), not
+// the register block, and must be gated by the controller's lock/PG state; only
 // a single owner of both can coordinate that. Performance: the aperture is the
 // hottest path in the emulator (every instruction fetch and constant load), so
 // reads are a range check + one XOR (bank remap) + a slice read; write-back to
@@ -353,7 +359,7 @@ const CR_PG: u32 = 1 << 1;
 const CR_BER: u32 = 1 << 3;
 const CR_START: u32 = 1 << 7;
 const CR_EOPIE: u32 = 1 << 16;
-// SR bits (BSY/QW read 0 — the model completes instantly; EOP latches).
+// SR bits (BSY/QW read 0, the model completes instantly; EOP latches).
 const SR_EOP: u32 = 1 << 16;
 // OPTCR bits.
 const OPTCR_OPTLOCK: u32 = 1 << 0;
@@ -375,7 +381,7 @@ pub struct Flash {
     mem: Vec<u8>,
     /// Write-through handle to the backing file. Every program/erase writes just
     /// the changed bytes here (seek + write), so the flash image stays in sync
-    /// even if the process is killed without a clean exit — matching real flash,
+    /// even if the process is killed without a clean exit, matching real flash,
     /// where a program/erase is durable the moment it completes. `None` if the
     /// file could not be opened (the model still works in RAM).
     file: Option<std::fs::File>,
@@ -395,13 +401,13 @@ pub struct Flash {
 
     bank2_locked: bool,
     opt_locked: bool,
-    key2_state: u8,          // progress through the 2-write KEYR2 unlock sequence
-    optkey_state: u8,        // progress through the 2-write OPTKEYR unlock sequence
-    cr2: u32,                // last CR2 write (PG/PSIZE/SNB/IE bits read back)
-    sr2: u32,                // EOP + error bits (BSY/QW always read 0)
-    erase_irq: bool,         // an erase completed with EOPIE armed -> pend FLASH_IRQ
+    key2_state: u8, // progress through the 2-write KEYR2 unlock sequence
+    optkey_state: u8, // progress through the 2-write OPTKEYR unlock sequence
+    cr2: u32,       // last CR2 write (PG/PSIZE/SNB/IE bits read back)
+    sr2: u32,       // EOP + error bits (BSY/QW always read 0)
+    erase_irq: bool, // an erase completed with EOPIE armed -> pend FLASH_IRQ
     regs: HashMap<u32, u32>, // ACR, bank1 stubs, other store/return registers
-    dbg: bool,               // $SP_EMU_FLASHDBG: trace controller register traffic
+    dbg: bool,      // $SP_EMU_FLASHDBG: trace controller register traffic
 }
 
 impl Flash {
@@ -417,7 +423,9 @@ impl Flash {
             .create(true)
             .truncate(false)
             .open(path)
-            .map_err(|e| eprintln!("[flash] open {path} for write-through failed: {e}"))
+            .map_err(|e| {
+                eprintln!("[flash] open {path} for write-through failed: {e}")
+            })
             .ok();
         if let Some(f) = file.as_mut() {
             use std::io::{Seek, SeekFrom, Write};
@@ -457,17 +465,13 @@ impl Flash {
     #[inline]
     fn phys_off(&self, addr: u32) -> usize {
         let rel = (addr - FLASH_BASE) as usize;
-        if self.effective_swap {
-            rel ^ BANK_SIZE
-        } else {
-            rel
-        }
+        if self.effective_swap { rel ^ BANK_SIZE } else { rel }
     }
 
     /// Read `N` bytes from the aperture, tolerating an access that straddles the
     /// top of the 2 MB window: bytes past the end read as erased flash (0xFF).
     /// The `mem.rs` dispatch only range-checks the base address, so a stray or
-    /// unaligned access in the last few bytes must not panic — the emulator's
+    /// unaligned access in the last few bytes must not panic; the emulator's
     /// contract is to keep the trace moving on out-of-range accesses, not fault.
     #[inline]
     fn read_bytes<const N: usize>(&self, addr: u32) -> [u8; N] {
@@ -494,7 +498,7 @@ impl Flash {
     }
 
     /// A firmware store into the flash aperture. Honored only while bank2 is
-    /// unlocked and CR2.PG is set (a real program cycle); NOR semantics — a
+    /// unlocked and CR2.PG is set (a real program cycle); NOR semantics: a
     /// program can only clear bits (`&=`), never set them. Anything else is
     /// dropped, matching hardware where a stray store to XIP flash faults / is
     /// ignored rather than mutating it.
@@ -516,7 +520,7 @@ impl Flash {
         self.write_through(o, n);
     }
 
-    /// Raw image load at boot (bypasses lock/PG) — used by `Bus::load`. An
+    /// Raw image load at boot (bypasses lock/PG); used by `Bus::load`. An
     /// oversized image is clamped to the window rather than panicking.
     pub fn load_image_at(&mut self, addr: u32, bytes: &[u8]) {
         let o = self.phys_off(addr);
@@ -565,11 +569,7 @@ impl Flash {
             }
             REG_OPTSR_CUR => {
                 // OPT_BUSY reads 0 (instant). SWAP_BANK_OPT = committed value.
-                let v = if self.committed_swap {
-                    OPT_SWAP_BANK
-                } else {
-                    0
-                };
+                let v = if self.committed_swap { OPT_SWAP_BANK } else { 0 };
                 if self.dbg {
                     eprintln!(
                         "[flashdbg] rd OPTSR_CUR={v:#010x} committed={}",
@@ -635,7 +635,10 @@ impl Flash {
                     self.bank2_locked = true;
                 }
                 // Bank erase: BER + START, on an unlocked bank.
-                if val & CR_BER != 0 && val & CR_START != 0 && !self.bank2_locked {
+                if val & CR_BER != 0
+                    && val & CR_START != 0
+                    && !self.bank2_locked
+                {
                     self.erase_bank2();
                     self.sr2 |= SR_EOP;
                     if val & CR_EOPIE != 0 {
@@ -668,8 +671,8 @@ impl Flash {
                     self.opt_locked = true;
                 }
                 // OPTSTART commits the staged option bytes to the current/NV copy.
-                // It does *not* change the effective mapping — only a reset latches
-                // that — so the running image is not remapped underfoot.
+                // It does not change the effective mapping (only a reset latches
+                // that), so the running image is not remapped underfoot.
                 if val & OPTCR_OPTSTART != 0 && !self.opt_locked {
                     self.committed_swap = self.staged_swap;
                     if self.dbg {
@@ -684,7 +687,7 @@ impl Flash {
                     };
                     if let Err(e) = save_nv(&self.nv_path, &nv) {
                         // A failed persist means the committed swap is lost across
-                        // the next run — surface it rather than silently dropping.
+                        // the next run; surface it rather than silently dropping.
                         eprintln!(
                             "[flash] persist option bytes to {} failed: {e}",
                             self.nv_path
@@ -700,8 +703,8 @@ impl Flash {
     }
 
     fn erase_bank2(&mut self) {
-        // The update server always programs the *inactive* physical bank, reached
-        // via the 0x0810_0000 aperture — which the same XOR maps to the right
+        // The update server always programs the inactive physical bank, reached
+        // via the 0x0810_0000 aperture, which the same XOR maps to the right
         // physical half regardless of the effective swap.
         let base = self.phys_off(FLASH_BASE + BANK_SIZE as u32);
         self.mem[base..base + BANK_SIZE].fill(ERASED);
@@ -718,7 +721,7 @@ impl Flash {
     }
 
     /// Force the boot bank selection (a CLI slot override). Sets all three swap
-    /// bits in memory but does not touch the NV state file — only a firmware OPTSTART
+    /// bits in memory but does not touch the NV state file; only a firmware OPTSTART
     /// commit persists a swap, so a `run a`/`run b` choice never clobbers the
     /// recorded option bytes.
     pub fn force_swap(&mut self, swap: bool) {
@@ -728,7 +731,7 @@ impl Flash {
     }
 
     /// Latch the effective mapping from the committed option byte. Called at every
-    /// reset edge — this is where a committed bank swap actually takes effect.
+    /// reset edge; this is where a committed bank swap actually takes effect.
     pub fn reset_latch(&mut self) {
         self.effective_swap = self.committed_swap;
     }
@@ -736,8 +739,10 @@ impl Flash {
     /// Sync the backing file to disk. Program/erase already write through, so this
     /// only forces the OS to flush its buffers; called at reset and on exit.
     pub fn flush(&mut self) {
-        if let Some(f) = self.file.as_mut() {
-            let _ = f.sync_all();
+        if let Some(f) = self.file.as_mut()
+            && let Err(e) = f.sync_all()
+        {
+            eprintln!("[flash] sync {} failed: {e}", self.path);
         }
     }
 }
@@ -748,8 +753,8 @@ mod tests {
 
     fn tmp(name: &str) -> std::path::PathBuf {
         // Include the pid so concurrent runs (CI matrix) don't share a temp dir.
-        let d =
-            std::env::temp_dir().join(format!("sp-emu-flashtest-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir()
+            .join(format!("sp-emu-flashtest-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -768,10 +773,7 @@ mod tests {
         };
         save_nv(ps, &nv).unwrap();
         assert_eq!(load_nv(ps), nv);
-        let bare = NvState {
-            swap_bank: false,
-            archive: None,
-        };
+        let bare = NvState { swap_bank: false, archive: None };
         save_nv(ps, &bare).unwrap();
         assert_eq!(load_nv(ps), bare);
         assert!(!std::fs::read_to_string(ps).unwrap().contains("archive"));
@@ -816,22 +818,29 @@ mod tests {
         std::fs::write(&flash, b"nvm").unwrap();
         let src = d.join("orig-base-a.zip");
         std::fs::write(&src, b"PKarchive-bytes").unwrap();
-        let rel = stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        let rel =
+            stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp")
+                .unwrap();
         assert_eq!(rel, "archives/sp.zip");
         let dst = d.join("archives/sp.zip");
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
         // Idempotent: stowing the already-stowed file (src == dst) must not error/truncate.
-        let rel2 = stow_archive(flash.to_str().unwrap(), dst.to_str().unwrap(), "sp").unwrap();
+        let rel2 =
+            stow_archive(flash.to_str().unwrap(), dst.to_str().unwrap(), "sp")
+                .unwrap();
         assert_eq!(rel2, "archives/sp.zip");
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
         // Re-run case: stowing the external src again while dst already holds identical
         // bytes takes the skip path, with no error and dst unchanged.
-        let rel3 = stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        let rel3 =
+            stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp")
+                .unwrap();
         assert_eq!(rel3, "archives/sp.zip");
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes");
         // A changed source is re-copied.
         std::fs::write(&src, b"PKarchive-bytes-v2").unwrap();
-        stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp").unwrap();
+        stow_archive(flash.to_str().unwrap(), src.to_str().unwrap(), "sp")
+            .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"PKarchive-bytes-v2");
         let _ = std::fs::remove_dir_all(&d);
     }

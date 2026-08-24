@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! The v1 external schema: the raw, untrusted config file as written.
 //!
 //! Every field is `Option`, so "set" is `Some` and a dumped file round-trips
@@ -16,7 +20,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFileV1 {
-    /// The schema version. `Some(1)` in a well-formed v1 file; ingest checks it.
+    /// The schema version. `Some(1)` in a well-formed v1 file; version routing
+    /// (`peek_version`/`migrate`) checks it, ingest ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Op::is_empty")]
@@ -243,21 +248,8 @@ macro_rules! is_empty_impl {
     };
 }
 
-is_empty_impl!(Op {
-    mode,
-    slot,
-    run_max,
-    board,
-    seed,
-    ignition
-});
-is_empty_impl!(Paths {
-    flash,
-    rot_nvm,
-    identity,
-    state_dir,
-    archive
-});
+is_empty_impl!(Op { mode, slot, run_max, board, seed, ignition });
+is_empty_impl!(Paths { flash, rot_nvm, identity, state_dir, archive });
 is_empty_impl!(Net {
     bridge,
     well_known_ports,
@@ -288,17 +280,9 @@ is_empty_impl!(Rot {
     dice,
     preboot
 });
-is_empty_impl!(Sprot {
-    flowctl,
-    couple,
-    endoscope_couple,
-    sp_clock_khz
-});
+is_empty_impl!(Sprot { flowctl, couple, endoscope_couple, sp_clock_khz });
 is_empty_impl!(Vpd { serial, part, rev });
-is_empty_impl!(Sensors {
-    overrides,
-    ambient_c
-});
+is_empty_impl!(Sensors { overrides, ambient_c });
 is_empty_impl!(Dump { dir, archive_id });
 is_empty_impl!(Trace {
     enabled,
@@ -312,12 +296,7 @@ is_empty_impl!(Trace {
     diff,
     pcprof
 });
-is_empty_impl!(Stats {
-    rx,
-    rtt,
-    pump,
-    pump_ms
-});
+is_empty_impl!(Stats { rx, rtt, pump, pump_ms });
 is_empty_impl!(Debug {
     no_debug,
     no_archive_warn,
@@ -384,10 +363,8 @@ eth = true
 
     #[test]
     fn set_knobs_round_trip_and_omit_empty_sections() {
-        let mut cfg = ConfigFileV1 {
-            schema_version: Some(1),
-            ..Default::default()
-        };
+        let mut cfg =
+            ConfigFileV1 { schema_version: Some(1), ..Default::default() };
         cfg.op.mode = Some("gdb".into());
         cfg.rot.cmpa = Some("cmpa.bin".into());
         let text = toml::to_string(&cfg).unwrap();
@@ -401,7 +378,9 @@ eth = true
 
     #[test]
     fn an_unknown_key_is_rejected() {
-        assert!(toml::from_str::<ConfigFileV1>("[op]\nmodee = \"run\"\n").is_err());
+        assert!(
+            toml::from_str::<ConfigFileV1>("[op]\nmodee = \"run\"\n").is_err()
+        );
     }
 
     #[test]

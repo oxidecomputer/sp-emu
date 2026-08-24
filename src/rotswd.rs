@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! RoT-side SWD: the emulated LPC55 RoT drives the SP's debug port (`SwDp`) over
 //! an internal SWD link that it clocks through its FLEXCOMM5 SPI block.
 //!
@@ -48,13 +52,12 @@ pub struct SwdLink {
     pub resp: Option<u32>,
 }
 
-/// Mutex wrapper keeping the old `Rc<RefCell>` call-site shape.
+/// Mutex wrapper for the shared SWD link.
 pub struct SwdCell(Mutex<SwdLink>);
 impl SwdCell {
-    pub fn borrow(&self) -> MutexGuard<'_, SwdLink> {
-        self.0.lock().unwrap()
-    }
-    pub fn borrow_mut(&self) -> MutexGuard<'_, SwdLink> {
+    // Poison policy: a panic on either core's thread is unrecoverable for the
+    // pair, so propagating the poison panic (unwrap) is deliberate fail-fast.
+    pub fn lock(&self) -> MutexGuard<'_, SwdLink> {
         self.0.lock().unwrap()
     }
 }
@@ -112,7 +115,7 @@ impl RotSwdSpi {
         if !matches!(self.phase, Phase::ReadData) || !self.rx.is_empty() {
             return;
         }
-        if let Some(data) = self.link.borrow_mut().resp.take() {
+        if let Some(data) = self.link.lock().resp.take() {
             self.rx.push_back((data as u8).reverse_bits() as u16);
             self.rx.push_back(((data >> 8) as u8).reverse_bits() as u16);
             self.rx.push_back(((data >> 16) as u8).reverse_bits() as u16);
@@ -131,7 +134,10 @@ impl RotSwdSpi {
         let data = (val & 0xFFFF) as u16;
         self.n_fwr += 1;
         if self.trace && self.n_fwr <= 60 {
-            eprintln!("[swd] FIFOWR#{} raw={:#010x} len={} data={:#06x}", self.n_fwr, val, len, data);
+            eprintln!(
+                "[swd] FIFOWR#{} raw={:#010x} len={} data={:#06x}",
+                self.n_fwr, val, len, data
+            );
         }
         match &mut self.phase {
             Phase::Idle => {
@@ -148,14 +154,20 @@ impl RotSwdSpi {
                     // serve loop runs the actual transfer.
                     self.rx.push_back(ACK_OK);
                     if rnw {
-                        self.link.borrow_mut().req.push_back(SwdReq { ap, rnw: true, a, wdata: 0 });
+                        self.link.lock().req.push_back(SwdReq {
+                            ap,
+                            rnw: true,
+                            a,
+                            wdata: 0,
+                        });
                         // The SP thread drains SWD requests; it may be parked idle.
                         if let Some(l) = crate::sprot::link() {
                             l.wake_sp();
                         }
                         self.phase = Phase::ReadData;
                     } else {
-                        self.phase = Phase::WriteData { acc: 0, bits: 0, ap, a };
+                        self.phase =
+                            Phase::WriteData { acc: 0, bits: 0, ap, a };
                     }
                     if self.trace {
                         eprintln!(
@@ -179,7 +191,7 @@ impl RotSwdSpi {
                     let rev = ((*acc >> 1) & 0xFFFF_FFFF) as u32;
                     let wdata = rev.reverse_bits();
                     let (ap, a) = (*ap, *a);
-                    self.link.borrow_mut().req.push_back(SwdReq {
+                    self.link.lock().req.push_back(SwdReq {
                         ap,
                         rnw: false,
                         a,
@@ -189,7 +201,10 @@ impl RotSwdSpi {
                         l.wake_sp();
                     }
                     if self.trace {
-                        eprintln!("[swd] write ap={} a={:#x} data={:#010x}", ap as u8, a, wdata);
+                        eprintln!(
+                            "[swd] write ap={} a={:#x} data={:#010x}",
+                            ap as u8, a, wdata
+                        );
                     }
                     self.phase = Phase::Idle;
                 }
@@ -209,11 +224,7 @@ impl Mmio for RotSwdSpi {
             FIFOSTAT => {
                 self.maybe_supply_read_data();
                 FIFOSTAT_TXNOTFULL
-                    | if self.rx.is_empty() {
-                        0
-                    } else {
-                        FIFOSTAT_RXNOTEMPTY
-                    }
+                    | if self.rx.is_empty() { 0 } else { FIFOSTAT_RXNOTEMPTY }
             }
             FIFORD => {
                 self.maybe_supply_read_data();

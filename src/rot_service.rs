@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Shared RoT service: one emulated LPC55 (oxide-rot-1) that answers sprot
 //! request frames over a socket, so SP processes share one RoT instead of each
 //! running its own in-process two-core bridge. The wire is frame-level: a client
@@ -25,7 +29,12 @@ const MAX_FRAME: usize = 4096;
 /// the core signals idle (`idle_skip`, which it clears). Returns whether it idled.
 /// Shared by `rot_exchange`'s grind loop and the idle keep-alive loop. The preboot
 /// loop does not stop on idle, so it does not use this.
-fn run_quantum(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, n: u32) -> bool {
+fn run_quantum(
+    rc: &mut Cpu,
+    rb: &mut Bus,
+    host: &mut dyn HostIo,
+    n: u32,
+) -> bool {
     for _ in 0..n {
         if rc.step(rb, host).is_err() {
             break;
@@ -51,7 +60,12 @@ fn first_nonzero(buf: &[u8]) -> Option<usize> {
 /// Synthesizes the SP's side of the link: manipulates the shared `SprotLink`
 /// (mosi/cs/ssa) the way `SpiMaster` plus the soc CS driver would, and steps the
 /// RoT core (waking its FLEXCOMM8 irq) as `gdb::serve` does.
-fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -> Vec<u8> {
+fn rot_exchange(
+    rc: &mut Cpu,
+    rb: &mut Bus,
+    host: &mut dyn HostIo,
+    req: &[u8],
+) -> Vec<u8> {
     let link = crate::sprot::link().expect("sprot link enabled");
     {
         let mut lk = link.borrow_mut();
@@ -84,8 +98,12 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                     .collect(),
                 None => String::from("(all-zero)"),
             };
-            eprintln!("[rotsvc] grind it={it} phase2={phase2} resp={} first_nonzero@{:?} head={head} rot_pc={:#010x}",
-                resp.len(), nz, rc.pc);
+            eprintln!(
+                "[rotsvc] grind it={it} phase2={phase2} resp={} first_nonzero@{:?} head={head} rot_pc={:#010x}",
+                resp.len(),
+                nz,
+                rc.pc
+            );
         }
         // Phase 1: feed request bytes as the RoT drains mosi (16-byte FIFO cap);
         // deassert CS once the whole request is in and nearly drained.
@@ -128,16 +146,16 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
                 drop(lk);
                 continue;
             }
-            // Collect the reply only in phase 2: only after the RoT signalled it
-            // (rot-irq) and CS was reasserted for the reply-read transaction. Mirrors
+            // Collect the reply only in phase 2: only after the RoT signals it
+            // (rot-irq) and CS is reasserted for the reply-read transaction. Mirrors
             // the real SP, which never reads the reply before rot-irq. Draining
-            // `miso` during phase 1 grabbed the reply before the RoT had sent it in a
-            // transaction it was aware of, so the exchange returned while the RoT was
-            // still mid-reply; the next exchange's link reset then reasserted CS
-            // underneath it and it ground forever, never reading the follow-up
-            // request (the caboose's chunked read). Once the reply is complete
-            // (`done`), draining continues but discards, so trailing idle frames the
-            // RoT clocks during wind-down are not appended to the reply.
+            // `miso` during phase 1 grabs the reply before the RoT has sent it in a
+            // transaction it is aware of: the exchange returns while the RoT is
+            // still mid-reply, and the next exchange's link reset reasserts CS
+            // underneath it, leaving it grinding forever without reading the
+            // follow-up request. Once the reply is complete (`done`), draining
+            // continues but discards, so trailing idle frames the RoT clocks during
+            // wind-down are not appended to the reply.
             if phase2 {
                 while let Some(b) = lk.miso.pop_front() {
                     if !done {
@@ -153,35 +171,37 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         // first nonzero byte (the protocol version, 0x06). Find that start, then
         // header = version(u32) + body_size(u16); reply spans
         // start .. start+6+body_size+CRC(2).
-        if phase2 && total.is_none() {
-            if let Some(start) = first_nonzero(&resp) {
-                if resp.len() >= start + 6 {
-                    let body_size = u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
-                    let t = start + 6 + body_size + 2;
-                    if body_size + 8 <= MAX_RESP {
-                        total = Some(t);
-                    }
-                }
+        if phase2
+            && total.is_none()
+            && let Some(start) = first_nonzero(&resp)
+            && resp.len() >= start + 6
+        {
+            let body_size =
+                u16::from_le_bytes([resp[start + 4], resp[start + 5]]) as usize;
+            let t = start + 6 + body_size + 2;
+            if body_size + 8 <= MAX_RESP {
+                total = Some(t);
             }
         }
-        if let Some(t) = total {
-            if resp.len() >= t && !done {
-                // Strip the leading dummy frames so the returned reply starts at the
-                // protocol version, as the SP's sprot driver expects.
-                let start = first_nonzero(&resp).unwrap_or(0);
-                resp.drain(..start);
-                resp.truncate(t - start);
-                // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
-                // SSD (FLEXCOMM8 STAT bit5), completes, and deasserts rot-irq,
-                // returning it to idle, ready for the next request. Without this the
-                // RoT spins on the SSD poll forever and never services the following
-                // request (wedged the caboose read after boot-info).
-                let mut lk = link.borrow_mut();
-                lk.cs = false;
-                lk.ssa = false;
-                lk.ssd = true;
-                done = true;
-            }
+        if let Some(t) = total
+            && resp.len() >= t
+            && !done
+        {
+            // Strip the leading dummy frames so the returned reply starts at the
+            // protocol version, as the SP's sprot driver expects.
+            let start = first_nonzero(&resp).unwrap_or(0);
+            resp.drain(..start);
+            resp.truncate(t - start);
+            // End-of-transfer: deassert CS so the RoT's SPI transmit loop sees
+            // SSD (FLEXCOMM8 STAT bit5), completes, and deasserts rot-irq,
+            // returning it to idle, ready for the next request. Without the
+            // deassert the RoT spins on the SSD poll forever and never services
+            // the following request.
+            let mut lk = link.borrow_mut();
+            lk.cs = false;
+            lk.ssa = false;
+            lk.ssd = true;
+            done = true;
         }
         // After signalling end-of-transfer, let the RoT observe SSD and finish
         // (deassert rot-irq), then stop. The pend_irq above keeps stepping it while
@@ -200,7 +220,8 @@ fn rot_exchange(rc: &mut Cpu, rb: &mut Bus, host: &mut dyn HostIo, req: &[u8]) -
         }
     }
     if dbg() {
-        let hx: String = resp.iter().take(48).map(|b| format!("{b:02x}")).collect();
+        let hx: String =
+            resp.iter().take(48).map(|b| format!("{b:02x}")).collect();
         eprintln!(
             "[rotsvc] exchange: req {}B -> resp {}B [{hx}]",
             req.len(),
@@ -223,9 +244,18 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
     let (req_tx, req_rx) = mpsc::channel::<Job>();
     std::thread::spawn(move || {
         crate::sprot::enable();
-        let (mut rc, mut rb) = crate::build_rot_core(&image).expect("build RoT core");
+        // The worker owns the only RoT; without it every client would block
+        // on a reply that can never come, so a build failure ends the service.
+        let (mut rc, mut rb) = match crate::build_rot_core(&image) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[rotsvc] fatal: building the RoT core failed: {e}");
+                std::process::exit(1);
+            }
+        };
         let mut host = StdoutHost;
-        let preboot: u64 = crate::config::get().rot_preboot().unwrap_or(40_000_000);
+        let preboot: u64 =
+            crate::config::get().rot_preboot().unwrap_or(40_000_000);
         for _ in 0..preboot {
             if rc.step(&mut rb, &mut host).is_err() {
                 break;
@@ -241,6 +271,7 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
         // idempotent: true for the read/nonce'd sprot traffic, not for
         // state-mutating ops like RoT update.
         let mut cache: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut cache_hit_warned = false;
         // Drive the RoT continuously, like the in-process two-core bridge. Between
         // requests it keeps stepping so it finishes tearing down the prior reply and
         // returns to its sprot receive loop; otherwise it freezes mid-teardown the
@@ -251,7 +282,8 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
             match req_rx.try_recv() {
                 Ok((req, resp_tx)) => {
                     if dbg() {
-                        let hx: String = req.iter().map(|b| format!("{b:02x}")).collect();
+                        let hx: String =
+                            req.iter().map(|b| format!("{b:02x}")).collect();
                         eprintln!(
                             "[rotsvc] req mt={:#04x} len={} hex={hx} cache_hit={}",
                             req.get(6).copied().unwrap_or(0),
@@ -260,6 +292,14 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
                         );
                     }
                     let resp = if let Some(r) = cache.get(&req) {
+                        if !cache_hit_warned {
+                            cache_hit_warned = true;
+                            eprintln!(
+                                "[rotsvc] serving a cached reply for a \
+                                 repeated request; state-mutating sprot ops \
+                                 must not go through rot-serve"
+                            );
+                        }
                         r.clone()
                     } else {
                         let r = rot_exchange(&mut rc, &mut rb, &mut host, &req);
@@ -286,7 +326,8 @@ pub fn run(listen: &str, image: &[u8]) -> Result<()> {
             }
         }
     });
-    let l = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
+    let l =
+        TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
     eprintln!("[rotsvc] listening on {listen} (RoT prebooting in background)");
     for conn in l.incoming() {
         let s = match conn {
@@ -339,10 +380,7 @@ pub struct RotClient {
 }
 impl RotClient {
     pub fn connect(addr: &str) -> Self {
-        let mut c = RotClient {
-            addr: addr.to_string(),
-            stream: None,
-        };
+        let mut c = RotClient { addr: addr.to_string(), stream: None };
         c.ensure();
         c
     }
@@ -354,7 +392,9 @@ impl RotClient {
                     eprintln!("[rotclient] connected to {}", self.addr);
                     self.stream = Some(s);
                 }
-                Err(e) => eprintln!("[rotclient] connect {} failed: {e}", self.addr),
+                Err(e) => {
+                    eprintln!("[rotclient] connect {} failed: {e}", self.addr)
+                }
             }
         }
     }

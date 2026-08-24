@@ -1,14 +1,18 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Emulated ARM debug port: an ADIv5 SW-DP + MEM-AP with a working debug core.
 //!
 //! This is the register-level model probe-rs drives over SWD. The Glasgow-applet
 //! server (`glasgow.rs`) decodes `CMD_TRANSFER` into calls to [`SwDp::transfer`];
-//! a later phase can drive the same model from the emulated RoT. Unlike a
-//! read-only, memory-only stub, this offers a *real* debug core — halt/run/step
-//! plus register access via DCRSR/DCRDR — which is what hiffy (halt, write
-//! program, run, read results) and endoscope need.
+//! a later phase can drive the same model from the emulated RoT. This is a
+//! working debug core, not a read-only memory stub: halt/run/step plus register
+//! access via DCRSR/DCRDR, which is what hiffy (halt, write program, run, read
+//! results) and endoscope need.
 //!
-//! sp-emu speaks the Glasgow *applet* protocol, not raw SWD line bits, so there
-//! is no parity/turnaround/clocking here — just ADIv5 register semantics.
+//! sp-emu speaks the Glasgow applet protocol, not raw SWD line bits, so there
+//! is no parity/turnaround/clocking here, just ADIv5 register semantics.
 
 use crate::cpu::Cpu;
 use crate::mem::Bus;
@@ -63,8 +67,8 @@ const S_RESET_ST: u32 = 1 << 25;
 const AIRCR: u32 = 0xE000_ED0C;
 const AIRCR_VECTKEY: u32 = 0x05FA_0000;
 const AIRCR_SYSRESETREQ: u32 = 1 << 2;
-// DEMCR.VC_CORERESET (bit0): vector catch — halt at the reset vector instead of
-// running. probe-rs sets it via reset_catch_set for reset-and-halt / endoscope.
+// DEMCR.VC_CORERESET (bit0): vector catch, halting at the reset vector instead
+// of running. probe-rs sets it via reset_catch_set for reset-and-halt / endoscope.
 const VC_CORERESET: u32 = 1 << 0;
 // Slot-A boot vector table (XIP flash): [0]=initial SP, [1]=reset PC.
 const VECTOR_TABLE: u32 = 0x0800_0000;
@@ -80,22 +84,26 @@ const SP_MEASUREMENT_SKIP: u32 = 0x9f38_bd71;
 pub enum Ack {
     /// Read data (`Some`) or a write acknowledgement (`None`).
     Ok(Option<u32>),
+    /// Protocol acks the applet response encoding defines; the modeled DP
+    /// answers immediately and faults nothing, so nothing constructs them.
+    #[allow(dead_code)]
     Wait,
+    #[allow(dead_code)]
     Fault,
 }
 
 /// A SW-DP with a single MEM-AP, plus the CoreDebug semantics behind it.
 pub struct SwDp {
-    select: u32,        // DP SELECT: APSEL[31:24] / APBANKSEL[7:4] / DPBANKSEL[3:0]
-    ctrl_stat: u32,     // last CTRL/STAT write (its power-req bits drive the ack echo)
-    posted: u32,        // pipelined AP-read result (returned by the next AP read / RDBUFF)
-    csw: u32,           // MEM-AP CSW (size + address-increment)
-    tar: u32,           // MEM-AP TAR (transfer address)
-    dcrdr: u32,         // DCRDR shadow for DCRSR register-file access
-    demcr: u32,         // DEMCR (VC_CORERESET drives halt-after-reset)
-    dhcsr_ctrl: u32,    // C_DEBUGEN|C_HALT|C_MASKINTS echoed back on DHCSR read
+    select: u32, // DP SELECT: APSEL[31:24] / APBANKSEL[7:4] / DPBANKSEL[3:0]
+    ctrl_stat: u32, // last CTRL/STAT write (its power-req bits drive the ack echo)
+    posted: u32, // pipelined AP-read result (returned by the next AP read / RDBUFF)
+    csw: u32,    // MEM-AP CSW (size + address-increment)
+    tar: u32,    // MEM-AP TAR (transfer address)
+    dcrdr: u32,  // DCRDR shadow for DCRSR register-file access
+    demcr: u32,  // DEMCR (VC_CORERESET drives halt-after-reset)
+    dhcsr_ctrl: u32, // C_DEBUGEN|C_HALT|C_MASKINTS echoed back on DHCSR read
     reset_sticky: bool, // a reset happened; reported once as DHCSR.S_RESET_ST then cleared
-    vcatch_halt: bool,  // the current halt came from a reset vector catch (reported as DFSR.VCATCH)
+    vcatch_halt: bool, // the current halt came from a reset vector catch (reported as DFSR.VCATCH)
     /// Set by a DHCSR resume-with-C_STEP; the server steps one instruction then
     /// re-halts. Free-run (no step) is driven by `cpu.halted` directly.
     pub step_request: bool,
@@ -172,7 +180,14 @@ impl SwDp {
         }
     }
 
-    fn ap_transfer(&mut self, cpu: &mut Cpu, bus: &mut Bus, rnw: bool, a: u8, wdata: u32) -> Ack {
+    fn ap_transfer(
+        &mut self,
+        cpu: &mut Cpu,
+        bus: &mut Bus,
+        rnw: bool,
+        a: u8,
+        wdata: u32,
+    ) -> Ack {
         let apbanksel = (self.select >> 4) & 0xF;
         let reg = (apbanksel << 4) | (a as u32 & 0x0C); // AP register offset
 
@@ -185,7 +200,7 @@ impl SwDp {
                 0x04 => self.tar,
                 0x0C => self.drw_read(cpu, bus), // DRW
                 0xFC => AP_IDR,                  // IDR (bank 0xF)
-                _ => 0,                          // BASE (no ROM table) and others
+                _ => 0, // BASE (no ROM table) and others
             };
             Ack::Ok(Some(out))
         } else {
@@ -261,8 +276,8 @@ impl SwDp {
             DEMCR => self.demcr,
             DCRSR => 0,
             // Synthesize the halt reason from live state. Real DFSR bits are
-            // sticky/W1C; modeling it as plain storage let probe-rs's own
-            // "clear DFSR" write (0x1F) read back as a breakpoint.
+            // sticky/W1C; plain storage would let probe-rs's own "clear DFSR"
+            // write (0x1F) read back as a breakpoint hit.
             DFSR => {
                 if cpu.bkpt_hit {
                     DFSR_BKPT
@@ -278,7 +293,13 @@ impl SwDp {
         }
     }
 
-    fn mem_write_word(&mut self, cpu: &mut Cpu, bus: &mut Bus, addr: u32, val: u32) {
+    fn mem_write_word(
+        &mut self,
+        cpu: &mut Cpu,
+        bus: &mut Bus,
+        addr: u32,
+        val: u32,
+    ) {
         match addr {
             DHCSR => self.write_dhcsr(cpu, val),
             DCRSR => self.write_dcrsr(cpu, val),
@@ -286,16 +307,22 @@ impl SwDp {
             DEMCR => self.demcr = val,
             DFSR => {} // write-1-to-clear; the read reflects live halt state
             AIRCR => {
-                if (val & 0xFFFF_0000) == AIRCR_VECTKEY && val & AIRCR_SYSRESETREQ != 0 {
+                if (val & 0xFFFF_0000) == AIRCR_VECTKEY
+                    && val & AIRCR_SYSRESETREQ != 0
+                {
                     self.do_reset(cpu, bus);
                 }
             }
             SP_MEASUREMENT_ADDR if val == SP_MEASUREMENT_VALID => {
-                eprintln!("[rot] SP measurement recorded: VALID token deposited at {SP_MEASUREMENT_ADDR:#010x}");
+                eprintln!(
+                    "[rot] SP measurement recorded: VALID token deposited at {SP_MEASUREMENT_ADDR:#010x}"
+                );
                 bus.write32(addr, val);
             }
             SP_MEASUREMENT_ADDR if val == SP_MEASUREMENT_SKIP => {
-                eprintln!("[rot] SP measurement skipped: SKIP token deposited at {SP_MEASUREMENT_ADDR:#010x}");
+                eprintln!(
+                    "[rot] SP measurement skipped: SKIP token deposited at {SP_MEASUREMENT_ADDR:#010x}"
+                );
                 bus.write32(addr, val);
             }
             _ => bus.write32(addr, val),
@@ -443,10 +470,7 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.reset_for_reboot(0x2000_1000, 0x0800_0100);
         let mut swdp = SwDp::new(); // demcr == 0
-        assert!(
-            !swdp.honor_vector_catch(&mut cpu),
-            "unarmed catch is a no-op"
-        );
+        assert!(!swdp.honor_vector_catch(&mut cpu), "unarmed catch is a no-op");
         assert!(!cpu.halted, "core keeps running from the reset vector");
         assert!(!swdp.vcatch_halt);
         assert!(!swdp.reset_sticky, "an unarmed no-op does not mark a reset");
