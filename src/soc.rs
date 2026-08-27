@@ -1574,18 +1574,33 @@ pub(crate) fn tlvc_chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// STM32H7 HASH (0x4802_1400, irq 80). Minimal model so drv-stm32h7-hash
-/// completes: report DINIS (ready for data) + not BUSY, and when the driver
-/// writes STR.DCAL (start digest) set SR.DCIS and raise irq 80 so its
-/// `sys_recv_notification` wakes. Returns a fixed digest: MGS only records the
-/// phase1 hash for inventory; it is not checked against the flash here.
+/// STM32H7 HASH (0x4802_1400, irq 80). Computes a real SHA-256 so the host
+/// phase 1 hash the SP reports matches the flash contents: Nexus compares it
+/// against TUF artifact hashes to identify the slot. drv-stm32h7-hash feeds
+/// DIN by CPU (no DMA) with DATATYPE=0b10, so accumulating each DIN word
+/// little-endian reproduces the message byte stream. On STR.DCAL the digest
+/// is computed, SR.DCIS set and irq 80 raised for `sys_recv_notification`.
+/// The driver reads HR words with `u32::from_be`, so each register holds a
+/// big-endian digest word. NBLW is honored for a partial last word, though
+/// every current caller hashes word-aligned data; the driver's STR.modify
+/// for DCAL rewrites NBLW from this model's zero STR read-back, which is
+/// only correct because of that alignment.
 struct Hash {
     irq_pending: bool,
     dcis: bool,
+    buf: Vec<u8>,
+    nblw: u32,
+    digest: [u32; 8],
 }
 impl Hash {
     pub fn new() -> Self {
-        Hash { irq_pending: false, dcis: false }
+        Hash {
+            irq_pending: false,
+            dcis: false,
+            buf: Vec::new(),
+            nblw: 0,
+            digest: [0; 8],
+        }
     }
 }
 impl Mmio for Hash {
@@ -1595,8 +1610,14 @@ impl Mmio for Hash {
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
             0x24 => (1 << 0) | if self.dcis { 1 << 1 } else { 0 }, // SR: DINIS + DCIS, BUSY=0
-            0x0C | 0x10 | 0x14 | 0x18 | 0x1C => 0xA5A5_A5A5,       // HR0-4
-            o if (0x310..=0x32C).contains(&o) => 0xA5A5_A5A5, // HR0-7 alias (SHA-256)
+            // HR0-4 (SHA-1 view): the leading words of the digest.
+            o @ (0x0C | 0x10 | 0x14 | 0x18 | 0x1C) => {
+                self.digest[((o - 0x0C) / 4) as usize]
+            }
+            // HR0-7 alias (SHA-256 view), what drv-stm32h7-hash reads.
+            o if (0x310..=0x32C).contains(&o) => {
+                self.digest[((o - 0x310) / 4) as usize]
+            }
             _ => 0,
         }
     }
@@ -1604,13 +1625,34 @@ impl Mmio for Hash {
         match off & !3 {
             0x00 => {
                 if val & (1 << 2) != 0 {
+                    // CR.INIT: reset the accumulator.
+                    self.buf.clear();
+                    self.nblw = 0;
                     self.dcis = false;
                 }
-            } // CR.INIT
-            0x08 if val & (1 << 8) != 0 => {
-                self.dcis = true;
-                self.irq_pending = true;
-            } // STR.DCAL
+            }
+            0x04 => self.buf.extend_from_slice(&val.to_le_bytes()), // DIN
+            0x08 => {
+                self.nblw = val & 0x1F;
+                if val & (1 << 8) != 0 {
+                    // STR.DCAL: drop the invalid tail of a partial last
+                    // word, then compute the digest.
+                    if self.nblw != 0 {
+                        let drop = 4 - (self.nblw / 8) as usize;
+                        self.buf.truncate(self.buf.len().saturating_sub(drop));
+                    }
+                    use sha2::{Digest, Sha256};
+                    let d = Sha256::digest(&self.buf);
+                    for (i, w) in self.digest.iter_mut().enumerate() {
+                        *w = u32::from_be_bytes(
+                            d[i * 4..i * 4 + 4].try_into().unwrap(),
+                        );
+                    }
+                    self.buf.clear();
+                    self.dcis = true;
+                    self.irq_pending = true;
+                }
+            }
             _ => {}
         }
     }
