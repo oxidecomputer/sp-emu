@@ -28,3 +28,35 @@ jobs:
         run: cargo build --workspace
       - name: test
         run: cargo test --workspace
+
+  # Best-effort binaries for people hacking on sp-emu standalone; voxel only
+  # ever fetches the blessed buildomat helios-3.0 artifact, so these carry no
+  # pinning or compatibility obligations. arm lives here because buildomat has
+  # no arm runners (its targets are helios and x86 ubuntu).
+  artifacts:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            label: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            label: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: build
+        run: cargo build --locked --release --bin sp-emu
+      - name: test
+        run: cargo test --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sp-emu-${{ matrix.label }}
+          path: target/release/sp-emu
+          if-no-files-found: error
