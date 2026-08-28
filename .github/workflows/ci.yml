@@ -29,17 +29,21 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-  # buildomat has no arm runners (its targets are helios and x86 ubuntu), so
-  # arm64 builds come from GitHub's runners and are kept as run artifacts.
-  arm:
+  # Best-effort binaries for people hacking on sp-emu standalone; voxel only
+  # ever fetches the blessed buildomat helios-3.0 artifact, so these carry no
+  # pinning or compatibility obligations. arm lives here because buildomat has
+  # no arm runners (its targets are helios and x86 ubuntu).
+  artifacts:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
-            label: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            label: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             label: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            label: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
