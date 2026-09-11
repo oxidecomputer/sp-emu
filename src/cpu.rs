@@ -2585,6 +2585,10 @@ fn shift_c(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> (u32, bool) {
                 (r, (r >> 31) & 1 != 0)
             }
         }
+        ShiftStyle::RRX => {
+            assert_eq!(amt, 0);
+            (v, (v >> 31) & 1 != 0)
+        }
     }
 }
 
