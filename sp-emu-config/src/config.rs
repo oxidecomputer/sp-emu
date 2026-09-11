@@ -89,6 +89,7 @@ config! {
     // ---- host UART / IPCC ----
     [ostr] host_uart: Option<String>,
     [val] host_pty: bool,
+    [ostr] host_power: Option<String>,
 
     // ---- companion I2C bridge ----
     [ostr] i2c_bridge: Option<String>,
