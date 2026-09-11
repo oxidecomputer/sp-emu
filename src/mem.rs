@@ -24,6 +24,8 @@ pub trait Mmio {
     fn take_irq(&mut self) -> Option<u16> {
         None
     }
+    /// Return to power-on state. Default: nothing to reset.
+    fn reset(&mut self) {}
 }
 
 struct Ram {
@@ -818,6 +820,13 @@ impl Bus {
 
     pub fn add_ram(&mut self, base: u32, size: u32) {
         self.rams.push(Ram { base, data: vec![0u8; size as usize] });
+    }
+
+    /// Reset every device, as an SP reset does to the parts it holds in reset.
+    pub fn reset_devices(&mut self) {
+        for d in &mut self.devs {
+            d.dev.reset();
+        }
     }
 
     pub fn add_device(&mut self, base: u32, size: u32, dev: Box<dyn Mmio>) {

@@ -315,7 +315,7 @@ fn cobs_frame(target: u8, data: &[u8]) -> Vec<u8> {
 
 /// COBS-encode `data` (no trailing delimiter). See the algorithm in
 /// probe-rs's `cobs` dependency; kept inline to avoid a new crate.
-fn cobs_encode(data: &[u8]) -> Vec<u8> {
+pub(crate) fn cobs_encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + data.len() / 254 + 2);
     let mut code_idx = out.len();
     out.push(0); // placeholder for the block's code byte
@@ -343,7 +343,7 @@ fn cobs_encode(data: &[u8]) -> Vec<u8> {
 
 /// COBS-decode one frame (delimiter already stripped). Returns None on a
 /// malformed frame.
-fn cobs_decode(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn cobs_decode(data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {

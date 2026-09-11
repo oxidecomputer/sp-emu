@@ -70,6 +70,7 @@ pub fn ingest(ext: ConfigFileV1) -> Result<Config, ConfigError> {
         // host UART / IPCC
         host_uart: host.uart,
         host_pty: host.pty.unwrap_or(false),
+        host_power: nonempty(host.power),
 
         // companion I2C bridge (empty treated as unset)
         i2c_bridge: nonempty(i2c.bridge),

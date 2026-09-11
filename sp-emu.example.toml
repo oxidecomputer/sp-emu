@@ -42,6 +42,7 @@ SP_EMU_ROT_ROM   = true   # boot-ROM skboot_authenticate shim (required in serve
 
 # ---- IPCC / host console ----
 SP_EMU_HOST_PTY = true    # expose the host-SP UART as a pty for faux-ipcc
+# SP_EMU_HOST_POWER = "[::1]:33312"   # serve the host power bridge here
 
 # ---- per-instance identity and VPD (give each instance in a fleet its own) ----
 # SP_EMU_SEED       = "0123456789abcdef"  # derives UID / UUID / DICE / PUF / MAC
