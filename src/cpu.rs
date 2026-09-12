@@ -549,12 +549,16 @@ impl Cpu {
         res
     }
 
-    /// ARMv8-M load-acquire / store-release (LDA/STL + B/H + LDAEX/STLEX), which
-    /// yaxpeax's ARMv7 decoder rejects. The LPC55 RoT (Cortex-M33) uses these for
-    /// atomics/sync. On a single-core emulator the acquire/release/exclusive
-    /// semantics reduce to plain loads/stores (exclusives always succeed).
+    /// ARMv8-M load-acquire / store-release (LDA/STL + B/H + LDAEX/STLEX). The
+    /// LPC55 RoT (Cortex-M33) uses these for atomics/sync. On a single-core
+    /// emulator the acquire/release/exclusive semantics reduce to plain
+    /// loads/stores (exclusives always succeed). Callers reach this two ways:
+    /// the opcode match, for a decoder that names these opcodes, and the
+    /// decode-failure path, for a decoder that rejects them.
     /// hw1 = 1110_1000_110L_Rnnn (0xE8C0 store, 0xE8D0 load); hw2[11:8]=1111,
-    /// hw2[7:4] = size/exclusive selector.
+    /// hw2[7:4] = size/exclusive selector. Encodings: DDI0553B.s C2.4.68-73
+    /// (LDA, LDAB, LDAEX, LDAEXB, LDAEXH, LDAH) and C2.4.216-221 (STL, STLB,
+    /// STLEX, STLEXB, STLEXH, STLH).
     fn try_v8m(&mut self, raw: u32, pc: u32, bus: &mut Bus) -> bool {
         let hw1 = (raw & 0xFFFF) as u16;
         let hw2 = ((raw >> 16) & 0xFFFF) as u16;
@@ -1139,6 +1143,23 @@ impl Cpu {
                 Ok(())
             }
 
+            // ARMv8-M load-acquire / store-release, exclusive and plain:
+            // try_v8m reads the encoding directly.
+            Opcode::LDAEX
+            | Opcode::LDAEXB
+            | Opcode::LDAEXH
+            | Opcode::STLEX
+            | Opcode::STLEXB
+            | Opcode::STLEXH
+            | Opcode::LDA
+            | Opcode::LDAB
+            | Opcode::LDAH
+            | Opcode::STL
+            | Opcode::STLB
+            | Opcode::STLH => {
+                self.try_v8m(raw, pc, bus).then_some(()).ok_or(())
+            }
+
             Opcode::CBZ => {
                 if self.read_reg(reg(&ops[0])?) == 0 {
                     self.pc = cbz_target(raw, pc);
@@ -1618,11 +1639,13 @@ impl Cpu {
                         self.r[sh.shiftee().number() as usize],
                         sh.stype(),
                         sh.imm() as u32,
+                        self.c,
                     ),
                     RegShiftStyle::RegReg(sh) => do_shift(
                         self.r[sh.shiftee().number() as usize],
                         sh.stype(),
                         self.r[sh.shifter().number() as usize] & 0xff,
+                        self.c,
                     ),
                 };
                 let ea = if *add {
@@ -2476,11 +2499,13 @@ impl Cpu {
                     self.read_reg(s.shiftee().number()),
                     s.stype(),
                     s.imm() as u32,
+                    self.c,
                 ),
                 RegShiftStyle::RegReg(s) => do_shift(
                     self.read_reg(s.shiftee().number()),
                     s.stype(),
                     self.read_reg(s.shifter().number()) & 0xff,
+                    self.c,
                 ),
             }),
             _ => Err(()),
@@ -2540,13 +2565,22 @@ enum Alu {
     Bic,
 }
 
-fn do_shift(v: u32, style: ShiftStyle, amt: u32) -> u32 {
-    shift_c(v, style, amt, false).0
+/// Shift an operand and discard the carry-out. RRX rotates the carry in, so
+/// callers pass the core's current `C`.
+fn do_shift(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> u32 {
+    shift_c(v, style, amt, cin).0
 }
 
-/// ARM Shift_C: shift with carry-out (the bit last shifted out). `amt == 0`
-/// leaves the value and carry unchanged.
+/// ARM Shift_C (DDI0553B.s E2.1.372): shift with carry-out (the bit last
+/// shifted out). `amt == 0` leaves the value and carry unchanged, except for
+/// RRX, which rotates through carry by one bit whatever amount arrives.
 fn shift_c(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> (u32, bool) {
+    // RRX rotates through carry by one bit (E2.1.348 RRX_C). DecodeImmShift
+    // (E2.1.92) pairs it with an amount of 1, and yaxpeax reports 0, so key on
+    // the style and run before the early return that treats 0 as a no-op.
+    if matches!(style, ShiftStyle::RRX) {
+        return (((cin as u32) << 31) | (v >> 1), v & 1 != 0);
+    }
     if amt == 0 {
         return (v, cin);
     }
@@ -2585,10 +2619,7 @@ fn shift_c(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> (u32, bool) {
                 (r, (r >> 31) & 1 != 0)
             }
         }
-        ShiftStyle::RRX => {
-            assert_eq!(amt, 0);
-            (v, (v >> 31) & 1 != 0)
-        }
+        ShiftStyle::RRX => unreachable!("RRX is handled before the match"),
     }
 }
 
@@ -3012,6 +3043,91 @@ mod tests {
         assert!(cpu.step(&mut bus, &mut host).is_ok());
         assert_eq!(cpu.r[2], 0x8000_0001);
         assert!(cpu.c, "non-S form leaves carry unchanged");
+    }
+
+    /// Exclusive byte atomics reach try_v8m through the opcode match, the path
+    /// taken when the decoder names these opcodes. STLEX reports success by
+    /// writing zero to its status register.
+    #[test]
+    fn stlexb_stores_and_ldaexb_reads_it_back() {
+        let mut bus = ram_bus();
+        // STLEXB r3, r2, [r1] = e8c1 2fc3; LDAEXB r4, [r1] = e8d1 4fcf.
+        bus.write16(RAM, 0xe8c1);
+        bus.write16(RAM + 2, 0x2fc3);
+        bus.write16(RAM + 4, 0xe8d1);
+        bus.write16(RAM + 6, 0x4fcf);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.r[1] = RAM + 0x100;
+        cpu.r[2] = 0xDEAD_BEAB;
+        cpu.r[3] = 0xFFFF_FFFF;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(
+            bus.read8(RAM + 0x100),
+            0xAB,
+            "byte store truncates to rt[7:0]"
+        );
+        assert_eq!(cpu.r[3], 0, "the monitor always grants the exclusive");
+        assert_eq!(cpu.pc, RAM + 4);
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.r[4], 0xAB, "byte load zero-extends");
+    }
+
+    /// The word-size acquire/release forms carry no size suffix, so they decode
+    /// as their own opcodes rather than as members of the B/H family. A `u32`
+    /// atomic uses these forms, so the RoT reaches them first.
+    #[test]
+    fn stl_and_lda_move_a_whole_word() {
+        let mut bus = ram_bus();
+        // STL r2, [r1] = e8c1 2faf; LDA r3, [r1] = e8d1 3faf.
+        bus.write16(RAM, 0xe8c1);
+        bus.write16(RAM + 2, 0x2faf);
+        bus.write16(RAM + 4, 0xe8d1);
+        bus.write16(RAM + 6, 0x3faf);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.r[1] = RAM + 0x100;
+        cpu.r[2] = 0x1122_3344;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(bus.read32(RAM + 0x100), 0x1122_3344);
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        assert_eq!(cpu.r[3], 0x1122_3344);
+    }
+
+    /// An RRX-shifted operand reaches shift_c through `opval`. yaxpeax 0.5.0
+    /// reports the style as RRX where 0.4.0 reported ROR by 0, so before the
+    /// style became visible this instruction ran as a no-op shift.
+    #[test]
+    fn add_with_an_rrx_shifted_operand() {
+        let mut bus = ram_bus();
+        // T2 ADD.W r0, r1, r2, RRX = eb01 0032.
+        bus.write16(RAM, 0xeb01);
+        bus.write16(RAM + 2, 0x0032);
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        cpu.r[1] = 0x0000_0010;
+        cpu.r[2] = 0x0000_0003;
+        cpu.c = true;
+        let mut host = StdoutHost;
+        assert!(cpu.step(&mut bus, &mut host).is_ok());
+        // RRX(0x0000_0003) with C=1 is 0x8000_0001.
+        assert_eq!(cpu.r[0], 0x8000_0011);
+    }
+
+    /// RRX as the shift on a data-processing operand goes through shift_c,
+    /// a different path from the standalone RRX instruction.
+    #[test]
+    fn rrx_shifted_operand_rotates_through_carry() {
+        // carry in set: 0x0000_0003 RRX -> 0x8000_0001, carry out = 1
+        let (r, c) = shift_c(0x0000_0003, ShiftStyle::RRX, 0, true);
+        assert_eq!(r, 0x8000_0001);
+        assert!(c, "bit 0 shifts out into carry");
+        // carry in clear: 0x0000_0002 RRX -> 0x0000_0001, carry out = 0
+        let (r, c) = shift_c(0x0000_0002, ShiftStyle::RRX, 0, false);
+        assert_eq!(r, 0x0000_0001);
+        assert!(!c);
     }
 
     /// SMLABB/BT/TB/TT multiply the selected signed halfwords of Rn and Rm
