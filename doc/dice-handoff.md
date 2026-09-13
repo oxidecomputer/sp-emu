@@ -70,9 +70,9 @@ Four pieces were needed:
    CTRL bit6.
 3. **UMAAL** (`src/cpu.rs`): the Ed25519 field-mul instruction, previously UNIMPL,
    needed for the DICE key derivation.
-4. **T3 MOV-immediate-shift decode** (`src/cpu.rs`): yaxpeax mis-decodes
-   `MOV.w Rd, Rm, ror #imm` as ASR; fixed in `t2_reg_shift_style`. This one broke
-   PlatformId validation (the `_` arm's index dispatch), panicking at mfg.rs:77.
+4. **T3 MOV-immediate-shift** (`src/cpu.rs`): `MOV.w Rd, Rm, ror #imm` executed
+   as ASR. This one broke PlatformId validation (the `_` arm's index dispatch),
+   panicking at mfg.rs:77.
 
 Also: `SP_EMU_ROT_PREBOOT` (default 400M) gives the crypto-heavy startup room.
 

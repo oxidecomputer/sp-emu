@@ -6,9 +6,11 @@
 //! execution set Hubris uses, IT blocks, the M-profile system registers, and
 //! the exception entry/return + SVC machinery to reach the first task.
 //!
-//! Decode is `yaxpeax-arm`. Execution semantics are hand-written.
-//! yaxpeax decodes M-profile MRS/MSR with A-profile semantics, so those two are
-//! re-decoded from the raw instruction word here.
+//! Decode is `yaxpeax-arm`. Execution semantics are hand-written. A few
+//! fields are read from the raw instruction word rather than the decoded
+//! operands: the M-profile MRS/MSR SYSm, the 16-bit STMIA mode, BFC's msb,
+//! branch targets, and 32-bit load/store addressing. VFP and the ARMv8-M
+//! acquire/release family execute from the raw word as well.
 
 use crate::host::HostIo;
 use crate::mem::Bus;
@@ -139,7 +141,7 @@ struct Decoded {
     raw: u32, // the 32-bit little-endian instruction word (operands re-read from this)
     buf: [u8; 4], // the raw bytes (for Trap reporting)
     len: u32, // encoded length (2 or 4)
-    inst: Option<yaxpeax_arm::armv7::Instruction>, // None => yaxpeax Err (VFP / try_vfp on raw)
+    inst: Option<yaxpeax_arm::armv7::Instruction>, // None => decode error (VFP; try_vfp executes from raw)
 }
 
 const SP: usize = 13;
@@ -552,9 +554,8 @@ impl Cpu {
     /// ARMv8-M load-acquire / store-release (LDA/STL + B/H + LDAEX/STLEX). The
     /// LPC55 RoT (Cortex-M33) uses these for atomics/sync. On a single-core
     /// emulator the acquire/release/exclusive semantics reduce to plain
-    /// loads/stores (exclusives always succeed). Callers reach this two ways:
-    /// the opcode match, for a decoder that names these opcodes, and the
-    /// decode-failure path, for a decoder that rejects them.
+    /// loads/stores (exclusives always succeed). Reached from the opcode match
+    /// in `execute` and from the decode-failure path in `step`.
     /// hw1 = 1110_1000_110L_Rnnn (0xE8C0 store, 0xE8D0 load); hw2[11:8]=1111,
     /// hw2[7:4] = size/exclusive selector. Encodings: DDI0553B.s C2.4.68-73
     /// (LDA, LDAB, LDAEX, LDAEXB, LDAEXH, LDAH) and C2.4.216-221 (STL, STLB,
@@ -629,8 +630,7 @@ impl Cpu {
     ) -> Result<(), ()> {
         let ops = &inst.operands;
         // ARM rule: 16-bit flag-setting data-processing instructions inside an
-        // IT block do not update the flags (the implicit S is suppressed). yaxpeax
-        // still reports them as `movs`/`adds` etc., so suppress here.
+        // IT block do not update the flags (the implicit S is suppressed).
         let s = inst.s && !(self.cur_in_it && len == 2);
         self.cur_setflags = s; // so alu()/shift_op() honor the IT-block suppression too
         match inst.opcode {
@@ -709,8 +709,6 @@ impl Cpu {
                 self.ldmia_regs(bus, SP as u8, reglist(&ops[0])?, true)
             }
 
-            // yaxpeax's LDM/STM (add, pre) tuple is unreliable (it reports 16-bit
-            // STMIA as increment-before), so decode the addressing mode from raw.
             Opcode::STM(..) => {
                 let (rn, wb) = regwback(&ops[0])?;
                 let (add, pre) = ldm_stm_mode(raw, len);
@@ -740,16 +738,7 @@ impl Cpu {
 
             Opcode::MOV => {
                 let rd = reg(&ops[0])?;
-                // yaxpeax mis-decodes two encodings here: the MOVW imm4 field
-                // (shifts by 16 not 12), and MVN-modified-immediate (reports it
-                // as MOV). Both surface as Opcode::MOV, so disambiguate via raw.
-                let val = if raw & 0xFBF0 == 0xF240 {
-                    movw_movt_imm16(raw) // MOVW: 16-bit immediate
-                } else if raw & 0xFBEF == 0xF06F {
-                    !self.opval(&ops[1])? // really MVN #imm
-                } else {
-                    self.opval(&ops[1])?
-                };
+                let val = self.opval(&ops[1])?;
                 self.write_reg(rd, val);
                 if s {
                     // Divergence: MOVS/MVNS with a modified immediate do not
@@ -760,7 +749,7 @@ impl Cpu {
             }
             Opcode::MOVT => {
                 let rd = reg(&ops[0])?;
-                let imm16 = movw_movt_imm16(raw); // same yaxpeax quirk as MOVW
+                let imm16 = self.opval(&ops[1])?;
                 let cur = self.read_reg(rd);
                 self.write_reg(rd, (cur & 0xffff) | (imm16 << 16));
                 Ok(())
@@ -786,18 +775,10 @@ impl Cpu {
             Opcode::EOR => self.alu(ops, Alu::Eor),
             Opcode::BIC => self.alu(ops, Alu::Bic),
 
-            // yaxpeax 0.4 mis-decodes the shift TYPE of the 32-bit register-form
-            // shift (T2: `LSL/LSR/ASR/ROR.w Rd, Rn, Rm`); e.g. it reports `lsr.w`
-            // as `lsl.w`. The type lives in raw hw1 bits[6:5]; decode it from there.
-            Opcode::LSL | Opcode::LSR | Opcode::ASR | Opcode::ROR => {
-                let dflt = match inst.opcode {
-                    Opcode::LSL => ShiftStyle::LSL,
-                    Opcode::LSR => ShiftStyle::LSR,
-                    Opcode::ASR => ShiftStyle::ASR,
-                    _ => ShiftStyle::ROR,
-                };
-                self.shift_op(ops, t2_reg_shift_style(raw, len).unwrap_or(dflt))
-            }
+            Opcode::LSL => self.shift_op(ops, ShiftStyle::LSL),
+            Opcode::LSR => self.shift_op(ops, ShiftStyle::LSR),
+            Opcode::ASR => self.shift_op(ops, ShiftStyle::ASR),
+            Opcode::ROR => self.shift_op(ops, ShiftStyle::ROR),
 
             Opcode::RRX => {
                 // RRX rd, rm: rotate right by one through carry. The S form
@@ -839,18 +820,18 @@ impl Cpu {
             }
 
             // Extends (optionally with a rotate, and the "A" add forms).
-            Opcode::UXTB => self.extend(ops, 8, false, false, raw, len),
-            Opcode::UXTH => self.extend(ops, 16, false, false, raw, len),
-            Opcode::SXTB => self.extend(ops, 8, true, false, raw, len),
-            Opcode::SXTH => self.extend(ops, 16, true, false, raw, len),
-            Opcode::UXTAB => self.extend(ops, 8, false, true, raw, len),
-            Opcode::UXTAH => self.extend(ops, 16, false, true, raw, len),
-            Opcode::SXTAB => self.extend(ops, 8, true, true, raw, len),
-            Opcode::SXTAH => self.extend(ops, 16, true, true, raw, len),
-            Opcode::UXTB16 => self.extend16(ops, false, false, raw),
-            Opcode::SXTB16 => self.extend16(ops, true, false, raw),
-            Opcode::UXTAB16 => self.extend16(ops, false, true, raw),
-            Opcode::SXTAB16 => self.extend16(ops, true, true, raw),
+            Opcode::UXTB => self.extend(ops, 8, false, false),
+            Opcode::UXTH => self.extend(ops, 16, false, false),
+            Opcode::SXTB => self.extend(ops, 8, true, false),
+            Opcode::SXTH => self.extend(ops, 16, true, false),
+            Opcode::UXTAB => self.extend(ops, 8, false, true),
+            Opcode::UXTAH => self.extend(ops, 16, false, true),
+            Opcode::SXTAB => self.extend(ops, 8, true, true),
+            Opcode::SXTAH => self.extend(ops, 16, true, true),
+            Opcode::UXTB16 => self.extend16(ops, false, false),
+            Opcode::SXTB16 => self.extend16(ops, true, false),
+            Opcode::UXTAB16 => self.extend16(ops, false, true),
+            Opcode::SXTAB16 => self.extend16(ops, true, true),
 
             Opcode::MUL => {
                 let a = self.read_reg(reg(&ops[1])?);
@@ -1002,11 +983,8 @@ impl Cpu {
                 Ok(())
             }
 
-            // yaxpeax gives the 4th operand of BFI/BFC as `msb`, not width
-            // (its own source flags this as a known quirk), so derive width here.
-            // yaxpeax 0.4 mis-decodes BFI/BFC's msb field (e.g. reports msb=15 for
-            // a `& 0x7fff` clear that should have msb=31), so derive lsb/msb from
-            // the raw T1 encoding: hw2 = (0)imm3 Rd imm2 (0) msb[4:0]; lsb=imm3:imm2.
+            // BFI/BFC take lsb and msb from the raw T1 encoding.
+            // hw2 = (0)imm3 Rd imm2 (0) msb[4:0]; lsb = imm3:imm2.
             Opcode::BFI => {
                 let rd = reg(&ops[0])?;
                 let rn = self.read_reg(reg(&ops[1])?);
@@ -1093,14 +1071,10 @@ impl Cpu {
             Opcode::STRH => self.store(ops, bus, 2, raw, len),
             Opcode::LDRD => self.load_double(ops, bus),
             Opcode::STRD => self.store_double(ops, bus),
-            // Unprivileged load/store (LDR*T/STR*T). yaxpeax also mis-decodes some
-            // 32-bit T2 imm12 byte/half/word loads-stores as these "T" variants
-            // (e.g. `strb r4,[sp,#3612]` -> `strbt`), so handle them identically to
-            // the privileged form: the emulator doesn't enforce MPU privilege, and
-            // store()/load() recompute the address from raw bits via mem_addr32,
-            // ignoring yaxpeax's wrong operands. These must execute as real
-            // stores/loads: a dropped byte store corrupts net's socket handle and
-            // the task spins on a garbage waker.
+            // Unprivileged load/store (LDR*T/STR*T). The emulator doesn't enforce
+            // MPU privilege, so these execute exactly like the privileged forms.
+            // They must execute as real accesses: a dropped byte store corrupts
+            // net's socket handle and the task spins on a garbage waker.
             Opcode::STRBT => self.store(ops, bus, 1, raw, len),
             Opcode::STRHT => self.store(ops, bus, 2, raw, len),
             Opcode::STRT => self.store(ops, bus, 4, raw, len),
@@ -1201,11 +1175,22 @@ impl Cpu {
             }
 
             Opcode::TBB | Opcode::TBH => {
-                // yaxpeax mis-decodes the H bit and operand shape, so read the
-                // encoding from raw: hw2 bit4 = H (0=byte table, 1=halfword).
-                let half = (raw >> 16) & 0x10 != 0;
-                let rn = (raw & 0xF) as u8;
-                let rm = ((raw >> 16) & 0xF) as u8;
+                // TBB: `[rn, rm]`; TBH: `[rn, rm, lsl #1]`.
+                let half = matches!(inst.opcode, Opcode::TBH);
+                let (rn, rm) = match &ops[0] {
+                    Operand::RegDerefPreindexReg(n, m, ..) => {
+                        (n.number(), m.number())
+                    }
+                    Operand::RegDerefPreindexRegShift(n, rs, ..) => {
+                        match rs.into_shift() {
+                            RegShiftStyle::RegImm(sh) => {
+                                (n.number(), sh.shiftee().number())
+                            }
+                            RegShiftStyle::RegReg(_) => return Err(()),
+                        }
+                    }
+                    _ => return Err(()),
+                };
                 let base = if rn == 15 {
                     self.cur_insn.wrapping_add(4)
                 } else {
@@ -1223,7 +1208,7 @@ impl Cpu {
             }
 
             Opcode::MRS => {
-                self.last_sys = true; // re-decode SYSm from raw word (yaxpeax uses A-profile here)
+                self.last_sys = true; // SYSm from raw
                 let rd = ((raw >> 24) & 0xF) as u8; // hw2 bits [11:8]
                 let sysm = ((raw >> 16) & 0xFF) as u8;
                 let v = self.read_special(sysm);
@@ -1378,8 +1363,6 @@ impl Cpu {
         bits: u32,
         signed: bool,
         add: bool,
-        raw: u32,
-        len: u32,
     ) -> Result<(), ()> {
         // forms: <ext> rd, rm[, rot]   /   <extA> rd, rn, rm[, rot]
         let rd = reg(&ops[0])?;
@@ -1388,9 +1371,8 @@ impl Cpu {
         } else {
             (0u32, &ops[1])
         };
-        // yaxpeax mis-reports the rotation operand; the ROR amount is the 2-bit
-        // field in the 32-bit encoding times 8 (16-bit forms never rotate).
-        let rot = if len == 2 { 0 } else { ((raw >> 20) & 3) * 8 };
+        // The optional `ror #n` is Operand::Ror (32-bit forms only).
+        let rot = ror_amount(ops);
         let mut v = self.opval(rm_op)?;
         if rot != 0 {
             v = v.rotate_right(rot);
@@ -1416,7 +1398,6 @@ impl Cpu {
         ops: &[Operand; 4],
         signed: bool,
         add: bool,
-        raw: u32,
     ) -> Result<(), ()> {
         let rd = reg(&ops[0])?;
         let (acc, rm_op) = if add {
@@ -1424,7 +1405,7 @@ impl Cpu {
         } else {
             (0u32, &ops[1])
         };
-        let rot = ((raw >> 20) & 3) * 8;
+        let rot = ror_amount(ops);
         let mut v = self.opval(rm_op)?;
         if rot != 0 {
             v = v.rotate_right(rot);
@@ -1455,8 +1436,8 @@ impl Cpu {
         len: u32,
     ) -> Result<(), ()> {
         let rt = reg(&ops[0])?;
-        // For 32-bit encodings, decode the address from raw: yaxpeax mis-decodes
-        // several load/store addressing forms (e.g. T3 imm as a register offset).
+        // For 32-bit encodings the address comes from the raw word; mem_addr32
+        // also performs the pre/post-index writeback.
         let addr = if len == 4 {
             self.mem_addr32(raw)
         } else {
@@ -2153,7 +2134,7 @@ impl Cpu {
         }
     }
 
-    /// Thumb VFP load/store (yaxpeax can't decode these). Returns true if handled.
+    /// Thumb VFP load/store, executed from the raw word. Returns true if handled.
     /// Covers VLDR/VSTR (single reg) and VLDM/VSTM/VPUSH/VPOP (register list) for
     /// both single (S) and double (D) precision, enough for the kernel's
     /// FP context save/restore around syscalls.
@@ -2270,9 +2251,10 @@ impl Cpu {
         true
     }
 
-    /// Single-precision VFP data-processing + VMOV/VMRS/VMSR. Decoded from raw
-    /// (yaxpeax can't decode VFP). Single precision (F32) is what this firmware
-    /// uses; double (F64) arithmetic is handled for the common ops too.
+    /// Single-precision VFP data-processing + VMOV/VMRS/VMSR, decoded from the
+    /// raw word. Single precision (F32) is
+    /// what this firmware uses; double (F64) arithmetic is handled for the
+    /// common ops too.
     fn exec_vfp_dp(&mut self, hw1: u32, hw2: u32) {
         let coproc_fp = (hw2 & 0x0E00) == 0x0A00;
         // VMRS Rt, FPSCR  (hw1=0xEEF1)
@@ -2575,9 +2557,9 @@ fn do_shift(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> u32 {
 /// shifted out). `amt == 0` leaves the value and carry unchanged, except for
 /// RRX, which rotates through carry by one bit whatever amount arrives.
 fn shift_c(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> (u32, bool) {
-    // RRX rotates through carry by one bit (E2.1.348 RRX_C). DecodeImmShift
-    // (E2.1.92) pairs it with an amount of 1, and yaxpeax reports 0, so key on
-    // the style and run before the early return that treats 0 as a no-op.
+    // RRX rotates through carry by one bit (E2.1.348 RRX_C) regardless of the
+    // reported amount, so key on the style ahead of the zero-amount early
+    // return.
     if matches!(style, ShiftStyle::RRX) {
         return (((cin as u32) << 31) | (v >> 1), v & 1 != 0);
     }
@@ -2624,8 +2606,9 @@ fn shift_c(v: u32, style: ShiftStyle, amt: u32, cin: bool) -> (u32, bool) {
 }
 
 /// Decode a Thumb B/BL/BLX branch target straight from the instruction word.
-/// yaxpeax's BranchThumbOffset is inconsistent across encodings and is unused
-/// here. All targets are PC-relative with PC = instruction address + 4.
+/// The decoder's branch offset is relative to the next halfword for the 16-bit
+/// conditional B and CBZ/CBNZ, and relative to PC (instruction address + 4)
+/// for every other form; decoding from the encoding uses one rule.
 fn thumb_branch_target(raw: u32, pc: u32, len: u32) -> u32 {
     let hw1 = raw & 0xFFFF;
     if len == 2 {
@@ -2668,18 +2651,6 @@ fn thumb_branch_target(raw: u32, pc: u32, len: u32) -> u32 {
             pc.wrapping_add(4).wrapping_add(off)
         }
     }
-}
-
-/// Decode a Thumb-2 MOVW/MOVT 16-bit immediate (imm4:i:imm3:imm8) from the raw
-/// instruction word, yaxpeax places imm4 incorrectly for these encodings.
-fn movw_movt_imm16(raw: u32) -> u32 {
-    let hw1 = raw & 0xFFFF;
-    let hw2 = (raw >> 16) & 0xFFFF;
-    let imm4 = hw1 & 0xF;
-    let i = (hw1 >> 10) & 1;
-    let imm3 = (hw2 >> 12) & 0x7;
-    let imm8 = hw2 & 0xFF;
-    (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8
 }
 
 /// CBZ/CBNZ: always a forward, zero-extended branch.
@@ -2733,39 +2704,6 @@ fn cond_from_bits(b: u8) -> ConditionCode {
     }
 }
 
-/// The 32-bit T2 register-controlled shift (`LSL/LSR/ASR/ROR.w Rd, Rn, Rm`):
-/// hw1 = 1111_1010_0_tt_S_Rn, hw2 = 1111_Rd_0000_Rm. yaxpeax mis-reports `tt`,
-/// so recover the true shift style from the raw encoding. Returns None when the
-/// instruction isn't this form (immediate / 16-bit shifts decode fine).
-fn t2_reg_shift_style(raw: u32, len: u32) -> Option<ShiftStyle> {
-    if len != 4 {
-        return None;
-    }
-    let (hw1, hw2) = ((raw & 0xFFFF) as u16, (raw >> 16) as u16);
-    // T2 register-form shift (`LSL/LSR/ASR/ROR.w Rd, Rn, Rm`): type in hw1[6:5].
-    if (hw1 >> 7) == 0x1F4 && (hw2 & 0xF0F0) == 0xF000 {
-        return Some(match (hw1 >> 5) & 0x3 {
-            0 => ShiftStyle::LSL,
-            1 => ShiftStyle::LSR,
-            2 => ShiftStyle::ASR,
-            _ => ShiftStyle::ROR,
-        });
-    }
-    // T3 MOV-immediate-shift (`MOV.w Rd, Rm, <type> #imm`, Rn=1111, S in bit4):
-    // yaxpeax 0.4 also mis-decodes the type here; it lives in hw2[5:4]. Without
-    // this, e.g. `mov.w rd, rm, ror #n` runs as ASR and silently corrupts values
-    // (breaks the RoT's PlatformId validation, among others).
-    if (hw1 & 0xFFEF) == 0xEA4F {
-        return Some(match (hw2 >> 4) & 0x3 {
-            0 => ShiftStyle::LSL,
-            1 => ShiftStyle::LSR,
-            2 => ShiftStyle::ASR,
-            _ => ShiftStyle::ROR,
-        });
-    }
-    None
-}
-
 /// Decode the (lsb, msb) bitfield bounds of a 32-bit T1 BFI/BFC from raw.
 /// hw2[14:12]=imm3, hw2[7:6]=imm2 -> lsb=imm3:imm2; hw2[4:0]=msb.
 fn bfx_lsb_msb(raw: u32) -> (u32, u32) {
@@ -2787,6 +2725,16 @@ fn imm_val(op: &Operand) -> Result<u32, ()> {
         _ => Err(()),
     }
 }
+/// The optional `ror #n` of the extend family, reported as `Operand::Ror`.
+fn ror_amount(ops: &[Operand; 4]) -> u32 {
+    ops.iter()
+        .find_map(|o| match o {
+            Operand::Ror(r) => Some(*r as u32),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
 fn reglist(op: &Operand) -> Result<u16, ()> {
     match op {
         Operand::RegList(m) => Ok(*m),
@@ -3096,9 +3044,8 @@ mod tests {
         assert_eq!(cpu.r[3], 0x1122_3344);
     }
 
-    /// An RRX-shifted operand reaches shift_c through `opval`. yaxpeax 0.5.0
-    /// reports the style as RRX where 0.4.0 reported ROR by 0, so before the
-    /// style became visible this instruction ran as a no-op shift.
+    /// An RRX-shifted operand reaches shift_c through `opval` with a reported
+    /// amount of zero, which must not take the zero-amount early return.
     #[test]
     fn add_with_an_rrx_shifted_operand() {
         let mut bus = ram_bus();
@@ -3128,6 +3075,83 @@ mod tests {
         let (r, c) = shift_c(0x0000_0002, ShiftStyle::RRX, 0, false);
         assert_eq!(r, 0x0000_0001);
         assert!(!c);
+    }
+
+    /// Each test below pins one decoded-operand path on a real Hubris
+    /// encoding, so a decoder change cannot regress it silently.
+    fn step_words(
+        words: &[u16],
+        setup: impl FnOnce(&mut Cpu, &mut Bus),
+    ) -> Cpu {
+        let mut bus = ram_bus();
+        for (i, w) in words.iter().enumerate() {
+            bus.write16(RAM + 2 * i as u32, *w);
+        }
+        let mut cpu = Cpu::new();
+        cpu.pc = RAM;
+        setup(&mut cpu, &mut bus);
+        let mut host = StdoutHost;
+        let insns = words.len() / 2; // all 32-bit encodings
+        for _ in 0..insns {
+            assert!(cpu.step(&mut bus, &mut host).is_ok());
+        }
+        cpu
+    }
+
+    #[test]
+    fn movw_movt_use_decoded_immediates() {
+        // movw r0, #0xadb0 = f64a 50b0 ; movt r0, #0x2406 = f2c2 4006
+        let cpu = step_words(&[0xf64a, 0x50b0, 0xf2c2, 0x4006], |_, _| {});
+        assert_eq!(cpu.r[0], 0x2406_adb0);
+    }
+
+    #[test]
+    fn mvn_modified_immediate_decodes_as_mvn() {
+        // mvn.w r2, #11 = f06f 020b
+        let cpu = step_words(&[0xf06f, 0x020b], |_, _| {});
+        assert_eq!(cpu.r[2], !0xb);
+    }
+
+    #[test]
+    fn wide_register_shift_uses_decoded_type() {
+        // lsr.w r1, r1, r9 = fa21 f109
+        let cpu = step_words(&[0xfa21, 0xf109], |cpu, _| {
+            cpu.r[1] = 0x8000_0000;
+            cpu.r[9] = 4;
+        });
+        assert_eq!(cpu.r[1], 0x0800_0000);
+    }
+
+    #[test]
+    fn mov_w_ror_immediate_uses_decoded_type() {
+        // mov.w r1, r6, ror #6 = ea4f 11b6
+        let cpu = step_words(&[0xea4f, 0x11b6], |cpu, _| cpu.r[6] = 0xc0);
+        assert_eq!(cpu.r[1], 3);
+    }
+
+    #[test]
+    fn tbh_uses_decoded_operands() {
+        // tbh [pc, r1, lsl #1] = e8df f011; table follows at pc+4.
+        let cpu = step_words(&[0xe8df, 0xf011], |cpu, bus| {
+            cpu.r[1] = 1;
+            bus.write16(RAM + 4, 0x0000);
+            bus.write16(RAM + 6, 0x0010);
+        });
+        assert_eq!(cpu.pc, RAM + 4 + 0x20);
+    }
+
+    #[test]
+    fn extend_rotation_comes_from_ror_operand() {
+        // uxtb.w r1, r2, ror #16 = fa5f f1a2
+        let cpu =
+            step_words(&[0xfa5f, 0xf1a2], |cpu, _| cpu.r[2] = 0x00ab_0000);
+        assert_eq!(cpu.r[1], 0xab);
+        // uxtab r0, r0, r4, ror #8 = fa50 f094
+        let cpu = step_words(&[0xfa50, 0xf094], |cpu, _| {
+            cpu.r[0] = 0x100;
+            cpu.r[4] = 0x0000_cd00;
+        });
+        assert_eq!(cpu.r[0], 0x1cd);
     }
 
     /// SMLABB/BT/TB/TT multiply the selected signed halfwords of Rn and Rm
