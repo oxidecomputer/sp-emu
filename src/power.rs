@@ -16,6 +16,12 @@
 //! ```
 //! `host-lost` becomes an IPCC `HostToSp::RequestPowerOff` on UART7, which
 //! host-sp-comms turns into a sequencer A2.
+//!
+//! When nothing plays the host on UART7 (no `$SP_EMU_HOST_UART` /
+//! `$SP_EMU_HOST_PTY`), sp-emu sends a gimlet SP an IPCC `HostToSp::GetStatus`
+//! `GET_STATUS_DELAY` after A0, as a booting host kernel does. host-sp-comms
+//! answers by muxing the host flash back to the SP; without that MGS cannot
+//! hash host phase 1 while the host runs.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -62,9 +68,33 @@ struct Inner {
     clients: Vec<Client>,
     /// The host power as the FPGA model last reported it.
     host_on: bool,
-    /// IPCC sequence number for injected host messages.
-    seq: u64,
     last_poll: Instant,
+}
+
+/// The stand-in host's IPCC state, live whether or not the socket is bound.
+struct HostIpcc {
+    /// Sequence number for injected host messages.
+    seq: u64,
+    /// When to send GetStatus for the A0 the FPGA model last reported.
+    get_status_due: Option<Instant>,
+}
+
+static HOST_IPCC: Mutex<HostIpcc> =
+    Mutex::new(HostIpcc { seq: 0, get_status_due: None });
+
+/// A0 to the stand-in host's GetStatus: long enough for the sequencer to
+/// finish muxing the flash to the host CPU.
+const GET_STATUS_DELAY: Duration = Duration::from_secs(3);
+
+fn host_ipcc() -> std::sync::MutexGuard<'static, HostIpcc> {
+    HOST_IPCC.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether sp-emu plays the host on UART7: a gimlet with no pty or socket
+/// client there. A sidecar has no host-sp-comms.
+fn stands_in_for_host() -> bool {
+    let c = crate::config::get();
+    !c.board().is_sidecar() && !c.host_pty() && c.host_uart().is_none()
 }
 
 /// How often the serve loop looks at the socket.
@@ -89,7 +119,6 @@ pub fn init() {
                     listener: l,
                     clients: Vec::new(),
                     host_on: false,
-                    seq: 0,
                     last_poll: Instant::now(),
                 }))
             }
@@ -121,6 +150,14 @@ fn broadcast(inner: &mut Inner, line: &str) {
 
 /// The FPGA model reports the host power it now supplies.
 pub fn host_changed(on: bool) {
+    {
+        let mut h = host_ipcc();
+        h.get_status_due = if on && stands_in_for_host() {
+            Some(Instant::now() + GET_STATUS_DELAY)
+        } else {
+            None
+        };
+    }
     with(|i| {
         if i.host_on == on {
             return;
@@ -139,9 +176,23 @@ pub fn ignition_request(port: u8, req: IgnitionRequest) {
     });
 }
 
-/// Serve the socket: accept clients, answer their lines, and feed a host-lost
-/// into the SP's UART7 RX queue. Called from the SP serve loop.
+/// Send the stand-in host's GetStatus once its A0 delay has elapsed, then serve
+/// the socket: accept clients, answer their lines, and feed a host-lost into the
+/// SP's UART7 RX queue. Called from the SP serve loop.
 pub fn poll(uart_rx: &crate::soc::UartQueue) {
+    {
+        let mut h = host_ipcc();
+        if h.get_status_due.is_some_and(|t| Instant::now() >= t) {
+            h.get_status_due = None;
+            h.seq += 1;
+            let frame = host_frame(HOST_TO_SP_GET_STATUS, h.seq);
+            eprintln!(
+                "[power] host A0: sending the SP an IPCC GetStatus ({} bytes)",
+                frame.len()
+            );
+            uart_rx.borrow_mut().extend(frame);
+        }
+    }
     with(|i| {
         if i.last_poll.elapsed() < POLL_INTERVAL {
             return;
@@ -191,8 +242,12 @@ pub fn poll(uart_rx: &crate::soc::UartQueue) {
         }
         i.clients.retain(|c| !c.closed);
         if lost {
-            i.seq += 1;
-            let frame = request_power_off_frame(i.seq);
+            let seq = {
+                let mut h = host_ipcc();
+                h.seq += 1;
+                h.seq
+            };
+            let frame = host_frame(HOST_TO_SP_REQUEST_POWER_OFF, seq);
             eprintln!(
                 "[power] host lost: sending the SP an IPCC RequestPowerOff ({} bytes)",
                 frame.len()
@@ -207,15 +262,16 @@ pub fn poll(uart_rx: &crate::soc::UartQueue) {
 const IPCC_MAGIC: u32 = 0x01de_19cc;
 const IPCC_VERSION: u32 = 1;
 const HOST_TO_SP_REQUEST_POWER_OFF: u8 = 0x02;
+const HOST_TO_SP_GET_STATUS: u8 = 0x08;
 
-/// A framed `HostToSp::RequestPowerOff`, led by a 0x00 that ends any partial
-/// frame host-sp-comms may be holding.
-pub fn request_power_off_frame(sequence: u64) -> Vec<u8> {
+/// One framed payload-less HostToSp command, led by a 0x00 that ends any
+/// partial frame host-sp-comms may be holding.
+fn host_frame(command: u8, sequence: u64) -> Vec<u8> {
     let mut msg = Vec::with_capacity(19);
     msg.extend_from_slice(&IPCC_MAGIC.to_le_bytes());
     msg.extend_from_slice(&IPCC_VERSION.to_le_bytes());
     msg.extend_from_slice(&sequence.to_le_bytes());
-    msg.push(HOST_TO_SP_REQUEST_POWER_OFF);
+    msg.push(command);
     let ck = fletcher16(&msg);
     msg.extend_from_slice(&ck.to_le_bytes());
     let mut out = vec![0x00];
@@ -263,7 +319,7 @@ mod tests {
 
     #[test]
     fn request_power_off_frame_carries_header_message_and_checksum() {
-        let f = request_power_off_frame(0x1122334455667788);
+        let f = host_frame(HOST_TO_SP_REQUEST_POWER_OFF, 0x1122334455667788);
         assert_eq!(f[0], 0x00, "leading terminator");
         assert_eq!(*f.last().unwrap(), 0x00, "trailing terminator");
         assert!(!f[1..f.len() - 1].contains(&0), "COBS body has no zeros");
@@ -276,6 +332,20 @@ mod tests {
         let ck = u16::from_le_bytes([msg[17], msg[18]]);
         assert_eq!(ck, fletcher16(&msg[..17]));
         assert_eq!(msg.len(), 19);
+    }
+
+    #[test]
+    fn get_status_frame_is_command_0x08() {
+        let f = host_frame(HOST_TO_SP_GET_STATUS, 7);
+        let msg = crate::glasgow::cobs_decode(&f[1..f.len() - 1]).unwrap();
+        assert_eq!(msg.len(), 19);
+        assert_eq!(&msg[..4], &0x01de_19ccu32.to_le_bytes());
+        assert_eq!(&msg[8..16], &7u64.to_le_bytes());
+        assert_eq!(msg[16], 0x08);
+        assert_eq!(
+            u16::from_le_bytes([msg[17], msg[18]]),
+            fletcher16(&msg[..17])
+        );
     }
 
     #[test]
