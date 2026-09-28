@@ -32,6 +32,7 @@ mod i2c_bridge;
 mod identity;
 mod lpc55;
 mod mem;
+mod power;
 mod puf;
 mod romapi;
 mod rot_flash;
@@ -382,6 +383,13 @@ fn main() -> Result<()> {
                 .unwrap_or(I2C_BRIDGE_DEFAULT_ADDR);
             i2c_bridge::serve(addr)
         }
+        Some("power-watch") => {
+            let addr =
+                sub_args.first().map(String::as_str).ok_or_else(|| {
+                    anyhow!("power-watch needs the SP's bridge address")
+                })?;
+            power::watch(addr, sub_args.get(1).map(String::as_str))
+        }
         Some("i2c-device") => {
             let addr = sub_args
                 .first()
@@ -417,6 +425,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  sp-emu config <validate|schema|upgrade>  work on config files (see `sp-emu config`)"
+            );
+            eprintln!(
+                "  sp-emu power-watch <addr> [host-lost]  follow an SP's host power bridge"
             );
             eprintln!(
                 "  sp-emu pack [bundle.zip]         bundle this instance (flash+archives) to a zip"
@@ -722,6 +733,7 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
         eprintln!("[rot] SP_EMU_ROT_SERVICE={a}");
         rot_service::RotClient::connect(a)
     });
+    power::init();
     let mut host = make_host()?;
     gdb::serve(cpu, bus, rot_image, rot_client, host.as_mut(), preboot)
 }

@@ -880,6 +880,7 @@ pub fn serve(
             let pc = bus.read32(0x0800_0004) & !1;
             cpu.reset_for_reboot(sp, pc);
             bus.reset_exception_sources();
+            bus.reset_devices();
             // On silicon DEMCR.VC_CORERESET catches a reset from any source, a
             // firmware SYSRESETREQ included. If the RoT armed reset-and-halt, the SP
             // halts at its reset vector here (0 instructions); otherwise it falls to
@@ -896,6 +897,7 @@ pub fn serve(
         // collect_irqs pends IRQ 82, and the idle SP wakes (otherwise an idle WFI
         // would never see the RX and the channel would deadlock).
         bus.pump_uart(host);
+        crate::power::poll(&bus.uart_rx);
         // Whether the RoT is mid-exchange (a request in flight or still building a
         // reply). When true, do not sleep the host below: an idle SP parked in
         // wait_rot_irq would otherwise pay a full idle_ms (~20ms) per poll cycle

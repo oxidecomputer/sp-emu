@@ -106,6 +106,8 @@ pub struct Host {
     pub uart: Option<String>,
     /// Serve the host UART on a pty sp-emu creates.
     pub pty: Option<bool>,
+    /// Bind address of the host power bridge.
+    pub power: Option<String>,
 }
 
 /// Companion I2C bridge.
@@ -261,7 +263,7 @@ is_empty_impl!(Net {
     eth_txbreak,
     idle_ms
 });
-is_empty_impl!(Host { uart, pty });
+is_empty_impl!(Host { uart, pty, power });
 is_empty_impl!(I2c { bridge, device });
 is_empty_impl!(Rot {
     rom,

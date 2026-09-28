@@ -755,6 +755,18 @@ impl Mmio for Vsc7448 {
     }
 }
 
+/// iCE40 sequencer registers the host power model answers (gimlet-regs).
+const SEQ_STATUS: u16 = 0x11;
+const SEQ_PWR_CTRL: u16 = 0x13;
+const SEQ_A1SMSTATUS: u16 = 0x15;
+const SEQ_A0SMSTATUS: u16 = 0x16;
+const PWR_CTRL_A1PWREN: u8 = 0x01;
+const PWR_CTRL_A0A_EN: u8 = 0x02;
+const STATUS_A1PWROK: u8 = 0x02;
+const STATUS_A0PWROK: u8 = 0x04;
+const A1SM_DONE: u8 = 0x05;
+const A0SM_DONE: u8 = 0x0c;
+
 /// SPI2 (0x4000_3800): gimlet's bus shared (by chip-select) between the iCE40
 /// sequencer FPGA (CS PB5) and the KSZ8463 switch (CS PI0). The active device is
 /// read from the shared `Spi2Cs` cell (set by the GPIO bank). The target is
@@ -763,11 +775,19 @@ impl Mmio for Vsc7448 {
 /// Sequencer FPGA protocol: a 3-byte header [cmd, addr_be_hi, addr_be_lo] then
 /// data; READ (cmd=1) returns reg[addr++] for bytes after the header. Registers
 /// modeled: ID0/1 = 0x01/0xDE (ident 0x1DE), CS0..3 = 0x74753981 LE (matches
-/// GIMLET_BITSTREAM_CHECKSUM, so the SP skips reprogramming), PWR_CTRL(0x13)=0 (A2).
+/// GIMLET_BITSTREAM_CHECKSUM, so the SP skips reprogramming), and the host power
+/// state machines behind PWR_CTRL (0x13): A1SMSTATUS reads Done once A1PWREN is
+/// set, A0SMSTATUS walks Pbtn..Done one step per poll once A0A_EN is set, so
+/// gimlet_seq sees GroupcPg, turns the vcore on, and completes A0 as it does on
+/// the iCE40. The host is on from A0 Done until PWR_CTRL drops A0A_EN; both edges
+/// go out on the power bridge (`power.rs`). An SP reset resets the FPGA to A2.
 pub struct Spi2 {
     regs: std::collections::HashMap<u32, u32>,
     cs: Spi2Cs,
     target: u8, // device latched at SPE (1=seq, 2=ksz)
+    // host power model: A0SMSTATUS progress and whether the host is powered
+    a0sm: u8,
+    host_on: bool,
     idx: u32,
     rx: Vec<u8>,
     // sequencer FPGA register file + per-transaction header accumulation
@@ -788,6 +808,8 @@ impl Spi2 {
             regs: Default::default(),
             cs,
             target: 0,
+            a0sm: 0,
+            host_on: false,
             idx: 0,
             rx: Vec::new(),
             seq: Default::default(),
@@ -801,16 +823,57 @@ impl Spi2 {
             dbg_txn: 0,
         }
     }
-    fn seq_read(&self, addr: u16) -> u8 {
+    /// PWR_CTRL as the sequencer last wrote it (0 = A2 resting).
+    fn pwr_ctrl(&self) -> u8 {
+        *self.seq.get(&SEQ_PWR_CTRL).unwrap_or(&0)
+    }
+    fn seq_read(&mut self, addr: u16) -> u8 {
         match addr {
             0x0 => 0xDE,
             0x1 => 0x01, // ID0/ID1 (LE) -> ident 0x01DE = 0x1DE
             0xa => 0x81,
             0xb => 0x39,
             0xc => 0x75,
-            0xd => 0x74,  // CS0..3 -> 0x74753981 (LE)
-            0x13 => 0x00, // PWR_CTRL -> 0 (A2 resting)
+            0xd => 0x74, // CS0..3 -> 0x74753981 (LE)
+            // STATUS: the power-good summary of what is enabled
+            SEQ_STATUS => {
+                let a1 = self.pwr_ctrl() & PWR_CTRL_A1PWREN != 0;
+                (if a1 { STATUS_A1PWROK } else { 0 })
+                    | (if self.host_on { STATUS_A0PWROK } else { 0 })
+            }
+            SEQ_A1SMSTATUS => {
+                if self.pwr_ctrl() & PWR_CTRL_A1PWREN != 0 {
+                    A1SM_DONE
+                } else {
+                    0
+                }
+            }
+            SEQ_A0SMSTATUS => {
+                if self.pwr_ctrl() & PWR_CTRL_A0A_EN == 0 {
+                    return 0;
+                }
+                if self.a0sm < A0SM_DONE {
+                    self.a0sm += 1;
+                }
+                if self.a0sm == A0SM_DONE && !self.host_on {
+                    self.host_on = true;
+                    crate::power::host_changed(true);
+                }
+                self.a0sm
+            }
             a => *self.seq.get(&a).unwrap_or(&0),
+        }
+    }
+    /// A PWR_CTRL write: dropping A0A_EN cuts the host and the A0 state machine
+    /// returns to Idle. The sequencer clears both enables in one write for A2
+    /// and on any failed A0 attempt.
+    fn pwr_ctrl_written(&mut self, ctrl: u8) {
+        if ctrl & PWR_CTRL_A0A_EN == 0 {
+            self.a0sm = 0;
+            if self.host_on {
+                self.host_on = false;
+                crate::power::host_changed(false);
+            }
         }
     }
     fn xfer(&mut self, b: u8) -> u8 {
@@ -870,6 +933,9 @@ impl Spi2 {
                                 _ => b,
                             };
                             self.seq.insert(a, nv);
+                            if a == SEQ_PWR_CTRL {
+                                self.pwr_ctrl_written(nv);
+                            }
                             0
                         }
                     }
@@ -916,6 +982,12 @@ impl Spi2 {
 impl Mmio for Spi2 {
     fn name(&self) -> &str {
         "SPI2"
+    }
+    /// The SP holds the iCE40 in reset while it boots, so an SP reset drops the
+    /// host to A2 and the sequencer restarts from its A2 gate.
+    fn reset(&mut self) {
+        self.seq.clear();
+        self.pwr_ctrl_written(0);
     }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
@@ -988,6 +1060,8 @@ pub struct Spi5 {
     dbg_req: Vec<u8>,
     dbg_resp: std::collections::VecDeque<u8>,
     tofino_regs: std::collections::HashMap<u32, u32>,
+    // ignition targets with a request in flight and when it was written
+    ignition_busy: Vec<(u8, std::time::Instant)>,
 }
 /// Seed the FPGA ignition-controller register block so the emulated sidecar SP
 /// answers MGS `ignition`. The sidecar is the rack's ignition hub: MGS issues
@@ -1010,12 +1084,41 @@ pub struct Spi5 {
 /// comma-separated `port:type` list, e.g. "0:gimlet,1:sidecar,2:gimlet,3:gimlet".
 /// Listed ports read present/powered-on/link-locked; all others read absent.
 /// Default is the 3-sled a4x2 reference rack.
+/// Ignition controller register block (drv-sidecar-mainboard-controller
+/// ignition.rs): per-port pages of 0x100 bytes from 0x400.
+const IGNITION_PORT_BASE: u16 = 0x400;
+const IGNITION_PORT_STRIDE: u16 = 0x100;
+const IGNITION_NUM_PORTS: u8 = 35;
+/// Per-port page offsets and bits (drv-ignition-api).
+const IGN_TARGET_SYSTEM_STATUS: u16 = 0x3;
+const IGN_TARGET_REQUEST_STATUS: u16 = 0x5;
+const IGN_TARGET_REQUEST: u16 = 0x8;
+const IGN_SYSTEM_POWER_ENABLED: u8 = 0x04;
+const IGN_POWER_OFF_IN_PROGRESS: u8 = 0x01;
+const IGN_POWER_ON_IN_PROGRESS: u8 = 0x02;
+const IGN_SYSTEM_RESET_IN_PROGRESS: u8 = 0x04;
+const IGN_REQUEST_PENDING: u8 = 0x80;
+/// How long a target reports its request in progress; real targets hold a
+/// 3s cooldown, MGS polls ignition once a second.
+const IGNITION_REQUEST_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+/// The ignition port page and offset behind an FPGA address, if any.
+fn ignition_reg(addr: u16) -> Option<(u8, u16)> {
+    let rel = addr.checked_sub(IGNITION_PORT_BASE)?;
+    let port = rel / IGNITION_PORT_STRIDE;
+    if port >= IGNITION_NUM_PORTS as u16 {
+        return None;
+    }
+    Some((port as u8, rel % IGNITION_PORT_STRIDE))
+}
+
 fn seed_ignition(fpga: &mut std::collections::HashMap<u16, u8>) {
     const CONTROLLERS_COUNT: u16 = 0x300;
     const TARGETS_PRESENT0: u16 = 0x301;
-    const PORT_BASE: u16 = 0x400;
-    const PORT_STRIDE: u16 = 0x100;
-    const NUM_PORTS: u8 = 35;
+    const PORT_BASE: u16 = IGNITION_PORT_BASE;
+    const PORT_STRIDE: u16 = IGNITION_PORT_STRIDE;
+    const NUM_PORTS: u8 = IGNITION_NUM_PORTS;
 
     let spec = crate::config::get().ignition();
 
@@ -1125,6 +1228,62 @@ impl Spi5 {
             dbg_req: Vec::new(),
             dbg_resp: std::collections::VecDeque::new(),
             tofino_regs: std::collections::HashMap::new(),
+            ignition_busy: Vec::new(),
+        }
+    }
+    /// Whether the Tofino sequencer reports A0.
+    fn tofino_on(&self) -> bool {
+        self.fpga.get(&0x101) == Some(&2)
+    }
+    /// A TARGET_REQUEST write: the target answers at once so the driver's
+    /// read-back verifies, then reports the request in progress for a while.
+    fn ignition_requested(&mut self, port: u8, val: u8) {
+        let Some(req) = crate::power::IgnitionRequest::from_kind(val) else {
+            return;
+        };
+        let base = IGNITION_PORT_BASE + IGNITION_PORT_STRIDE * port as u16;
+        let status = base + IGN_TARGET_SYSTEM_STATUS;
+        let cur = *self.fpga.get(&status).unwrap_or(&0);
+        let (sys, progress) = match req {
+            crate::power::IgnitionRequest::Off => {
+                (cur & !IGN_SYSTEM_POWER_ENABLED, IGN_POWER_OFF_IN_PROGRESS)
+            }
+            crate::power::IgnitionRequest::On => {
+                (cur | IGN_SYSTEM_POWER_ENABLED, IGN_POWER_ON_IN_PROGRESS)
+            }
+            crate::power::IgnitionRequest::Reset => (
+                cur | IGN_SYSTEM_POWER_ENABLED,
+                IGN_SYSTEM_RESET_IN_PROGRESS | IGN_POWER_ON_IN_PROGRESS,
+            ),
+        };
+        self.fpga.insert(status, sys);
+        self.fpga.insert(base + IGN_TARGET_REQUEST_STATUS, progress);
+        self.fpga.insert(
+            base + IGN_TARGET_REQUEST,
+            (val & 0x03) | IGN_REQUEST_PENDING,
+        );
+        self.ignition_busy.retain(|(p, _)| *p != port);
+        self.ignition_busy.push((port, std::time::Instant::now()));
+        crate::power::ignition_request(port, req);
+    }
+    /// Clear the in-progress bits of requests past their window.
+    fn ignition_settle(&mut self) {
+        if self.ignition_busy.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut done = Vec::new();
+        self.ignition_busy.retain(|(port, at)| {
+            if now.duration_since(*at) < IGNITION_REQUEST_WINDOW {
+                return true;
+            }
+            done.push(*port);
+            false
+        });
+        for port in done {
+            let base = IGNITION_PORT_BASE + IGNITION_PORT_STRIDE * port as u16;
+            self.fpga.insert(base + IGN_TARGET_REQUEST_STATUS, 0);
+            self.fpga.insert(base + IGN_TARGET_REQUEST, 0);
         }
     }
     /// Run a queued Tofino debug-port request (REQUEST_IN_PROGRESS written to
@@ -1179,6 +1338,7 @@ impl Spi5 {
     /// its VID handshake (SequencerTimeoutNotInA0 otherwise), and its timer
     /// tick powers up whenever policy is LatchOffOnFault and STATE reads A2.
     fn tofino_seq_ctrl_written(&mut self) {
+        let was_on = self.tofino_on();
         let ctrl = *self.fpga.get(&0x100).unwrap_or(&0);
         let en = ctrl & 0x02 != 0;
         // Command bits self-clear.
@@ -1193,9 +1353,13 @@ impl Spi5 {
         for a in 0x106..=0x10bu16 {
             self.fpga.insert(a, rail);
         }
+        if en != was_on {
+            crate::power::host_changed(en);
+        }
     }
     /// The next data byte for the current (read) command, with address auto-increment.
     fn next_data(&mut self) -> u8 {
+        self.ignition_settle();
         let incr = self.op != 5 && self.op != 6; // No-AddrIncr variants hold addr
         let a = self.addr.wrapping_add(if incr { self.dpos } else { 0 } as u16);
         self.dpos += 1;
@@ -1253,6 +1417,11 @@ impl Spi5 {
                         if a == 0x100 {
                             self.tofino_seq_ctrl_written();
                         }
+                        if let Some((port, IGN_TARGET_REQUEST)) =
+                            ignition_reg(a)
+                        {
+                            self.ignition_requested(port, nv);
+                        }
                         // Debug-port state: REQUEST_IN_PROGRESS runs the queued
                         // request; other writes (e.g. reset to buffers-empty)
                         // are plain stores.
@@ -1277,6 +1446,14 @@ impl Spi5 {
 impl Mmio for Spi5 {
     fn name(&self) -> &str {
         "SPI5"
+    }
+    /// An SP reset takes the mainboard FPGA back to its power-on image.
+    fn reset(&mut self) {
+        let was_on = self.tofino_on();
+        *self = Spi5::new(self.cs.clone());
+        if was_on {
+            crate::power::host_changed(false);
+        }
     }
     fn read(&mut self, off: u32) -> u32 {
         match off & !3 {
@@ -1332,8 +1509,11 @@ impl Mmio for Spi5 {
 
 /// GPIO bank: store/return, but the read-only input register IDR (+0x10 within
 /// each 0x400 port) is synthesized for the boot-critical externally-driven pins:
-///  - GPIOC (port 2): PC6/PC7 = sequencer V3P3/V1P2 power-good -> bits 6,7 high.
+///  - GPIOC (port 2): PC6/PC7 = sequencer V3P3/V1P2 power-good -> bits 6,7 high;
+///    PC13 = CPU_PRESENT_L -> low, a CPU is fitted.
 ///  - GPIOG (port 6): PG[2:0] = board revision -> 0b010 for gimlet-c.
+///  - GPIOI (port 8): PI4 = SP3R1, PI5 = CORETYPE -> high, with PH13 = SP3R2 low,
+///    the socket population gimlet_seq accepts before it enables A0.
 ///
 /// Other ports' IDR mirrors their ODR (+0x14) so output read-back works.
 pub struct GpioBank {
@@ -1421,8 +1601,14 @@ impl Mmio for GpioBank {
                 };
             }
             return match port {
-                2 => 0b11 << 6, // GPIOC: PG lines good
+                2 => 0b11 << 6, // GPIOC: PG lines good, CPU_PRESENT_L low
                 6 => 0b010,     // GPIOG: gimlet-c board rev
+                // GPIOI: SP3R1 + CORETYPE high over the ODR mirror (PI0 = KSZ CS)
+                8 => {
+                    self.regs.get(&(8 * 0x400 + 0x14)).copied().unwrap_or(0)
+                        | (1 << 4)
+                        | (1 << 5)
+                }
                 _ => *self.regs.get(&(port * 0x400 + 0x14)).unwrap_or(&0), // mirror ODR
             };
         }
@@ -2841,6 +3027,130 @@ mod tests {
         v.mii_cmd(miim(6, 31, Some(1)));
         v.mii_cmd(miim(6, 23, None));
         assert_eq!(v.mii_data >> 11, 2);
+    }
+
+    // ---- Sequencer FPGA: host power state machines ---------------------------
+
+    /// One sequencer read: SPE 0->1, the 3-byte header, then `n` data bytes.
+    fn seq_read(s: &mut Spi2, addr: u16, n: usize) -> Vec<u8> {
+        s.write(0x00, 0);
+        s.write(0x00, 1);
+        for b in [1u8, (addr >> 8) as u8, addr as u8] {
+            s.write(0x20, b as u32);
+            s.read(0x30);
+        }
+        (0..n)
+            .map(|_| {
+                s.write(0x20, 0);
+                s.read(0x30) as u8
+            })
+            .collect()
+    }
+
+    fn seq_write(s: &mut Spi2, cmd: u8, addr: u16, val: u8) {
+        s.write(0x00, 0);
+        s.write(0x00, 1);
+        for b in [cmd, (addr >> 8) as u8, addr as u8, val] {
+            s.write(0x20, b as u32);
+            s.read(0x30);
+        }
+    }
+
+    /// Poll a state machine register until it reads `want`, bounded.
+    fn seq_poll(s: &mut Spi2, addr: u16, want: u8) -> usize {
+        for n in 1..=32 {
+            if seq_read(s, addr, 1)[0] == want {
+                return n;
+            }
+        }
+        panic!("{addr:#x} never read {want:#x}");
+    }
+
+    #[test]
+    fn spi2_host_power_follows_the_sequencer() {
+        let mut s = Spi2::new(Rc::new(Cell::new(1)));
+        assert_eq!(seq_read(&mut s, SEQ_PWR_CTRL, 1), [0], "A2 resting");
+        assert_eq!(seq_read(&mut s, SEQ_A1SMSTATUS, 1), [0]);
+        assert_eq!(seq_read(&mut s, SEQ_A0SMSTATUS, 1), [0]);
+        // gimlet_seq: A1PWREN, wait for A1 Done
+        seq_write(&mut s, 2, SEQ_PWR_CTRL, PWR_CTRL_A1PWREN);
+        assert_eq!(seq_read(&mut s, SEQ_A1SMSTATUS, 1), [A1SM_DONE]);
+        assert_eq!(seq_read(&mut s, SEQ_STATUS, 1), [STATUS_A1PWROK]);
+        assert!(!s.host_on);
+        // A0A_EN, wait for GroupcPg, vcore on, wait for Done
+        seq_write(&mut s, 2, SEQ_PWR_CTRL, PWR_CTRL_A0A_EN);
+        assert_eq!(seq_read(&mut s, SEQ_PWR_CTRL, 1), [0x03]);
+        assert!(seq_poll(&mut s, SEQ_A0SMSTATUS, 0x07) <= 8);
+        assert!(!s.host_on, "no host before A0 Done");
+        assert!(seq_poll(&mut s, SEQ_A0SMSTATUS, A0SM_DONE) <= 8);
+        assert!(s.host_on);
+        assert_eq!(seq_read(&mut s, SEQ_A0SMSTATUS, 1), [A0SM_DONE], "holds");
+        assert_eq!(
+            seq_read(&mut s, SEQ_STATUS, 1),
+            [STATUS_A1PWROK | STATUS_A0PWROK]
+        );
+        // A2: both enables cleared in one write
+        seq_write(&mut s, 3, SEQ_PWR_CTRL, 0x03);
+        assert!(!s.host_on);
+        assert_eq!(seq_read(&mut s, SEQ_PWR_CTRL, 1), [0]);
+        assert_eq!(seq_read(&mut s, SEQ_A1SMSTATUS, 1), [0]);
+        assert_eq!(seq_read(&mut s, SEQ_A0SMSTATUS, 1), [0]);
+    }
+
+    #[test]
+    fn spi2_reset_drops_the_host() {
+        let mut s = Spi2::new(Rc::new(Cell::new(1)));
+        seq_write(&mut s, 0, SEQ_PWR_CTRL, 0x03);
+        seq_poll(&mut s, SEQ_A0SMSTATUS, A0SM_DONE);
+        assert!(s.host_on);
+        s.reset();
+        assert!(!s.host_on);
+        assert_eq!(seq_read(&mut s, SEQ_PWR_CTRL, 1), [0], "A2 gate passes");
+        assert_eq!(seq_read(&mut s, SEQ_A0SMSTATUS, 1), [0]);
+    }
+
+    #[test]
+    fn spi5_ignition_request_reads_back_then_settles() {
+        let mut s = Spi5::new(Rc::new(Cell::new(0)));
+        let base = IGNITION_PORT_BASE + IGNITION_PORT_STRIDE * 2;
+        assert_eq!(
+            s.fpga[&(base + IGN_TARGET_SYSTEM_STATUS)]
+                & IGN_SYSTEM_POWER_ENABLED,
+            IGN_SYSTEM_POWER_ENABLED,
+            "targets seed powered on"
+        );
+        s.ignition_requested(2, 0x01);
+        assert_eq!(
+            s.fpga[&(base + IGN_TARGET_SYSTEM_STATUS)]
+                & IGN_SYSTEM_POWER_ENABLED,
+            0
+        );
+        assert_eq!(
+            s.fpga[&(base + IGN_TARGET_REQUEST_STATUS)],
+            IGN_POWER_OFF_IN_PROGRESS
+        );
+        assert_eq!(s.fpga[&(base + IGN_TARGET_REQUEST)], 0x81);
+        s.ignition_settle();
+        assert_eq!(s.ignition_busy.len(), 1, "still in its window");
+        s.ignition_busy[0].1 =
+            std::time::Instant::now() - 2 * IGNITION_REQUEST_WINDOW;
+        s.ignition_settle();
+        assert!(s.ignition_busy.is_empty());
+        assert_eq!(s.fpga[&(base + IGN_TARGET_REQUEST_STATUS)], 0);
+        assert_eq!(s.fpga[&(base + IGN_TARGET_REQUEST)], 0);
+        s.ignition_requested(2, 0x03);
+        assert_eq!(
+            s.fpga[&(base + IGN_TARGET_REQUEST_STATUS)],
+            IGN_SYSTEM_RESET_IN_PROGRESS | IGN_POWER_ON_IN_PROGRESS
+        );
+        assert_eq!(
+            s.fpga[&(base + IGN_TARGET_SYSTEM_STATUS)]
+                & IGN_SYSTEM_POWER_ENABLED,
+            IGN_SYSTEM_POWER_ENABLED
+        );
+        assert_eq!(ignition_reg(0x400 + 0x100 * 34 + 8), Some((34, 8)));
+        assert_eq!(ignition_reg(0x400 + 0x100 * 35), None);
+        assert_eq!(ignition_reg(0x3ff), None);
     }
 
     // ---- Mainboard FPGA: Tofino sequencing FSM + debug port ------------------
