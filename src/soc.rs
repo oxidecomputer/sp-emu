@@ -3072,6 +3072,64 @@ mod tests {
     }
 
     #[test]
+    fn qspi_chip0_reads_unaffected_by_interleaved_chip1_writes() {
+        // hf's step_hash reads chip 0 a block at a time, selecting it per
+        // block and restoring the previous selection; between blocks CPA's
+        // page_program_dev programs chip 1. A slot 0 hash computed across a
+        // slot 1 write must equal the idle one.
+        let dev: HfDevSel = Rc::new(Cell::new(0));
+        let mut q = qspi_ram(&dev);
+        let base = 0x0001_0000u32;
+        let n = 8usize;
+        // Chip 0 holds a known pattern; chip 1 starts erased.
+        for i in 0..n {
+            qspi_cmd(&mut q, 0x06, None, &[]);
+            let a = base + (i as u32) * 4;
+            qspi_cmd(
+                &mut q,
+                0x12,
+                Some(a),
+                &[i as u8, 0xA0 | i as u8, 0x55, 0xAA],
+            );
+        }
+        let idle: Vec<Vec<u8>> = (0..n)
+            .map(|i| qspi_read(&mut q, 0x13, Some(base + (i as u32) * 4), 4))
+            .collect();
+        // The write context holds Flash1, so each hash step flips 1 -> 0 -> 1.
+        dev.set(1);
+        let mut hashed = Vec::new();
+        for i in 0..n {
+            let prev = dev.get();
+            dev.set(0);
+            hashed.push(qspi_read(
+                &mut q,
+                0x13,
+                Some(base + (i as u32) * 4),
+                4,
+            ));
+            dev.set(prev);
+            // page_program_dev(Flash1) at the same address.
+            qspi_cmd(&mut q, 0x06, None, &[]);
+            qspi_cmd(&mut q, 0x12, Some(base + (i as u32) * 4), &[0x00; 4]);
+        }
+        assert_eq!(hashed, idle, "chip 0 reads changed under chip 1 writes");
+        // Chip 1 took all the writes.
+        for i in 0..n {
+            assert_eq!(
+                qspi_read(&mut q, 0x13, Some(base + (i as u32) * 4), 4),
+                vec![0u8; 4]
+            );
+        }
+        dev.set(0);
+        for (i, want) in idle.iter().enumerate() {
+            assert_eq!(
+                &qspi_read(&mut q, 0x13, Some(base + (i as u32) * 4), 4),
+                want
+            );
+        }
+    }
+
+    #[test]
     fn qspi_dev_select_addresses_two_chips() {
         // Each HfDevSelect must reach its own array with its own WEL, or
         // writing the inactive host phase 1 slot rewrites the active one.
