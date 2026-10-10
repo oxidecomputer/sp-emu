@@ -109,15 +109,6 @@ fn default_socket_ports(sidecar: bool) -> Vec<u16> {
     ports
 }
 
-/// The instance anchor: the SP flash NVM path (`$SP_EMU_FLASH`). Its directory is the
-/// single instance base. Every instance-relative thing (the stowed Hubris archives in
-/// `<base>/archives/`, and the base-relative refs in both the SP and RoT `.nv` files)
-/// resolves against it, so a two-core instance (SP + RoT) lives under one directory
-/// and `pack` bundles it as a single tree regardless of where the RoT NVM sits.
-fn instance_anchor() -> String {
-    config::get().flash_path().to_string()
-}
-
 /// The Hubris SP archive for this run: explicit `$SP_EMU_ARCHIVE`, else the archive
 /// recorded in the flash `.nv` file (resolved against the instance base). `None` when
 /// neither is available (a bare-image instance; see the flash-time warning).
@@ -125,7 +116,7 @@ fn sp_archive() -> Option<String> {
     if let Some(a) = config::get().archive() {
         return Some(a.to_string());
     }
-    let flash = config::get().flash_path().to_string();
+    let flash = nvm_path();
     let rel = flash::load_nv(&flash::nv_state_path(&flash)).archive?;
     Some(flash::instance_base(&flash).join(rel).to_string_lossy().into_owned())
 }
@@ -727,14 +718,14 @@ fn serve_forever(slot: char, slot_given: bool, preboot: u64) -> Result<()> {
 }
 
 /// Stow the RoT's Hubris archives into the instance base (the SP flash's directory,
-/// `instance_anchor`) so the SP and RoT share one `archives/` and pack as a single
+/// `nvm_path`) so the SP and RoT share one `archives/` and pack as a single
 /// tree, and record which archive produced each region in the RoT metadata file
 /// (`<rot-nvm>.nv`, refs relative to that base): slot A = `SP_EMU_ROT_FLASH`, slot B =
 /// `SP_EMU_ROT_IMAGE_B`, stage0 = `SP_EMU_ROT_BOOTLEBY`. Warns on a bare-bin RoT image
 /// (humility can't attach).
 fn record_rot_archives(slot_a: &str) {
     let nvm = rot_flash::nvm_path();
-    let anchor = instance_anchor();
+    let anchor = nvm_path();
     let cfg = config::get();
     let stow = |src: &str, name: &str, region: &str| -> Option<String> {
         if flash::is_archive(src) {
