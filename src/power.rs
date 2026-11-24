@@ -8,12 +8,15 @@
 //!
 //! Enabled by `$SP_EMU_HOST_POWER=<host:port>`. Newline delimited text:
 //! ```text
-//!   sp-emu -> client:  state <A0|A2>                  on connect and on request
-//!                      event <a0|a2>                  each host power transition
+//!   sp-emu -> client:  state <A0 [A|B]|A2>            on connect and on request
+//!                      event <a0 [A|B]|a2>            each host power transition
 //!                      ignition <port> <on|off|reset> each ignition request (sidecar)
 //!   client -> sp-emu:  state                          ask for a state line
 //!                      host-lost                      the host went away
 //! ```
+//! On a gimlet, A0 carries the host phase 1 slot the host boots from: the host
+//! flash chip selected when the sequencer reached A0.
+//!
 //! `host-lost` becomes an IPCC `HostToSp::RequestPowerOff` on UART7, which
 //! host-sp-comms turns into a sequencer A2.
 //!
@@ -68,6 +71,8 @@ struct Inner {
     clients: Vec<Client>,
     /// The host power as the FPGA model last reported it.
     host_on: bool,
+    /// The host flash chip selected at the last A0 (gimlet).
+    boot_slot: Option<u8>,
     last_poll: Instant,
 }
 
@@ -119,6 +124,7 @@ pub fn init() {
                     listener: l,
                     clients: Vec::new(),
                     host_on: false,
+                    boot_slot: None,
                     last_poll: Instant::now(),
                 }))
             }
@@ -139,8 +145,15 @@ fn with<R>(f: impl FnOnce(&mut Inner) -> R) -> Option<R> {
     Some(f(&mut g))
 }
 
-fn state_line(on: bool) -> String {
-    format!("state {}\n", if on { "A0" } else { "A2" })
+/// A `state` or `event` line.
+fn power_line(kind: &str, on: bool, boot_slot: Option<u8>) -> String {
+    let (a0, a2) = if kind == "state" { ("A0", "A2") } else { ("a0", "a2") };
+    match (on, boot_slot) {
+        (true, Some(0)) => format!("{kind} {a0} A\n"),
+        (true, Some(_)) => format!("{kind} {a0} B\n"),
+        (true, None) => format!("{kind} {a0}\n"),
+        (false, _) => format!("{kind} {a2}\n"),
+    }
 }
 
 /// Send a line to every client, dropping the ones that are gone.
@@ -148,8 +161,9 @@ fn broadcast(inner: &mut Inner, line: &str) {
     inner.clients.retain_mut(|c| c.stream.write_all(line.as_bytes()).is_ok());
 }
 
-/// The FPGA model reports the host power it now supplies.
-pub fn host_changed(on: bool) {
+/// The FPGA model reports the host power it now supplies. `boot_slot` is the
+/// host flash chip selected at A0, `None` on a sidecar.
+pub fn host_changed(on: bool, boot_slot: Option<u8>) {
     {
         let mut h = host_ipcc();
         h.get_status_due = if on && stands_in_for_host() {
@@ -163,8 +177,10 @@ pub fn host_changed(on: bool) {
             return;
         }
         i.host_on = on;
-        eprintln!("[power] host {}", if on { "A0" } else { "A2" });
-        broadcast(i, &format!("event {}\n", if on { "a0" } else { "a2" }));
+        i.boot_slot = boot_slot;
+        let line = power_line("event", on, boot_slot);
+        eprint!("[power] host {}", &line["event ".len()..]);
+        broadcast(i, &line);
     });
 }
 
@@ -200,7 +216,10 @@ pub fn poll(uart_rx: &crate::soc::UartQueue) {
         i.last_poll = Instant::now();
         while let Ok((mut s, peer)) = i.listener.accept() {
             if s.set_nonblocking(true).is_ok()
-                && s.write_all(state_line(i.host_on).as_bytes()).is_ok()
+                && s.write_all(
+                    power_line("state", i.host_on, i.boot_slot).as_bytes(),
+                )
+                .is_ok()
             {
                 eprintln!("[power] client {peer}");
                 i.clients.push(Client {
@@ -210,7 +229,7 @@ pub fn poll(uart_rx: &crate::soc::UartQueue) {
                 });
             }
         }
-        let host_on = i.host_on;
+        let state = power_line("state", i.host_on, i.boot_slot);
         let mut lost = false;
         for c in &mut i.clients {
             let mut buf = [0u8; 256];
@@ -226,8 +245,7 @@ pub fn poll(uart_rx: &crate::soc::UartQueue) {
                     String::from_utf8_lossy(&cmd[..nl]).trim().to_string();
                 match cmd.as_str() {
                     "state" => {
-                        let _ =
-                            c.stream.write_all(state_line(host_on).as_bytes());
+                        let _ = c.stream.write_all(state.as_bytes());
                     }
                     "host-lost" => lost = true,
                     "" => {}
@@ -346,6 +364,15 @@ mod tests {
             u16::from_le_bytes([msg[17], msg[18]]),
             fletcher16(&msg[..17])
         );
+    }
+
+    #[test]
+    fn power_lines_carry_the_boot_slot_at_a0() {
+        assert_eq!(power_line("state", true, Some(0)), "state A0 A\n");
+        assert_eq!(power_line("event", true, Some(1)), "event a0 B\n");
+        assert_eq!(power_line("event", true, None), "event a0\n");
+        assert_eq!(power_line("state", false, Some(1)), "state A2\n");
+        assert_eq!(power_line("event", false, None), "event a2\n");
     }
 
     #[test]

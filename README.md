@@ -234,7 +234,8 @@ The ones you reach for most:
   so there is no doubt about whether persistent state is in use.
 - `SP_EMU_HOST_UART`: socket for the host-to-SP comms UART (IPCC).
 - `SP_EMU_HOST_POWER`: bind address of the host power bridge, which reports the
-  sequencer's host power transitions (`event a0`/`event a2`, and on the sidecar each
+  sequencer's host power transitions (`event a0 <A|B>`/`event a2`, where the letter
+  is the host phase 1 slot a gimlet boots from, and on the sidecar each
   `ignition <port> <on|off|reset>` request) and accepts `host-lost`, delivered to the
   SP as an IPCC `RequestPowerOff` so it drops the host to A2. `sp-emu power-watch
   <addr> [host-lost]` is the matching client.

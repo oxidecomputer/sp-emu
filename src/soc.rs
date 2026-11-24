@@ -98,7 +98,11 @@ pub fn install_peripherals(bus: &mut Bus) {
         bus.add_device(0x4000_3C00, 0x400, Box::new(Spi4::new())); // net ⇄ KSZ8463 (reuse KSZ model)
         bus.add_device(0x4001_5000, 0x400, Box::new(Spi5::new(spi5_cs)));
     } else {
-        bus.add_device(0x4000_3800, 0x400, Box::new(Spi2::new(spi2_cs))); // gimlet sequencer/KSZ
+        bus.add_device(
+            0x4000_3800,
+            0x400,
+            Box::new(Spi2::new(spi2_cs, hf_dev.clone())),
+        ); // gimlet sequencer/KSZ
     }
 
     // I2C controllers (gimlet: i2c1 spd, i2c2/3/4 sensors/power). Minimal FSM
@@ -797,6 +801,7 @@ pub struct Spi2 {
     // host power model: A0SMSTATUS progress and whether the host is powered
     a0sm: u8,
     host_on: bool,
+    hf_dev: HfDevSel,
     idx: u32,
     rx: Vec<u8>,
     // sequencer FPGA register file + per-transaction header accumulation
@@ -812,13 +817,14 @@ pub struct Spi2 {
     dbg_txn: u32,
 }
 impl Spi2 {
-    pub fn new(cs: Spi2Cs) -> Self {
+    pub fn new(cs: Spi2Cs, hf_dev: HfDevSel) -> Self {
         Spi2 {
             regs: Default::default(),
             cs,
             target: 0,
             a0sm: 0,
             host_on: false,
+            hf_dev,
             idx: 0,
             rx: Vec::new(),
             seq: Default::default(),
@@ -866,7 +872,9 @@ impl Spi2 {
                 }
                 if self.a0sm == A0SM_DONE && !self.host_on {
                     self.host_on = true;
-                    crate::power::host_changed(true);
+                    // The flash is muxed to the host by now, so the select is
+                    // the slot it boots from.
+                    crate::power::host_changed(true, Some(self.hf_dev.get()));
                 }
                 self.a0sm
             }
@@ -880,7 +888,7 @@ impl Spi2 {
             self.a0sm = 0;
             if self.host_on {
                 self.host_on = false;
-                crate::power::host_changed(false);
+                crate::power::host_changed(false, None);
             }
         }
     }
@@ -1359,7 +1367,7 @@ impl Spi5 {
             self.fpga.insert(a, rail);
         }
         if en != was_on {
-            crate::power::host_changed(en);
+            crate::power::host_changed(en, None);
         }
     }
     /// The next data byte for the current (read) command, with address auto-increment.
@@ -1457,7 +1465,7 @@ impl Mmio for Spi5 {
         let was_on = self.tofino_on();
         *self = Spi5::new(self.cs.clone());
         if was_on {
-            crate::power::host_changed(false);
+            crate::power::host_changed(false, None);
         }
     }
     fn read(&mut self, off: u32) -> u32 {
@@ -3244,7 +3252,7 @@ mod tests {
 
     #[test]
     fn spi2_host_power_follows_the_sequencer() {
-        let mut s = Spi2::new(Rc::new(Cell::new(1)));
+        let mut s = Spi2::new(Rc::new(Cell::new(1)), Rc::new(Cell::new(0)));
         assert_eq!(seq_read(&mut s, SEQ_PWR_CTRL, 1), [0], "A2 resting");
         assert_eq!(seq_read(&mut s, SEQ_A1SMSTATUS, 1), [0]);
         assert_eq!(seq_read(&mut s, SEQ_A0SMSTATUS, 1), [0]);
@@ -3275,7 +3283,7 @@ mod tests {
 
     #[test]
     fn spi2_reset_drops_the_host() {
-        let mut s = Spi2::new(Rc::new(Cell::new(1)));
+        let mut s = Spi2::new(Rc::new(Cell::new(1)), Rc::new(Cell::new(0)));
         seq_write(&mut s, 0, SEQ_PWR_CTRL, 0x03);
         seq_poll(&mut s, SEQ_A0SMSTATUS, A0SM_DONE);
         assert!(s.host_on);
