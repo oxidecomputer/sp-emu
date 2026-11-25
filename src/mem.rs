@@ -106,6 +106,9 @@ pub struct Bus {
     /// aliases) reaches the same RotFlash + RAM. RoT (bootleby) core only; the
     /// STM32 SP uses 0x3000_0000 as a distinct SRAM, so this stays off there.
     pub secure_alias: bool,
+    /// Executable flash was erased or programmed; `Cpu::step` flushes its
+    /// decode cache and clears this.
+    pub code_changed: bool,
 }
 
 const SCB_ICSR: u32 = 0xE000_ED04;
@@ -241,6 +244,7 @@ impl Bus {
             rot_flash: None,
             rom_enabled: false,
             secure_alias: false,
+            code_changed: false,
         }
     }
 
@@ -1020,6 +1024,7 @@ impl Bus {
             if (ROT_FLASH_REG_LO..ROT_FLASH_REG_HI).contains(&addr) {
                 self.mmio_hit = true;
                 f.reg_write((addr & !3) - ROT_FLASH_REG_LO, val);
+                self.code_changed |= f.take_code_changed();
                 return;
             }
         }
