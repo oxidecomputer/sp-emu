@@ -430,6 +430,9 @@ fn rot_thread_main(
             if crate::sprot::rot_trace_tick() {
                 eprintln!("[rottr] {:#010x}", rc.pc);
             }
+            if rb.reset_pending {
+                break;
+            }
             rc.maybe_tick(&mut rb);
             rc.maybe_interrupt(&mut rb);
             if rc.idle_skip > 0 {
@@ -437,6 +440,34 @@ fn rot_thread_main(
                 rot_idled = true;
                 break;
             }
+        }
+        // Chip reset (SYSCON.SWR_RESET, e.g. after an update): rebuild the core
+        // from the persisted flash, as a restart of sp-emu would, and drop
+        // whatever exchange the SP had open.
+        if rb.reset_pending {
+            eprintln!("[rot] chip reset");
+            rb.flush_rot_flash();
+            (rc, rb) = match crate::build_rot_core(&image) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[rot] rebuild after reset failed: {e}");
+                    return;
+                }
+            };
+            rc.trace_svc = crate::config::get().rotsvc();
+            rc.record_disasm = rot_trace_from.is_some();
+            rot_trap_seen.clear();
+            let mut lk = link.borrow_mut();
+            lk.mosi.clear();
+            lk.miso.clear();
+            lk.rot_irq = false;
+            lk.ssa = false;
+            lk.ssd = false;
+            lk.sot_pending = false;
+            lk.request_in_flight = false;
+            drop(lk);
+            link.wake_sp();
+            continue;
         }
         shared.tick_events.store(rc.tick_events, Ordering::Relaxed);
         shared.rot_pc.store(rc.pc, Ordering::Relaxed);
