@@ -96,6 +96,9 @@ pub struct Net {
     pub eth_txbreak: Option<bool>,
     /// WFI idle-throttle period, milliseconds.
     pub idle_ms: Option<u64>,
+    /// Pace the SP's SysTick by the wall clock, with at least this many
+    /// instructions between ticks. Unset: one tick per SYST_RVR instructions.
+    pub wall_tick: Option<u32>,
 }
 
 /// Host UART / IPCC.
@@ -259,7 +262,8 @@ is_empty_impl!(Net {
     vid1,
     eth_quantum,
     eth_txbreak,
-    idle_ms
+    idle_ms,
+    wall_tick
 });
 is_empty_impl!(Host { uart, pty });
 is_empty_impl!(I2c { bridge, device });

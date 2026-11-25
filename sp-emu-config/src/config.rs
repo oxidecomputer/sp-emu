@@ -85,6 +85,7 @@ config! {
     [val] eth_quantum: u32,
     [val] eth_txbreak: bool,
     [val] idle_ms: u64,
+    [val] wall_tick: Option<u32>,
 
     // ---- host UART / IPCC ----
     [ostr] host_uart: Option<String>,

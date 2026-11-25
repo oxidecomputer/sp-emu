@@ -40,6 +40,7 @@ pub const ENV_NAMES: &[&str] = &[
     "SP_EMU_ETH_QUANTUM",
     "SP_EMU_ETH_TXBREAK",
     "SP_EMU_IDLE_MS",
+    "SP_EMU_WALL_TICK",
     "SP_EMU_HOST_UART",
     "SP_EMU_HOST_PTY",
     "SP_EMU_I2C_BRIDGE",
@@ -196,6 +197,7 @@ fn set(c: &mut ConfigFileV1, name: &str, s: &str) {
         "SP_EMU_ETH_QUANTUM" => c.net.eth_quantum = s.parse().ok(),
         "SP_EMU_ETH_TXBREAK" => c.net.eth_txbreak = ne0,
         "SP_EMU_IDLE_MS" => c.net.idle_ms = s.parse().ok(),
+        "SP_EMU_WALL_TICK" => c.net.wall_tick = s.parse().ok(),
 
         // host UART / IPCC
         "SP_EMU_HOST_UART" => c.host.uart = Some(s.into()),

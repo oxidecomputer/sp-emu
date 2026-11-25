@@ -66,6 +66,7 @@ pub fn ingest(ext: ConfigFileV1) -> Result<Config, ConfigError> {
         eth_quantum: net.eth_quantum.filter(|&q| q > 0).unwrap_or(4096),
         eth_txbreak: net.eth_txbreak.unwrap_or(true),
         idle_ms: net.idle_ms.unwrap_or(10),
+        wall_tick: net.wall_tick,
 
         // host UART / IPCC
         host_uart: host.uart,

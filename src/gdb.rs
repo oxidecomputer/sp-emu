@@ -545,6 +545,8 @@ pub fn serve(
     // Post-preboot: enable the WFI idle-throttle so an idle SP sleeps the host
     // instead of pegging a core (preboot ran with it off, at full spin speed).
     cpu.wfi_throttle = true;
+    cpu.wall_tick =
+        crate::config::get().wall_tick().map(crate::cpu::WallTick::new);
     // Per idle WFI, sleep this long (ms) instead of spinning. Larger = lower
     // idle CPU but slower background sim-time; an incoming packet's eth-irq wakes
     // the SP immediately regardless. 10ms ≈ 4x CPU cut; tune via SP_EMU_IDLE_MS
