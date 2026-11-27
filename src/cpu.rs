@@ -1997,8 +1997,8 @@ impl Cpu {
             a = a.wrapping_add(4);
         }
         if fpca {
-            for i in 0..16 {
-                bus.write32(a, self.s[i]);
+            for &v in &self.s[..16] {
+                bus.write32(a, v);
                 a = a.wrapping_add(4);
             }
             bus.write32(a, self.fpscr);
@@ -2074,8 +2074,8 @@ impl Cpu {
         }
         let mut sp = base.wrapping_add(0x20);
         if extended {
-            for i in 0..16 {
-                self.s[i] = bus.read32(sp);
+            for v in &mut self.s[..16] {
+                *v = bus.read32(sp);
                 sp = sp.wrapping_add(4);
             }
             self.fpscr = bus.read32(sp);

@@ -1136,8 +1136,8 @@ fn boot(image: &[u8], swap_override: Option<bool>, max: u64) -> Result<()> {
                         (bus.mmio_hit || exc || cpu.last_it || cpu.last_sys)
                             as u8;
                     let _ = write!(f, "{:08x}", pc);
-                    for k in 0..15 {
-                        let _ = write!(f, " {:08x}", cpu.r[k]);
+                    for r in &cpu.r[..15] {
+                        let _ = write!(f, " {:08x}", r);
                     }
                     let _ = write!(
                         f,
