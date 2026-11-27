@@ -28,8 +28,10 @@
 //!     flash and keeps the advanced counter. See demo/README.md for how that
 //!     baseline supports rollback and key-revocation testing.
 //!   * The active CFPA's persistent boot-preference bit. This is only one input
-//!     bootleby uses; running the real bootleby (signature checks on both slots,
-//!     the transient RAM boot preference, scratch-CFPA promotion) is future work.
+//!     bootleby uses, alongside the signature checks on both slots.
+//!   * Scratch-CFPA promotion, as the boot ROM does it on reset: see
+//!     `promote_scratch_cfpa`. The transient RAM boot preference is not modeled;
+//!     a reset rebuilds the core's RAM.
 //!
 //! The flash contents and erased bitset persist to backing files, like the SP
 //! flash. Memory-mapped stores into the flash window are ignored: on the LPC55
@@ -53,7 +55,6 @@ pub const IMAGE_B_BASE: u32 = 0x0005_0000;
 
 // Protected flash region page byte-addresses (from the lpc55-pac peripheral
 // bases: FLASH_CFPA0 = 0x9_E000, FLASH_CMPA = 0x9_E400, key store 0x9_E600).
-#[allow(dead_code)] // PFR layout completeness; scratch promotion is future work
 const CFPA_SCRATCH: usize = 0x9_DE00;
 const CFPA_PING: usize = 0x9_E000;
 const CFPA_PONG: usize = 0x9_E200;
@@ -300,6 +301,7 @@ impl RotFlash {
         if !use_persisted {
             f.persist_all();
         }
+        f.promote_scratch_cfpa();
         Ok(f)
     }
 
@@ -601,6 +603,35 @@ impl RotFlash {
         }
     }
 
+    /// What the boot ROM does with the CFPA on reset: a valid scratch page newer
+    /// than the active page replaces the older of ping and pong. This is how a
+    /// persistent boot preference the update server wrote takes effect.
+    fn promote_scratch_cfpa(&mut self) {
+        use sha2::{Digest, Sha256};
+        if self.is_erased(CFPA_SCRATCH / PAGE) {
+            return;
+        }
+        let version = self.cfpa_at(CFPA_SCRATCH).version;
+        let active = self.active_cfpa();
+        if version <= self.cfpa_at(active).version {
+            return;
+        }
+        let page = self.mem[CFPA_SCRATCH..CFPA_SCRATCH + PAGE].to_vec();
+        if Sha256::digest(&page[..CFPA_HASH_OFF])[..] != page[CFPA_HASH_OFF..] {
+            eprintln!(
+                "[rotflash] scratch CFPA version {version}: bad hash, ignored"
+            );
+            return;
+        }
+        let older = if active == CFPA_PING { CFPA_PONG } else { CFPA_PING };
+        self.write_pages(older, &page);
+        self.persist_pages(older / PAGE, older / PAGE);
+        eprintln!(
+            "[rotflash] promoted scratch CFPA version {version}, boot preference slot {}",
+            self.boot_pref_slot().to_ascii_uppercase()
+        );
+    }
+
     /// The 512-byte CMPA page, for the boot-ROM signature verifier.
     pub fn cmpa_bytes(&self) -> [u8; PAGE] {
         self.mem[CMPA..CMPA + PAGE].try_into().unwrap()
@@ -858,6 +889,39 @@ mod tests {
             "Bart RKTH kept verbatim"
         );
         assert!(!f.is_erased(CMPA / PAGE), "CMPA page programmed");
+        cleanup(&f);
+    }
+
+    /// A valid scratch CFPA newer than the active page takes the older slot;
+    /// an older one, or one with a bad hash, is left alone.
+    #[test]
+    fn scratch_cfpa_promotion() {
+        use sha2::{Digest, Sha256};
+        let mut f = fresh();
+        let scratch = |version: u32| {
+            let mut c =
+                lpc55_areas::CFPAPage::from_bytes(&seed_cfpa(true)).unwrap();
+            c.version = version;
+            let mut p = to_page(c.to_vec().unwrap());
+            let digest = Sha256::digest(&p[..CFPA_HASH_OFF]);
+            p[CFPA_HASH_OFF..PAGE].copy_from_slice(&digest);
+            p
+        };
+
+        f.write_pages(CFPA_SCRATCH, &scratch(0));
+        f.promote_scratch_cfpa();
+        assert_eq!(f.boot_pref_slot(), 'a', "not newer than the active page");
+
+        let mut bad = scratch(1);
+        bad[CFPA_HASH_OFF] ^= 1;
+        f.write_pages(CFPA_SCRATCH, &bad);
+        f.promote_scratch_cfpa();
+        assert_eq!(f.boot_pref_slot(), 'a', "bad hash");
+
+        f.write_pages(CFPA_SCRATCH, &scratch(1));
+        f.promote_scratch_cfpa();
+        assert_eq!(f.active_cfpa(), CFPA_PONG, "pong was the older page");
+        assert_eq!(f.boot_pref_slot(), 'b');
         cleanup(&f);
     }
 

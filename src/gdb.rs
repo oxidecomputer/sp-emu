@@ -313,6 +313,8 @@ fn rot_thread_main(
 
     // The SP-side SPI master may now pace on RoT progress (sprot.rs TXDR).
     link.borrow_mut().rot_live = true;
+    // Between a chip reset and the RoT's return to idle.
+    let mut rebooting = false;
 
     loop {
         // The RoT's own debug probe: halt it, serve humility (ringbuf/hiffy/
@@ -430,6 +432,9 @@ fn rot_thread_main(
             if crate::sprot::rot_trace_tick() {
                 eprintln!("[rottr] {:#010x}", rc.pc);
             }
+            if rb.reset_pending {
+                break;
+            }
             rc.maybe_tick(&mut rb);
             rc.maybe_interrupt(&mut rb);
             if rc.idle_skip > 0 {
@@ -437,6 +442,45 @@ fn rot_thread_main(
                 rot_idled = true;
                 break;
             }
+        }
+        // Chip reset (SYSCON.SWR_RESET, e.g. after an update): rebuild the core
+        // from the persisted flash, as a restart of sp-emu would, and drop
+        // whatever exchange the SP had open.
+        if rb.reset_pending {
+            eprintln!("[rot] chip reset");
+            rb.flush_rot_flash();
+            (rc, rb) = match crate::build_rot_core(&image) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[rot] rebuild after reset failed: {e}");
+                    return;
+                }
+            };
+            rc.trace_svc = crate::config::get().rotsvc();
+            rc.record_disasm = rot_trace_from.is_some();
+            rot_trap_seen.clear();
+            rebooting = true;
+            let mut lk = link.borrow_mut();
+            lk.rot_live = false;
+            lk.miso.clear();
+            lk.rot_irq = false;
+            lk.request_in_flight = false;
+            drop(lk);
+            link.wake_sp();
+            continue;
+        }
+        // Back at idle after a chip reset: the RoT is listening again. What
+        // the SP clocked out meanwhile went to a chip in reset, notably its
+        // retries of the reset request, which would otherwise reset the RoT
+        // a second time.
+        if rebooting && rot_idled {
+            rebooting = false;
+            let mut lk = link.borrow_mut();
+            lk.mosi.clear();
+            lk.ssa = false;
+            lk.ssd = false;
+            lk.sot_pending = false;
+            lk.rot_live = true;
         }
         shared.tick_events.store(rc.tick_events, Ordering::Relaxed);
         shared.rot_pc.store(rc.pc, Ordering::Relaxed);

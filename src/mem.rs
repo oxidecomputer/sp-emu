@@ -126,6 +126,9 @@ pub const SYST_CVR: u32 = 0xE000_E018;
 // the non-secure address OR'd with the IDAU secure-alias bit (bit 28). bootleby links
 // at the secure aliases; `Bus::fold` maps them onto the modeled non-secure memory.
 pub const LPC55_SECURE_ALIAS_BIT: u32 = 0x1000_0000;
+/// LPC55 SYSCON.SWR_RESET and its key (UM11126 4.5.16): a write resets the chip.
+const LPC55_SWR_RESET: u32 = 0x4000_0160;
+const LPC55_SWR_RESET_KEY: u32 = 0x5A00_0001;
 const LPC55_SRAM_BASE: u32 = 0x2000_0000; // non-secure main SRAM (SRAMX/SRAM0..)
 const LPC55_SRAM_SIZE: u32 = 0x0008_0000; // main SRAM window folded (covers the RoT's use)
 
@@ -1059,6 +1062,12 @@ impl Bus {
         if addr & !3 == SCB_AIRCR
             && (val & 0xFFFF_0000) == AIRCR_VECTKEY
             && val & (1 << 2) != 0
+        {
+            self.reset_pending = true;
+        }
+        if self.rot_flash.is_some()
+            && addr & !LPC55_SECURE_ALIAS_BIT == LPC55_SWR_RESET
+            && val == LPC55_SWR_RESET_KEY
         {
             self.reset_pending = true;
         }

@@ -55,8 +55,8 @@ pub struct HashCrypt {
     /// The partial block being filled by INDATA writes.
     block: [u32; 16],
     fill: usize,
-    /// DIGEST0..7 register contents (the state, byte-swapped: firmware reads each
-    /// DIGEST word and calls `.swap_bytes()`).
+    /// DIGEST0..7 register contents: the state words. Firmware byte-swaps each
+    /// and keeps the result in little-endian memory, giving the digest's bytes.
     digest: [u32; 8],
     status: u32,
 }
@@ -106,9 +106,7 @@ impl HashCrypt {
                 core::slice::from_ref(GenericArray::from_slice(&bytes)),
             );
             self.fill = 0;
-            for (d, &h) in self.digest.iter_mut().zip(self.state.iter()) {
-                *d = h.swap_bytes();
-            }
+            self.digest = self.state;
             self.status |= ST_DIGEST; // a block finished; a digest is ready
         }
         self.status |= ST_WAITING; // always ready for the next word
@@ -156,7 +154,7 @@ mod tests {
     /// MODE+NEW_HASH, feed the message words, then the software Merkle-Damgard
     /// padding (pre-swapped PAD and 64-bit length words). Zero-fill carries into a
     /// second block when the length words don't fit the current one. Returns the
-    /// byte-swapped DIGEST the firmware reads back.
+    /// digest bytes as the firmware holds them.
     fn engine_digest(msg: &[u32]) -> Vec<u8> {
         let mut h = HashCrypt::new();
         h.write(REG_CTRL, MODE_SHA2_256 | NEW_HASH);
@@ -173,7 +171,7 @@ mod tests {
         assert_eq!(h.read(REG_STATUS) & ST_DIGEST, ST_DIGEST, "digest ready");
         (0..8)
             .flat_map(|i| {
-                h.read(REG_DIGEST0 + i * 4).swap_bytes().to_be_bytes()
+                h.read(REG_DIGEST0 + i * 4).swap_bytes().to_le_bytes()
             })
             .collect()
     }
@@ -228,7 +226,7 @@ mod tests {
         h.write(REG_INDATA, u32::swap_bytes(bits as u32));
         let got: Vec<u8> = (0..8)
             .flat_map(|i| {
-                h.read(REG_DIGEST0 + i * 4).swap_bytes().to_be_bytes()
+                h.read(REG_DIGEST0 + i * 4).swap_bytes().to_le_bytes()
             })
             .collect();
         assert_eq!(got, reference_digest(&msg));
