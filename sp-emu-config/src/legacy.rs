@@ -42,6 +42,7 @@ pub const ENV_NAMES: &[&str] = &[
     "SP_EMU_IDLE_MS",
     "SP_EMU_HOST_UART",
     "SP_EMU_HOST_PTY",
+    "SP_EMU_HOST_POWER",
     "SP_EMU_I2C_BRIDGE",
     "SP_EMU_I2C_DEVICE",
     "SP_EMU_ROT_ROM",
@@ -200,6 +201,7 @@ fn set(c: &mut ConfigFileV1, name: &str, s: &str) {
         // host UART / IPCC
         "SP_EMU_HOST_UART" => c.host.uart = Some(s.into()),
         "SP_EMU_HOST_PTY" => c.host.pty = present,
+        "SP_EMU_HOST_POWER" => c.host.power = Some(s.into()),
 
         // companion I2C bridge
         "SP_EMU_I2C_BRIDGE" => c.i2c.bridge = Some(s.into()),

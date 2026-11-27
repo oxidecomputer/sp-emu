@@ -93,6 +93,9 @@ pub fn template() -> String {
         "# uart = \"/path/to/socket\"       # connect the host UART to a unix socket"
     );
     line!("pty = {}", d.host_pty());
+    line!(
+        "# power = \"[::1]:33312\"          # bind the host power bridge here"
+    );
 
     line!("\n# Companion I2C bridge.");
     line!("[i2c]");
@@ -233,7 +236,11 @@ fn config_to_external(c: &Config) -> ConfigFileV1 {
             eth_txbreak: Some(c.eth_txbreak),
             idle_ms: Some(c.idle_ms),
         },
-        host: v1::Host { uart: c.host_uart.clone(), pty: Some(c.host_pty) },
+        host: v1::Host {
+            uart: c.host_uart.clone(),
+            pty: Some(c.host_pty),
+            power: c.host_power.clone(),
+        },
         i2c: v1::I2c {
             bridge: c.i2c_bridge.clone(),
             device: c.i2c_device.clone(),
