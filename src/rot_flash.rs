@@ -214,6 +214,8 @@ pub struct RotFlash {
     /// Set after the first failed erased-bitset write, so a persistently
     /// failing disk logs once rather than per flash operation.
     bitset_write_failed: bool,
+    /// Set by an erase or program; the bus takes it to flush cached decodes.
+    code_changed: bool,
 }
 
 fn bitset_path(path: &str) -> String {
@@ -239,6 +241,7 @@ impl RotFlash {
             dbg: cfg.rotflashdbg(),
             unknown_cmds_logged: 0,
             bitset_write_failed: false,
+            code_changed: false,
         };
 
         // Persisted state takes precedence over `image` and the CMPA/CFPA/bootleby
@@ -454,6 +457,10 @@ impl RotFlash {
         }
     }
 
+    pub fn take_code_changed(&mut self) -> bool {
+        std::mem::take(&mut self.code_changed)
+    }
+
     pub fn reg_write(&mut self, off: u32, val: u32) {
         match off {
             REG_CMD => self.do_cmd(val),
@@ -506,6 +513,7 @@ impl RotFlash {
             self.set_erased(page, true);
         }
         self.persist_pages(first, last);
+        self.code_changed = true;
         self.status |= ST_DONE;
     }
 
@@ -532,6 +540,7 @@ impl RotFlash {
             }
             self.set_erased(page, false);
             self.persist_pages(page, page);
+            self.code_changed = true;
         }
         self.page_buf = [ERASED; PAGE];
         self.status |= ST_DONE;
@@ -830,6 +839,8 @@ mod tests {
             f.reg_write(REG_INT_CLR_STATUS, 0xF);
             f.reg_write(REG_CMD, CMD_WRITE);
         }
+        assert!(f.take_code_changed(), "erase changed flash");
+        assert!(!f.take_code_changed(), "filling the buffer did not");
         f.reg_write(REG_STARTA, word);
         f.reg_write(REG_INT_CLR_STATUS, 0xF);
         f.reg_write(REG_CMD, CMD_PROGRAM);

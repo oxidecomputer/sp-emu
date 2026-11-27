@@ -824,6 +824,13 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
         bus.rom_enabled = true;
         eprintln!("[rot] boot-ROM API emulation enabled (skboot_authenticate)");
     }
+    // Cache decodes for the whole LPC55 flash: bootleby runs from its secure
+    // alias, the Hubris image from either slot. Flash writes flush the cache
+    // (`Bus::code_changed`).
+    cpu.set_flash_cache(
+        rot_flash::BASE..rot_flash::BASE + rot_flash::SIZE as u32,
+        mem::LPC55_SECURE_ALIAS_BIT,
+    );
     // Bootleby mode (SP_EMU_ROT_BOOTLEBY): load real bootleby at the flash base and
     // boot it instead of jumping to the image; bootleby does genuine A/B selection
     // via the boot-ROM skboot_authenticate shim. It links at the TrustZone secure
@@ -844,16 +851,9 @@ pub fn build_rot_core(image: &[u8]) -> Result<(Cpu, Bus)> {
             pc
         );
         cpu.reset(sp, pc);
-        // bootleby executes from the secure flash alias (the non-secure flash base
-        // OR'd with the secure-alias bit).
-        let secure_base = mem::LPC55_SECURE_ALIAS_BIT | rot_flash::BASE;
-        cpu.set_flash_cache(secure_base..(secure_base + bl.len() as u32));
         bus.write32(mem::SCB_VTOR, rot_flash::BASE); // VTOR at the flash base
         return Ok((cpu, bus));
     }
-    // The RoT executes in place from its LPC55 image (immutable XIP flash) at
-    // 0x0001_0000, outside the SP's default cache window, so cache decodes there.
-    cpu.set_flash_cache(base..(base + image.len() as u32));
     bus.write32(mem::SCB_VTOR, base);
     Ok((cpu, bus))
 }

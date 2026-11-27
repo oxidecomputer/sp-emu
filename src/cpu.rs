@@ -139,10 +139,13 @@ pub struct Cpu {
     /// memory map, and decode cache); they only differ by where their image is
     /// mapped. So the cacheable window is per-instance: it defaults to the SP's
     /// flash window (`FLASH_LO..FLASH_HI`, 0x0800_0000) and the RoT instance sets
-    /// its own (its image span at 0x0001_0000) via `set_flash_cache`. PCs outside
+    /// its own (the LPC55 flash at 0x0) via `set_flash_cache`. PCs outside
     /// the window (RAM, the ITCM-injected endoscope) are decoded fresh every time,
     /// so self-modified or injected code is never served a stale decode.
     flash_cache: std::ops::Range<u32>,
+    /// Address bits ignored when testing `flash_cache`, so an alias of the
+    /// window (the LPC55 secure alias bootleby runs from) is cached too.
+    flash_cache_alias: u32,
     syst_csr: u32, // cached SYST_CSR (refreshed periodically in maybe_tick)
     syst_rvr: u32, // cached SYST_RVR reload value (>=1)
     /// This core's executable-memory windows: a stacked return PC outside all of
@@ -278,6 +281,7 @@ impl Cpu {
             decoder: InstDecoder::default_thumb(),
             dcache: std::collections::HashMap::default(),
             flash_cache: FLASH_LO..FLASH_HI,
+            flash_cache_alias: 0,
             syst_csr: 0,
             syst_rvr: 1,
             code_ranges: vec![0..ITCM_HI, SP_CODE_RANGE],
@@ -372,15 +376,17 @@ impl Cpu {
         }
     }
 
-    /// Set the PC window whose decodes are cached: this instance's own immutable
-    /// XIP flash. The SP and RoT are separate `Cpu` instances (see `flash_cache`)
-    /// whose images sit at different flash bases (SP 0x0800_0000, RoT/LPC55
-    /// 0x0001_0000), so each configures its own window; this is a memory-map
-    /// setting, not a change of core architecture. The range must cover only
-    /// immutable code: RAM or injected/self-modified regions must stay outside
-    /// it, or their stale decodes would be reused.
-    pub fn set_flash_cache(&mut self, range: std::ops::Range<u32>) {
+    /// Set the PC window whose decodes are cached: this instance's own XIP
+    /// flash. The SP and RoT are separate `Cpu` instances (see `flash_cache`)
+    /// with different flash bases (SP 0x0800_0000, RoT/LPC55 0x0), so each
+    /// configures its own window; this is a memory-map setting, not a change of
+    /// core architecture. `alias` is the address bits to ignore when testing the
+    /// window. The range must cover only code that is immutable or whose
+    /// writes set `Bus::code_changed`: RAM or injected/self-modified regions
+    /// must stay outside it, or their stale decodes would be reused.
+    pub fn set_flash_cache(&mut self, range: std::ops::Range<u32>, alias: u32) {
         self.flash_cache = range;
+        self.flash_cache_alias = alias;
     }
 
     /// Replace this core's executable-memory windows for the exc-ret crash
@@ -509,8 +515,13 @@ impl Cpu {
         // instructions) be decoded once instead of every instruction; the debug
         // port invalidates those entries on injection (`invalidate_decode`), and
         // gating on `debug_en` keeps normal execution's mutable ITCM uncached.
+        if bus.code_changed {
+            bus.code_changed = false;
+            self.dcache.clear();
+        }
         let cacheable =
-            self.flash_cache.contains(&pc) || (self.debug_en && pc < ITCM_HI);
+            self.flash_cache.contains(&(pc & !self.flash_cache_alias))
+                || (self.debug_en && pc < ITCM_HI);
         let dec: Rc<Decoded> = if cacheable {
             match self.dcache.get(&pc) {
                 Some(d) => d.clone(), // Rc bump; decouples from the &mut self execute below
@@ -2823,6 +2834,37 @@ mod tests {
         bus.log_unmapped = false;
         bus.add_ram(RAM, 0x1000);
         bus
+    }
+
+    /// A cached decode is reused until the bus reports a flash change, and an
+    /// alias of the cache window is cached too.
+    #[test]
+    fn decode_cache_flushes_on_code_change() {
+        const MOVS_R0_1: u16 = 0x2001;
+        const MOVS_R0_2: u16 = 0x2002;
+        const ALIAS: u32 = 0x1000_0000;
+        let mut bus = ram_bus();
+        bus.add_ram(RAM | ALIAS, 0x1000);
+        let mut host = StdoutHost;
+        for base in [RAM, RAM | ALIAS] {
+            let mut cpu = Cpu::new();
+            cpu.set_flash_cache(RAM..RAM + 0x1000, ALIAS);
+            bus.write16(base, MOVS_R0_1);
+            cpu.pc = base;
+            cpu.step(&mut bus, &mut host).unwrap();
+            assert_eq!(cpu.r[0], 1);
+
+            bus.write16(base, MOVS_R0_2);
+            cpu.pc = base;
+            cpu.step(&mut bus, &mut host).unwrap();
+            assert_eq!(cpu.r[0], 1, "stale decode served from the cache");
+
+            bus.code_changed = true;
+            cpu.pc = base;
+            cpu.step(&mut bus, &mut host).unwrap();
+            assert_eq!(cpu.r[0], 2, "cache flushed");
+            assert!(!bus.code_changed);
+        }
     }
 
     #[test]
