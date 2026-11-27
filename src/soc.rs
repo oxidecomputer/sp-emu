@@ -28,6 +28,9 @@ pub type Spi2Cs = Rc<Cell<u8>>;
 /// used because the deassert between commands happens with no Spi5 access, so a
 /// bool edge would be missed; the GPIO bank sees every PJ6 write and counts.
 pub type Spi5Cs = Rc<Cell<u32>>;
+/// Host-flash device select, shared between the GPIO bank (gimlet PG5, hf's
+/// `flash_dev_select`) and the QSPI model: 0 = Flash0, 1 = Flash1.
+pub type HfDevSel = Rc<Cell<u8>>;
 
 // ---- standard STM32H7 memory map (gimletlet uses the AXI-SRAM layout) -------
 
@@ -74,10 +77,15 @@ pub fn install_peripherals(bus: &mut Bus) {
     // drives the shared SPI2 chip-select (PB5=sequencer, PI0=KSZ8463).
     let spi2_cs: Spi2Cs = Rc::new(Cell::new(0));
     let spi5_cs: Spi5Cs = Rc::new(Cell::new(0));
+    let hf_dev: HfDevSel = Rc::new(Cell::new(0));
     bus.add_device(
         0x5802_0000,
         0x3000,
-        Box::new(GpioBank::new(spi2_cs.clone(), spi5_cs.clone())),
+        Box::new(GpioBank::new(
+            spi2_cs.clone(),
+            spi5_cs.clone(),
+            hf_dev.clone(),
+        )),
     );
 
     // SPI bus wiring differs by board. On gimlet, SPI2 (0x4000_3800) is the iCE40
@@ -90,7 +98,11 @@ pub fn install_peripherals(bus: &mut Bus) {
         bus.add_device(0x4000_3C00, 0x400, Box::new(Spi4::new())); // net ⇄ KSZ8463 (reuse KSZ model)
         bus.add_device(0x4001_5000, 0x400, Box::new(Spi5::new(spi5_cs)));
     } else {
-        bus.add_device(0x4000_3800, 0x400, Box::new(Spi2::new(spi2_cs))); // gimlet sequencer/KSZ
+        bus.add_device(
+            0x4000_3800,
+            0x400,
+            Box::new(Spi2::new(spi2_cs, hf_dev.clone())),
+        ); // gimlet sequencer/KSZ
     }
 
     // I2C controllers (gimlet: i2c1 spd, i2c2/3/4 sensors/power). Minimal FSM
@@ -142,10 +154,12 @@ pub fn install_peripherals(bus: &mut Bus) {
 
     // QUADSPI (0x5200_5000): writable NOR-flash model. On gimlet the `hf` task
     // drives it (host flash: RDID must answer a recognized Micron 32 MiB chip or
-    // hf's init fails, blocking gimlet_seq's A0 transition and thus MGS `state`);
-    // on sidecar the `auxflash` task does (FPGA-blob slots: the MGS SP-update
-    // path erases + programs a slot and re-reads its CHCK). See the Qspi impl.
-    bus.add_device(0x5200_5000, 0x400, Box::new(Qspi::new()));
+    // hf's init fails, blocking gimlet_seq's A0 transition and thus MGS `state`).
+    // A gimlet has two such chips (host phase 1 slots A and B), selected by PG5
+    // through `hf_dev`. On sidecar the `auxflash` task drives it (FPGA-blob
+    // slots: the MGS SP-update path erases + programs a slot and re-reads its
+    // CHCK) and only chip 0 exists. See the Qspi impl.
+    bus.add_device(0x5200_5000, 0x400, Box::new(Qspi::new(hf_dev.clone())));
 
     // SYSCFG (0x5800_0400): gimlet's kernel reads PKGR (+0x124) on boot and
     // panics unless pkg[3:0] == 0b1000 (TFBGA240), a guard against flashing
@@ -787,6 +801,7 @@ pub struct Spi2 {
     // host power model: A0SMSTATUS progress and whether the host is powered
     a0sm: u8,
     host_on: bool,
+    hf_dev: HfDevSel,
     idx: u32,
     rx: Vec<u8>,
     // sequencer FPGA register file + per-transaction header accumulation
@@ -802,13 +817,14 @@ pub struct Spi2 {
     dbg_txn: u32,
 }
 impl Spi2 {
-    pub fn new(cs: Spi2Cs) -> Self {
+    pub fn new(cs: Spi2Cs, hf_dev: HfDevSel) -> Self {
         Spi2 {
             regs: Default::default(),
             cs,
             target: 0,
             a0sm: 0,
             host_on: false,
+            hf_dev,
             idx: 0,
             rx: Vec::new(),
             seq: Default::default(),
@@ -856,7 +872,9 @@ impl Spi2 {
                 }
                 if self.a0sm == A0SM_DONE && !self.host_on {
                     self.host_on = true;
-                    crate::power::host_changed(true);
+                    // The flash is muxed to the host by now, so the select is
+                    // the slot it boots from.
+                    crate::power::host_changed(true, Some(self.hf_dev.get()));
                 }
                 self.a0sm
             }
@@ -870,7 +888,7 @@ impl Spi2 {
             self.a0sm = 0;
             if self.host_on {
                 self.host_on = false;
-                crate::power::host_changed(false);
+                crate::power::host_changed(false, None);
             }
         }
     }
@@ -1349,7 +1367,7 @@ impl Spi5 {
             self.fpga.insert(a, rail);
         }
         if en != was_on {
-            crate::power::host_changed(en);
+            crate::power::host_changed(en, None);
         }
     }
     /// The next data byte for the current (read) command, with address auto-increment.
@@ -1447,7 +1465,7 @@ impl Mmio for Spi5 {
         let was_on = self.tofino_on();
         *self = Spi5::new(self.cs.clone());
         if was_on {
-            crate::power::host_changed(false);
+            crate::power::host_changed(false, None);
         }
     }
     fn read(&mut self, off: u32) -> u32 {
@@ -1515,17 +1533,19 @@ pub struct GpioBank {
     regs: std::collections::HashMap<u32, u32>,
     cs: Spi2Cs,
     spi5_cs: Spi5Cs,
+    hf_dev: HfDevSel,
     prev_pj6_low: Cell<bool>,
     sidecar: bool,
 }
 impl GpioBank {
-    pub fn new(cs: Spi2Cs, spi5_cs: Spi5Cs) -> Self {
+    pub fn new(cs: Spi2Cs, spi5_cs: Spi5Cs, hf_dev: HfDevSel) -> Self {
         // $SP_EMU_BOARD selects the board profile for synthesized input pins.
         let sidecar = crate::config::get().board().is_sidecar();
         GpioBank {
             regs: std::collections::HashMap::new(),
             cs,
             spi5_cs,
+            hf_dev,
             prev_pj6_low: Cell::new(false),
             sidecar,
         }
@@ -1554,6 +1574,18 @@ impl GpioBank {
             self.spi5_cs.set(self.spi5_cs.get().wrapping_add(1));
         }
         self.prev_pj6_low.set(pj6_low);
+        // Gimlet host-flash device select: PG5 high picks Flash1. Sidecar
+        // has one chip and uses PG5 elsewhere.
+        if !self.sidecar {
+            let pg = *self.regs.get(&(6 * 0x400 + 0x14)).unwrap_or(&0); // GPIOG ODR
+            let dev = ((pg >> 5) & 1) as u8;
+            if dev != self.hf_dev.get() {
+                self.hf_dev.set(dev);
+                if crate::dbg::eth() {
+                    eprintln!("[qspi] PG5 -> host flash device {dev}");
+                }
+            }
+        }
     }
 }
 impl Mmio for GpioBank {
@@ -1676,8 +1708,9 @@ impl Mmio for GpioBank {
                 }
             }
         }
-        // GPIOB/GPIOI affect SPI2 CS; GPIOJ (port 9) affects the sidecar SPI5 CS.
-        if port == 1 || port == 8 || port == 9 {
+        // GPIOB/GPIOI affect SPI2 CS; GPIOJ (port 9) affects the sidecar SPI5 CS;
+        // GPIOG (port 6) carries the gimlet host-flash device select.
+        if port == 1 || port == 6 || port == 8 || port == 9 {
             self.update_cs();
         }
     }
@@ -2240,9 +2273,10 @@ impl Mmio for I2c {
 /// * Any addressed read (Read 0x13, QuadRead 0x6C, ...): array contents.
 ///
 /// Program and erase require WEL and clear it on completion. Contents persist
-/// to `qspi-flash.bin` next to the SP flash NVM file, write-through like
-/// `Flash`. The file is created lazily on the first program or erase, so a
-/// gimlet that never writes its host flash creates no file.
+/// per chip (`qspi-flash.bin`, `qspi-flash-1.bin`) next to the SP flash NVM
+/// file, write-through like `Flash`. A file is created lazily on the first
+/// program or erase of its chip, so a gimlet that never writes its host flash
+/// creates no file.
 ///
 /// The driver (drv-stm32h7-qspi) polls SR.FLEVEL (bits 8..13) and SR.TCF
 /// (bit 1), moving data one byte at a time through DR (offset 0x20). Reads
@@ -2273,19 +2307,12 @@ enum QspiXfer {
     },
 }
 
-pub struct Qspi {
-    dlr: u32,        // transfer length register (holds len-1)
-    ar: u32,         // address register (last AR write)
-    resp: Vec<u8>,   // pending read response
-    resp_pos: usize, // bytes drained from `resp`
-    mode_read: bool, // current transfer is an indirect read
-    tcf: bool,       // transfer-complete latch
-    cr: u32,         // control register (stored, for EN bit etc.)
-    dcr: u32,        // device config (stored)
-    wel: bool,       // write-enable latch (RDSR bit 1)
-    xfer: QspiXfer,  // multi-register transfer in progress
-    wr_buf: Vec<u8>, // page-program data collected so far
-    mem: Vec<u8>,    // the 32 MiB NOR array
+/// One NOR chip: a 32 MiB array with its own write-enable latch and
+/// write-through backing file.
+struct NorChip {
+    idx: u8,
+    wel: bool,    // write-enable latch (RDSR bit 1)
+    mem: Vec<u8>, // the 32 MiB NOR array
     /// Write-through handle to the backing file, as in `Flash::file`. Opened
     /// at construction if a persisted image exists, else created and seeded on
     /// the first program or erase. `None` before that, or after an I/O error;
@@ -2294,23 +2321,13 @@ pub struct Qspi {
     /// Backing file path. `None` disables persistence (tests).
     path: Option<String>,
 }
-impl Qspi {
-    pub fn new() -> Self {
-        // Persist next to the SP flash NVM file, one array per instance.
-        let nvm = crate::config::instance_file(
-            "SP_EMU_FLASH",
-            crate::config::get().flash_path(),
-        );
-        let path = crate::flash::instance_base(&nvm)
-            .join("qspi-flash.bin")
-            .display()
-            .to_string();
-        Self::with_backing(Some(path))
-    }
-    /// Build the model, loading a persisted array from `path` if one exists.
-    fn with_backing(path: Option<String>) -> Self {
+impl NorChip {
+    /// Build the chip, loading a persisted array from `path` if one exists.
+    /// Returns whether an image was loaded.
+    fn load(idx: u8, path: Option<String>) -> (Self, bool) {
         let mut mem = vec![ERASED; QSPI_SIZE];
         let mut file = None;
+        let mut loaded = false;
         if let Some(p) = path.as_deref()
             && std::path::Path::new(p).exists()
         {
@@ -2323,66 +2340,24 @@ impl Qspi {
                             let n = buf.len().min(QSPI_SIZE);
                             mem[..n].copy_from_slice(&buf[..n]);
                             eprintln!(
-                                "[qspi] loaded persisted QSPI flash from {p}"
+                                "[qspi] chip {idx}: loaded persisted QSPI flash from {p}"
                             );
                             file = Some(f);
+                            loaded = true;
                         }
                         Err(e) => eprintln!(
-                            "[qspi] read {p} failed: {e}; starting erased"
+                            "[qspi] chip {idx}: read {p} failed: {e}; starting erased"
                         ),
                     }
                 }
-                Err(e) => {
-                    eprintln!("[qspi] open {p} failed: {e}; running RAM-only")
-                }
+                Err(e) => eprintln!(
+                    "[qspi] chip {idx}: open {p} failed: {e}; running RAM-only"
+                ),
             }
         }
-        Qspi {
-            dlr: 0,
-            ar: 0,
-            resp: Vec::new(),
-            resp_pos: 0,
-            mode_read: false,
-            tcf: false,
-            cr: 0,
-            dcr: 0,
-            wel: false,
-            xfer: QspiXfer::Idle,
-            wr_buf: Vec::new(),
-            mem,
-            file,
-            path,
-        }
+        (NorChip { idx, wel: false, mem, file, path }, loaded)
     }
-    /// Response for a non-addressed read command (RDID, RDSR, unique id).
-    fn build_response(&self, instruction: u8, len: usize) -> Vec<u8> {
-        let mut v = vec![0u8; len];
-        match instruction {
-            0x9F => {
-                // ReadId (RDID): Micron MT25Q, 32 MiB (log2 capacity = 0x19)
-                let id = [0x20u8, 0xBA, 0x19];
-                for (i, b) in id.iter().enumerate() {
-                    if i < len {
-                        v[i] = *b;
-                    }
-                }
-            }
-            0x05 => {
-                // ReadStatusReg: WIP (bit 0) always clear, WEL (bit 1) live.
-                if self.wel {
-                    v[0] = 0x02;
-                }
-            }
-            // Unknown non-addressed reads (e.g. Winbond unique id): 0xFF fill.
-            _ => {
-                for b in v.iter_mut() {
-                    *b = 0xFF;
-                }
-            }
-        }
-        v
-    }
-    /// Response for an addressed read: the array contents (wrapping at 32 MiB).
+    /// Array contents at `addr` (wrapping at 32 MiB).
     fn read_mem(&self, addr: u32, len: usize) -> Vec<u8> {
         let mut v = vec![ERASED; len];
         for (i, b) in v.iter_mut().enumerate() {
@@ -2412,17 +2387,26 @@ impl Qspi {
                     .and_then(|_| f.set_len(QSPI_SIZE as u64));
                 match r {
                     Ok(()) => {
-                        eprintln!("[qspi] created backing file {p}");
+                        eprintln!(
+                            "[qspi] chip {}: created backing file {p}",
+                            self.idx
+                        );
                         self.file = Some(f);
                     }
                     Err(e) => {
-                        eprintln!("[qspi] seed {p} failed: {e}; RAM-only");
+                        eprintln!(
+                            "[qspi] chip {}: seed {p} failed: {e}; RAM-only",
+                            self.idx
+                        );
                         self.path = None;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[qspi] create {p} failed: {e}; RAM-only");
+                eprintln!(
+                    "[qspi] chip {}: create {p} failed: {e}; RAM-only",
+                    self.idx
+                );
                 self.path = None;
             }
         }
@@ -2441,7 +2425,8 @@ impl Qspi {
                 .and_then(|_| f.write_all(&self.mem[off..off + len]));
             if let Err(e) = r {
                 eprintln!(
-                    "[qspi] write-through to {} failed: {e}",
+                    "[qspi] chip {}: write-through to {} failed: {e}",
+                    self.idx,
                     self.path.as_deref().unwrap_or("?")
                 );
                 self.file = None; // stop retrying a broken handle
@@ -2449,16 +2434,15 @@ impl Qspi {
             }
         }
     }
-    /// Sector (or bulk) erase at `self.ar`. Requires WEL; consumes it.
-    fn do_erase(&mut self, instruction: u8) {
+    /// Sector (or bulk) erase at `ar`. Requires WEL; consumes it.
+    fn erase(&mut self, instruction: u8, ar: u32) {
         if !self.wel {
             if crate::dbg::eth() {
                 eprintln!(
-                    "[qspi] erase {:#04x} without WEL, ignored",
-                    instruction
+                    "[qspi] chip {}: erase {:#04x} without WEL, ignored",
+                    self.idx, instruction
                 );
             }
-            self.tcf = true;
             return;
         }
         self.wel = false;
@@ -2466,33 +2450,33 @@ impl Qspi {
             0xC7 => (0, QSPI_SIZE), // BulkErase
             // SectorErase (0xDC 4-byte / 0xD8 3-byte): 64 KiB, aligned down.
             _ => (
-                self.ar as usize & (QSPI_SIZE - 1) & !(QSPI_SECTOR - 1),
+                ar as usize & (QSPI_SIZE - 1) & !(QSPI_SECTOR - 1),
                 QSPI_SECTOR,
             ),
         };
         self.mem[base..base + len].fill(ERASED);
         self.write_through(base, len);
-        self.tcf = true;
         if crate::dbg::eth() {
             eprintln!(
-                "[qspi] erase {:#04x} @ {:#010x} len={}",
-                instruction, base, len
+                "[qspi] chip {}: erase {:#04x} @ {:#010x} len={}",
+                self.idx, instruction, base, len
             );
         }
     }
-    /// Page program `self.wr_buf` at `self.ar`. Requires WEL; consumes it.
-    /// NOR semantics: programming only clears bits.
-    fn do_program(&mut self) {
-        let buf = std::mem::take(&mut self.wr_buf);
+    /// Page program `buf` at `ar`. Requires WEL; consumes it. NOR semantics:
+    /// programming only clears bits.
+    fn program(&mut self, ar: u32, buf: &[u8]) {
         if !self.wel {
             if crate::dbg::eth() {
-                eprintln!("[qspi] program without WEL, ignored");
+                eprintln!(
+                    "[qspi] chip {}: program without WEL, ignored",
+                    self.idx
+                );
             }
-            self.tcf = true;
             return;
         }
         self.wel = false;
-        let base = self.ar as usize & (QSPI_SIZE - 1);
+        let base = ar as usize & (QSPI_SIZE - 1);
         for (i, b) in buf.iter().enumerate() {
             self.mem[(base + i) & (QSPI_SIZE - 1)] &= *b;
         }
@@ -2502,10 +2486,118 @@ impl Qspi {
         if first < buf.len() {
             self.write_through(0, buf.len() - first);
         }
-        self.tcf = true;
         if crate::dbg::eth() {
-            eprintln!("[qspi] program @ {:#010x} len={}", base, buf.len());
+            eprintln!(
+                "[qspi] chip {}: program @ {:#010x} len={}",
+                self.idx,
+                base,
+                buf.len()
+            );
         }
+    }
+}
+
+/// The QSPI controller and the two host-flash chips behind it. Every command
+/// goes to the chip `dev` selects, so hf's Flash0/Flash1 are distinct arrays.
+/// A chip 1 with no file starts as a copy of chip 0's persisted image (a fresh
+/// board holds the same host image in both slots) and gets its own file on
+/// first write.
+pub struct Qspi {
+    dlr: u32,        // transfer length register (holds len-1)
+    ar: u32,         // address register (last AR write)
+    resp: Vec<u8>,   // pending read response
+    resp_pos: usize, // bytes drained from `resp`
+    mode_read: bool, // current transfer is an indirect read
+    tcf: bool,       // transfer-complete latch
+    cr: u32,         // control register (stored, for EN bit etc.)
+    dcr: u32,        // device config (stored)
+    xfer: QspiXfer,  // multi-register transfer in progress
+    wr_buf: Vec<u8>, // page-program data collected so far
+    chips: [NorChip; 2],
+    dev: HfDevSel,
+}
+impl Qspi {
+    pub fn new(dev: HfDevSel) -> Self {
+        // Persist next to the SP flash NVM file, one array per chip.
+        let nvm = crate::config::instance_file(
+            "SP_EMU_FLASH",
+            crate::config::get().flash_path(),
+        );
+        let base = crate::flash::instance_base(&nvm);
+        let p0 = base.join("qspi-flash.bin").display().to_string();
+        let p1 = base.join("qspi-flash-1.bin").display().to_string();
+        Self::with_backing([Some(p0), Some(p1)], dev)
+    }
+    /// Build the model, loading persisted arrays from `paths` where they exist.
+    fn with_backing(paths: [Option<String>; 2], dev: HfDevSel) -> Self {
+        let [p0, p1] = paths;
+        let (c0, loaded0) = NorChip::load(0, p0);
+        let (mut c1, loaded1) = NorChip::load(1, p1);
+        if loaded0 && !loaded1 {
+            c1.mem.copy_from_slice(&c0.mem);
+            eprintln!("[qspi] chip 1: no persisted image; seeded from chip 0");
+        }
+        Qspi {
+            dlr: 0,
+            ar: 0,
+            resp: Vec::new(),
+            resp_pos: 0,
+            mode_read: false,
+            tcf: false,
+            cr: 0,
+            dcr: 0,
+            xfer: QspiXfer::Idle,
+            wr_buf: Vec::new(),
+            chips: [c0, c1],
+            dev,
+        }
+    }
+    fn chip(&self) -> &NorChip {
+        &self.chips[(self.dev.get() & 1) as usize]
+    }
+    fn chip_mut(&mut self) -> &mut NorChip {
+        &mut self.chips[(self.dev.get() & 1) as usize]
+    }
+    /// Response for a non-addressed read command (RDID, RDSR, unique id).
+    fn build_response(&self, instruction: u8, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        match instruction {
+            0x9F => {
+                // ReadId (RDID): Micron MT25Q, 32 MiB (log2 capacity = 0x19)
+                let id = [0x20u8, 0xBA, 0x19];
+                for (i, b) in id.iter().enumerate() {
+                    if i < len {
+                        v[i] = *b;
+                    }
+                }
+            }
+            0x05 => {
+                // ReadStatusReg: WIP (bit 0) always clear, WEL (bit 1) live.
+                if self.chip().wel {
+                    v[0] = 0x02;
+                }
+            }
+            // Unknown non-addressed reads (e.g. Winbond unique id): 0xFF fill.
+            _ => {
+                for b in v.iter_mut() {
+                    *b = 0xFF;
+                }
+            }
+        }
+        v
+    }
+    /// Sector (or bulk) erase at `self.ar` on the selected chip.
+    fn do_erase(&mut self, instruction: u8) {
+        let ar = self.ar;
+        self.chip_mut().erase(instruction, ar);
+        self.tcf = true;
+    }
+    /// Page program `self.wr_buf` at `self.ar` on the selected chip.
+    fn do_program(&mut self) {
+        let buf = std::mem::take(&mut self.wr_buf);
+        let ar = self.ar;
+        self.chip_mut().program(ar, &buf);
+        self.tcf = true;
     }
 }
 impl Mmio for Qspi {
@@ -2589,13 +2681,13 @@ impl Mmio for Qspi {
                     match instruction {
                         0x06 => {
                             // WREN
-                            self.wel = true;
+                            self.chip_mut().wel = true;
                             self.xfer = QspiXfer::Idle;
                             self.tcf = true;
                         }
                         0x04 => {
                             // WRDI
-                            self.wel = false;
+                            self.chip_mut().wel = false;
                             self.xfer = QspiXfer::Idle;
                             self.tcf = true;
                         }
@@ -2632,7 +2724,7 @@ impl Mmio for Qspi {
                 self.ar = val;
                 match self.xfer {
                     QspiXfer::ReadAtAddr { len } => {
-                        self.resp = self.read_mem(val, len);
+                        self.resp = self.chip().read_mem(val, len);
                         self.resp_pos = 0;
                         self.xfer = QspiXfer::Idle;
                     }
@@ -2912,9 +3004,13 @@ mod tests {
         assert_ne!(q.read(0x08) & (1 << 1), 0, "TCF after {instr:#04x}");
     }
 
+    fn qspi_ram(dev: &HfDevSel) -> Qspi {
+        Qspi::with_backing([None, None], dev.clone())
+    }
+
     #[test]
     fn qspi_write_enable_latch_reads_back_in_rdsr() {
-        let mut q = Qspi::with_backing(None);
+        let mut q = qspi_ram(&Rc::new(Cell::new(0)));
         // auxflash's set_and_check_write_enable: WREN then RDSR, bit 1 must
         // set, else WriteEnableFailed (MGS "code 17"). WIP (bit 0) clear.
         assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
@@ -2929,7 +3025,7 @@ mod tests {
 
     #[test]
     fn qspi_erase_program_readback() {
-        let mut q = Qspi::with_backing(None);
+        let mut q = qspi_ram(&Rc::new(Cell::new(0)));
         let base = 0x0002_0000u32; // slot-interior, sector-aligned
         let data = [0xDE, 0xAD, 0xBE, 0xEF];
 
@@ -2967,15 +3063,108 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let base = 0x0001_0000u32;
+        let dev: HfDevSel = Rc::new(Cell::new(0));
         {
-            let mut q = Qspi::with_backing(Some(path.clone()));
+            let mut q =
+                Qspi::with_backing([Some(path.clone()), None], dev.clone());
             qspi_cmd(&mut q, 0x06, None, &[]);
             qspi_cmd(&mut q, 0x12, Some(base), &[0x5A, 0xA5]);
         }
         // A fresh instance (a new sp-emu run) sees the programmed bytes.
-        let mut q = Qspi::with_backing(Some(path.clone()));
+        let mut q = Qspi::with_backing([Some(path.clone()), None], dev.clone());
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x5A, 0xA5]);
+        // Chip 1 had no image of its own, so it starts as a copy of chip 0.
+        dev.set(1);
         assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x5A, 0xA5]);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn qspi_chip0_reads_unaffected_by_interleaved_chip1_writes() {
+        // hf's step_hash reads chip 0 a block at a time, selecting it per
+        // block and restoring the previous selection; between blocks CPA's
+        // page_program_dev programs chip 1. A slot 0 hash computed across a
+        // slot 1 write must equal the idle one.
+        let dev: HfDevSel = Rc::new(Cell::new(0));
+        let mut q = qspi_ram(&dev);
+        let base = 0x0001_0000u32;
+        let n = 8usize;
+        // Chip 0 holds a known pattern; chip 1 starts erased.
+        for i in 0..n {
+            qspi_cmd(&mut q, 0x06, None, &[]);
+            let a = base + (i as u32) * 4;
+            qspi_cmd(
+                &mut q,
+                0x12,
+                Some(a),
+                &[i as u8, 0xA0 | i as u8, 0x55, 0xAA],
+            );
+        }
+        let idle: Vec<Vec<u8>> = (0..n)
+            .map(|i| qspi_read(&mut q, 0x13, Some(base + (i as u32) * 4), 4))
+            .collect();
+        // The write context holds Flash1, so each hash step flips 1 -> 0 -> 1.
+        dev.set(1);
+        let mut hashed = Vec::new();
+        for i in 0..n {
+            let prev = dev.get();
+            dev.set(0);
+            hashed.push(qspi_read(
+                &mut q,
+                0x13,
+                Some(base + (i as u32) * 4),
+                4,
+            ));
+            dev.set(prev);
+            // page_program_dev(Flash1) at the same address.
+            qspi_cmd(&mut q, 0x06, None, &[]);
+            qspi_cmd(&mut q, 0x12, Some(base + (i as u32) * 4), &[0x00; 4]);
+        }
+        assert_eq!(hashed, idle, "chip 0 reads changed under chip 1 writes");
+        // Chip 1 took all the writes.
+        for i in 0..n {
+            assert_eq!(
+                qspi_read(&mut q, 0x13, Some(base + (i as u32) * 4), 4),
+                vec![0u8; 4]
+            );
+        }
+        dev.set(0);
+        for (i, want) in idle.iter().enumerate() {
+            assert_eq!(
+                &qspi_read(&mut q, 0x13, Some(base + (i as u32) * 4), 4),
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn qspi_dev_select_addresses_two_chips() {
+        // Each HfDevSelect must reach its own array with its own WEL, or
+        // writing the inactive host phase 1 slot rewrites the active one.
+        let dev: HfDevSel = Rc::new(Cell::new(0));
+        let mut q = qspi_ram(&dev);
+        let base = 0x0010_0000u32;
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0x12, Some(base), &[0x11, 0x22]);
+        // Flash1: erased, its own WEL clear, same part id.
+        dev.set(1);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0xFF; 2]);
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
+        assert_eq!(qspi_read(&mut q, 0x9F, None, 3), vec![0x20, 0xBA, 0x19]);
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0x12, Some(base), &[0x33, 0x44]);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x33, 0x44]);
+        // WEN armed on chip 1 does not leak to chip 0.
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        dev.set(0);
+        assert_eq!(qspi_read(&mut q, 0x05, None, 1)[0], 0x00);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x11, 0x22]);
+        // A bulk erase of chip 0 leaves chip 1 intact.
+        qspi_cmd(&mut q, 0x06, None, &[]);
+        qspi_cmd(&mut q, 0xC7, None, &[]);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0xFF; 2]);
+        dev.set(1);
+        assert_eq!(qspi_read(&mut q, 0x13, Some(base), 2), vec![0x33, 0x44]);
     }
 
     // ---- VSC7448 MIIM bridge + VSC8504 PHY model -----------------------------
@@ -3063,7 +3252,7 @@ mod tests {
 
     #[test]
     fn spi2_host_power_follows_the_sequencer() {
-        let mut s = Spi2::new(Rc::new(Cell::new(1)));
+        let mut s = Spi2::new(Rc::new(Cell::new(1)), Rc::new(Cell::new(0)));
         assert_eq!(seq_read(&mut s, SEQ_PWR_CTRL, 1), [0], "A2 resting");
         assert_eq!(seq_read(&mut s, SEQ_A1SMSTATUS, 1), [0]);
         assert_eq!(seq_read(&mut s, SEQ_A0SMSTATUS, 1), [0]);
@@ -3094,7 +3283,7 @@ mod tests {
 
     #[test]
     fn spi2_reset_drops_the_host() {
-        let mut s = Spi2::new(Rc::new(Cell::new(1)));
+        let mut s = Spi2::new(Rc::new(Cell::new(1)), Rc::new(Cell::new(0)));
         seq_write(&mut s, 0, SEQ_PWR_CTRL, 0x03);
         seq_poll(&mut s, SEQ_A0SMSTATUS, A0SM_DONE);
         assert!(s.host_on);
