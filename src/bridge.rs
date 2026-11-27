@@ -160,6 +160,19 @@ struct BoundSock {
     sp_port: u16, // SP UDP port this socket relays (11111 mgmt | 57005 ereport)
 }
 
+/// A frame queued for the SP.
+struct Queued {
+    /// MGS client UDP source port; 0 = bridge-generated control frame.
+    flow: u16,
+    /// The VLAN, for a request to control_plane_agent (delivered one at a time).
+    mgmt_vid: Option<u16>,
+    frame: Vec<u8>,
+}
+
+/// How long a delivered control_plane_agent request holds back the next one
+/// when the SP never replies to it.
+const MGMT_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub struct Bridge {
     serial: StdoutHost,
     /// One socket per switch view (base_port+0 -> vid 0x301, base_port+1 -> 0x302).
@@ -174,11 +187,13 @@ pub struct Bridge {
     sp_by_vid: std::collections::HashMap<u16, ([u8; 6], [u8; 16])>,
     /// Last MGS host endpoint heard per VLAN (where that view's SP replies go).
     peer_by_vid: std::collections::HashMap<(u16, u16), SocketAddr>,
-    /// Frames queued for the SP, each tagged with its MGS-client flow key (the
-    /// client's UDP source port; 0 = bridge-generated control frame). The tag
-    /// drives flow-fair eviction in `push_rx` so the rare request flows survive
-    /// the sensor-poll flood.
-    rx: VecDeque<(u16, Vec<u8>)>,
+    /// Frames queued for the SP. The flow key drives flow-fair eviction in
+    /// `push_rx`
+    rx: VecDeque<Queued>,
+    /// The control_plane_agent request the SP has not yet answered: (vid,
+    /// client port, delivered at). The next one waits for its reply. net hands
+    /// control_plane_agent packets in fixed VLAN order
+    in_flight: Option<(u16, u16, std::time::Instant)>,
     /// RX-path drop diagnostics (SP_EMU_RXSTATS): frames received from the host
     /// sockets, evicted by the flow-fair cap, delivered to the SP, and SP->MGS
     /// replies the host socket failed to send.
@@ -351,6 +366,7 @@ impl Bridge {
             sp_by_vid: std::collections::HashMap::new(),
             peer_by_vid: std::collections::HashMap::new(),
             rx: VecDeque::new(),
+            in_flight: None,
             n_recv: 0,
             n_evict: 0,
             n_pop: 0,
@@ -421,14 +437,14 @@ impl Bridge {
                 // Unsolicited NA pre-warms this VLAN's neighbor cache so the SP's
                 // first reply isn't dropped pending NDP resolution.
                 let na = self.build_neighbor_advert(vid, src_mac, &src_ip);
-                self.push_rx(0, na);
+                self.push_rx(0, None, na);
                 if crate::config::get().pingtest() {
                     eprintln!(
                         "[bridge] PINGTEST: echo-request -> SP vid {:#x}",
                         vid
                     );
                     let ping = self.build_echo_request(vid, src_mac, &src_ip);
-                    self.push_rx(0, ping);
+                    self.push_rx(0, None, ping);
                 }
             }
         }
@@ -473,13 +489,13 @@ impl Bridge {
                         eprintln!("[bridge] NS for me on vid {:#x} -> NA", vid);
                     }
                     let na = self.build_neighbor_advert(vid, sp_mac, src_ip);
-                    self.push_rx(0, na);
+                    self.push_rx(0, None, na);
                 }
             }
             ICMP6_ECHO_REQUEST => {
                 // Answer pings to the bridge (RX-path sanity check).
                 let reply = self.build_echo_reply(vid, sp_mac, src_ip, p);
-                self.push_rx(0, reply);
+                self.push_rx(0, None, reply);
             }
             _ => {} // Router Solicit / MLD / NA / Echo Reply: absorb.
         }
@@ -490,6 +506,12 @@ impl Bridge {
             return;
         }
         let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+        let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+        if src_port == SP_PORT
+            && self.in_flight.is_some_and(|(v, p, _)| v == vid && p == dst_port)
+        {
+            self.in_flight = None;
+        }
         // Relay only the SP sockets this bridge actually bound on this VLAN; drop
         // broadcast/echo chatter from unbridged sockets. In the default mode that
         // is exactly {mgmt 11111, ereport 57005}; in well-known-port mode it is
@@ -505,7 +527,6 @@ impl Bridge {
         // flood runs; routing to a single last-seen peer per VLAN would starve
         // all but the busiest client. The MGS IP comes from the learned peer
         // (all clients share the in-zone loopback) + this port.
-        let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
         let peer_ip = match self.peer_by_vid.get(&(vid, src_port)) {
             Some(p) => p.ip(),
             None => return,
@@ -611,7 +632,8 @@ impl Bridge {
             // (src.port()) so the SP echoes it back as the reply's dest port.
             let frame =
                 self.build_udp6(vid, sp_mac, sp_ip, sp_port, src.port(), &data);
-            self.push_rx(src.port(), frame);
+            let mgmt_vid = (sp_port == SP_PORT).then_some(vid);
+            self.push_rx(src.port(), mgmt_vid, frame);
         }
     }
 
@@ -620,19 +642,19 @@ impl Bridge {
     /// the emulated SP (~1000x slower than silicon) can drain its 4-entry RX
     /// ring, so the backlog must be bounded or reply latency climbs without
     /// limit and never recovers.
-    fn push_rx(&mut self, flow: u16, frame: Vec<u8>) {
+    fn push_rx(&mut self, flow: u16, mgmt_vid: Option<u16>, frame: Vec<u8>) {
         // Flow != 0 is a real MGS client request (flow 0 = bridge control: NA/echo).
         // Stamp its arrival so the SP's reply can report the round-trip latency.
         if flow != 0 && crate::config::get().rttstats() {
             self.last_req_at = Some(std::time::Instant::now());
         }
         const RX_BACKLOG_CAP: usize = 32;
-        self.rx.push_back((flow, frame));
+        self.rx.push_back(Queued { flow, mgmt_vid, frame });
         while self.rx.len() > RX_BACKLOG_CAP {
             let mut counts: std::collections::HashMap<u16, usize> =
                 std::collections::HashMap::new();
-            for (f, _) in &self.rx {
-                *counts.entry(*f).or_insert(0) += 1;
+            for q in &self.rx {
+                *counts.entry(q.flow).or_insert(0) += 1;
             }
             // Busiest non-control flow; fall back to the global oldest only if the
             // queue is somehow all control frames.
@@ -642,7 +664,7 @@ impl Bridge {
                 .max_by_key(|(_, c)| **c)
                 .map(|(f, _)| *f);
             match victim
-                .and_then(|vf| self.rx.iter().position(|(f, _)| *f == vf))
+                .and_then(|vf| self.rx.iter().position(|q| q.flow == vf))
             {
                 Some(pos) => {
                     self.rx.remove(pos);
@@ -840,14 +862,25 @@ impl HostIo for Bridge {
     fn eth_rx(&mut self) -> Option<Vec<u8>> {
         // Control frames (NA/echo, flow 0) are connectivity-critical, serve
         // them first (oldest-first).
-        if let Some(pos) = self.rx.iter().position(|(f, _)| *f == 0) {
+        if let Some(pos) = self.rx.iter().position(|q| q.flow == 0) {
             self.n_pop += 1;
-            return self.rx.remove(pos).map(|(_, frame)| frame);
+            return self.rx.remove(pos).map(|q| q.frame);
         }
-        if !self.rx.is_empty() {
-            self.n_pop += 1;
+        if self
+            .in_flight
+            .is_some_and(|(_, _, t)| t.elapsed() >= MGMT_REPLY_WAIT)
+        {
+            self.in_flight = None;
         }
-        self.rx.pop_front().map(|(_, frame)| frame)
+        let held = self.in_flight.is_some();
+        let pos =
+            self.rx.iter().position(|q| !(held && q.mgmt_vid.is_some()))?;
+        let q = self.rx.remove(pos)?;
+        self.n_pop += 1;
+        if let Some(vid) = q.mgmt_vid {
+            self.in_flight = Some((vid, q.flow, std::time::Instant::now()));
+        }
+        Some(q.frame)
     }
 }
 
@@ -884,4 +917,58 @@ fn checksum6(src: &[u8; 16], dst: &[u8; 16], next: u8, data: &[u8]) -> u16 {
     let ck = !(sum as u16);
     // UDP sends a zero checksum as 0xFFFF (0 = "no checksum"); ICMPv6 keeps zero.
     if ck == 0 && next == IPPROTO_UDP { 0xFFFF } else { ck }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::HostIo;
+
+    /// A UDP header from the SP's `src` port to client port `dst`.
+    fn sp_udp(src: u16, dst: u16) -> Vec<u8> {
+        let mut u = vec![0u8; 8];
+        u[0..2].copy_from_slice(&src.to_be_bytes());
+        u[2..4].copy_from_slice(&dst.to_be_bytes());
+        u
+    }
+
+    /// control_plane_agent requests reach the SP one at a time, in arrival
+    /// order across VLANs
+    #[test]
+    fn mgmt_requests_wait_for_the_reply() {
+        let mut b = Bridge::from_socks(Vec::new());
+        b.push_rx(1000, Some(0x301), vec![1]);
+        b.push_rx(1000, Some(0x301), vec![2]);
+        b.push_rx(2000, Some(0x302), vec![3]);
+        b.push_rx(3000, None, vec![4]); // ereport
+        b.push_rx(0, None, vec![5]); // control
+
+        assert_eq!(b.eth_rx(), Some(vec![5]), "control first");
+        assert_eq!(b.eth_rx(), Some(vec![1]));
+        assert_eq!(b.eth_rx(), Some(vec![4]), "ereport not held");
+        assert_eq!(b.eth_rx(), None, "held until the SP replies");
+
+        b.handle_udp_tx(0x302, &sp_udp(SP_PORT, 1000));
+        assert_eq!(b.eth_rx(), None, "reply on another VLAN");
+        b.handle_udp_tx(0x301, &sp_udp(57005, 1000));
+        assert_eq!(b.eth_rx(), None, "reply from another socket");
+
+        b.handle_udp_tx(0x301, &sp_udp(SP_PORT, 1000));
+        assert_eq!(b.eth_rx(), Some(vec![2]));
+        b.handle_udp_tx(0x301, &sp_udp(SP_PORT, 1000));
+        assert_eq!(b.eth_rx(), Some(vec![3]));
+        assert_eq!(b.eth_rx(), None);
+    }
+
+    #[test]
+    fn unanswered_mgmt_request_times_out() {
+        let mut b = Bridge::from_socks(Vec::new());
+        b.push_rx(1000, Some(0x301), vec![1]);
+        b.push_rx(2000, Some(0x302), vec![2]);
+        assert_eq!(b.eth_rx(), Some(vec![1]));
+        assert_eq!(b.eth_rx(), None);
+        let (vid, port, at) = b.in_flight.unwrap();
+        b.in_flight = Some((vid, port, at - MGMT_REPLY_WAIT));
+        assert_eq!(b.eth_rx(), Some(vec![2]));
+    }
 }
