@@ -86,6 +86,9 @@ pub fn template() -> String {
     line!("eth_quantum = {}", d.eth_quantum());
     line!("eth_txbreak = {}", d.eth_txbreak());
     line!("idle_ms = {}", d.idle_ms());
+    line!(
+        "# wall_tick = 400000  # wall-clock SP tick, min instructions between ticks"
+    );
 
     line!("\n# Host UART / IPCC.");
     line!("[host]");
@@ -235,6 +238,7 @@ fn config_to_external(c: &Config) -> ConfigFileV1 {
             eth_quantum: Some(c.eth_quantum),
             eth_txbreak: Some(c.eth_txbreak),
             idle_ms: Some(c.idle_ms),
+            wall_tick: c.wall_tick,
         },
         host: v1::Host {
             uart: c.host_uart.clone(),

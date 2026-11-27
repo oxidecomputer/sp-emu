@@ -44,6 +44,34 @@ pub enum Mode {
     Handler,
 }
 
+/// Paces SysTick by the wall clock instead of the instruction count: a tick
+/// fires once a real millisecond is owed and `min_instrs` instructions have run
+/// since the last one.
+pub struct WallTick {
+    min_instrs: u32,
+    start: std::time::Instant,
+    delivered: u64,
+}
+
+impl WallTick {
+    /// Ticks a stalled core may be owed
+    const MAX_OWED: u64 = 50;
+    /// Instructions between clock reads once the floor is met and no tick is due.
+    const RECHECK: u32 = 256;
+
+    pub fn new(min_instrs: u32) -> Self {
+        WallTick { min_instrs, start: std::time::Instant::now(), delivered: 0 }
+    }
+
+    fn owed(&mut self) -> u64 {
+        let ms = self.start.elapsed().as_millis() as u64;
+        if ms.saturating_sub(self.delivered) > Self::MAX_OWED {
+            self.delivered = ms - Self::MAX_OWED;
+        }
+        ms.saturating_sub(self.delivered)
+    }
+}
+
 pub struct Cpu {
     pub r: [u32; 16], // r0..r12, r13=active SP, r14=LR, r15 unused (pc is separate)
     pub pc: u32,
@@ -84,6 +112,9 @@ pub struct Cpu {
     // pace the RoT's endoscope halt-poll by the SP's progress: without it the RoT's
     // active polling advances its own clock and races past the poll deadline.
     pub tick_frozen: bool,
+    /// Wall-clock tick pacing (`net.wall_tick`). None: one tick per SYST_RVR
+    /// instructions.
+    pub wall_tick: Option<WallTick>,
     pub record_disasm: bool, // populate last_disasm per-instruction (only when tracing/diff is on)
     pub halted: bool, // external debug halt (DHCSR C_HALT via the SWD debug port)
     pub debug_en: bool, // DHCSR.C_DEBUGEN set: a BKPT halts into debug state (else it faults)
@@ -235,6 +266,7 @@ impl Cpu {
             tick_events: 0,
             sp_tick_credit: 0,
             tick_frozen: false,
+            wall_tick: None,
             record_disasm: false,
             halted: false,
             debug_en: false,
@@ -684,6 +716,15 @@ impl Cpu {
                         // idle to the run loop but leave `systick` alone, so no tick
                         // fires; the clock only moves when credit arrives.
                         self.idle_skip = 1;
+                    } else if let Some(w) = self.wall_tick.as_mut() {
+                        // Wall-clock pacing: take a tick that is due now, without
+                        // sleeping, so an idle core catches up; otherwise sleep
+                        // the host and look again at the next WFI.
+                        if w.owed() > 0 {
+                            self.systick = 1;
+                        } else {
+                            self.idle_skip = 1;
+                        }
                     } else {
                         // No accepted request (or caught up to the RoT): the ordinary
                         // idle throttle: record the skip so the loop sleeps the host
@@ -1858,12 +1899,32 @@ impl Cpu {
             // SP's progress) instead of racing on the core's own execution.
             return;
         }
+        let reload = match &self.wall_tick {
+            Some(w) => w.min_instrs.max(1),
+            None => self.syst_rvr,
+        };
         if self.systick == 0 {
-            self.systick = self.syst_rvr;
+            self.systick = reload;
         }
         self.systick -= 1;
         if self.systick == 0 {
-            self.systick = self.syst_rvr;
+            let frozen = self.tick_frozen;
+            let masked = self.syst_csr & 2 != 0
+                && (self.mode != Mode::Thread || self.primask);
+            if let Some(w) = self.wall_tick.as_mut() {
+                if masked {
+                    // Hold the tick until the handler returns, as the
+                    // pended exception would be.
+                    self.systick = 1;
+                    return;
+                }
+                if !frozen && w.owed() == 0 {
+                    self.systick = WallTick::RECHECK;
+                    return;
+                }
+                w.delivered += 1;
+            }
+            self.systick = reload;
             // One 1ms tick elapsed. Count it whether or not the exception is
             // delivered below (a masked/handler-mode tick still marks elapsed time):
             // the serve loop diffs the RoT's `tick_events` to pace the SP's SysTick
@@ -2894,6 +2955,84 @@ mod tests {
         }
         assert_eq!(cpu.tick_events, 2);
         assert_eq!(cpu.mode, Mode::Handler, "no exception was taken");
+    }
+
+    /// With wall-clock pacing a tick needs both the instruction floor and a
+    /// millisecond owed
+    #[test]
+    fn wall_tick_fires_only_when_owed() {
+        let ms = std::time::Duration::from_millis;
+        let mut bus = ram_bus();
+        let mut cpu = Cpu::new();
+        cpu.cycles = 1; // skip maybe_tick's periodic CSR/RVR refresh
+        cpu.syst_csr = 0b01; // ENABLE, no exception
+        let mut w = WallTick::new(4);
+        w.start -= ms(2);
+        cpu.wall_tick = Some(w);
+
+        for _ in 0..3 {
+            cpu.maybe_tick(&mut bus);
+        }
+        assert_eq!(cpu.tick_events, 0, "below the instruction floor");
+        cpu.maybe_tick(&mut bus);
+        assert_eq!(cpu.tick_events, 1);
+
+        // Nothing owed: the floor alone does not fire a tick.
+        cpu.wall_tick.as_mut().unwrap().delivered = 1_000_000;
+        for _ in 0..10_000 {
+            cpu.maybe_tick(&mut bus);
+        }
+        assert_eq!(cpu.tick_events, 1);
+
+        cpu.tick_frozen = true;
+        cpu.systick = 1; // armed by the WFI credit drain
+        cpu.maybe_tick(&mut bus);
+        assert_eq!(cpu.tick_events, 2, "credit tick");
+
+        // A tick due in a handler is held until thread mode, not dropped.
+        cpu.syst_csr = 0b11;
+        cpu.mode = Mode::Handler;
+        cpu.systick = 1;
+        for _ in 0..10 {
+            cpu.maybe_tick(&mut bus);
+        }
+        assert_eq!(cpu.tick_events, 2);
+        cpu.mode = Mode::Thread;
+        cpu.syst_csr = 0b01; // no exception entry: the test bus has no vectors
+        cpu.maybe_tick(&mut bus);
+        assert_eq!(cpu.tick_events, 3);
+    }
+
+    #[test]
+    fn wall_tick_caps_what_a_stalled_core_is_owed() {
+        let mut w = WallTick::new(4);
+        w.start -= std::time::Duration::from_secs(10);
+        assert_eq!(w.owed(), WallTick::MAX_OWED);
+    }
+
+    /// An idle WFI under wall-clock pacing arms a tick that is due without
+    /// asking the loop to sleep
+    #[test]
+    fn wfi_takes_owed_wall_ticks_without_sleeping() {
+        let mut bus = ram_bus();
+        bus.write16(RAM, WFI);
+        let mut host = StdoutHost;
+        let mut cpu = Cpu::new();
+        cpu.wfi_throttle = true;
+        let mut w = WallTick::new(4);
+        w.start -= std::time::Duration::from_millis(2);
+        cpu.wall_tick = Some(w);
+
+        cpu.pc = RAM;
+        cpu.systick = 100;
+        cpu.step(&mut bus, &mut host).unwrap();
+        assert_eq!((cpu.systick, cpu.idle_skip), (1, 0));
+
+        cpu.wall_tick.as_mut().unwrap().delivered = 1_000_000;
+        cpu.pc = RAM;
+        cpu.systick = 100;
+        cpu.step(&mut bus, &mut host).unwrap();
+        assert_eq!((cpu.systick, cpu.idle_skip), (100, 1));
     }
 
     /// When the SP is credited with RoT-elapsed ticks (a coupled sprot wait), an idle
