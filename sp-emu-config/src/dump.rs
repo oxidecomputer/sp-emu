@@ -87,7 +87,7 @@ pub fn template() -> String {
     line!("eth_txbreak = {}", d.eth_txbreak());
     line!("idle_ms = {}", d.idle_ms());
     line!(
-        "# wall_tick = 25000   # wall-clock SP tick, min instructions between ticks"
+        "# wall_tick = 400000  # wall-clock SP tick, min instructions between ticks"
     );
 
     line!("\n# Host UART / IPCC.");

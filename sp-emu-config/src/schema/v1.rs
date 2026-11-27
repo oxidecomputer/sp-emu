@@ -97,7 +97,9 @@ pub struct Net {
     /// WFI idle-throttle period, milliseconds.
     pub idle_ms: Option<u64>,
     /// Pace the SP's SysTick by the wall clock, with at least this many
-    /// instructions between ticks. Unset: one tick per SYST_RVR instructions.
+    /// instructions between ticks. Below the firmware's own count (400000 on
+    /// gimlet) a task that works every tick starves the rest. Unset: one tick
+    /// per SYST_RVR instructions.
     pub wall_tick: Option<u32>,
 }
 
