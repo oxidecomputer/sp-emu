@@ -457,6 +457,12 @@ impl Bus {
         if off == DMACTXDTPR && !self.rec {
             self.eth_tx_walk();
         }
+        // A new RX descriptor list starts at its first descriptor. Without
+        // this, after an SP reset frames land past the descriptor the driver
+        // is waiting on and sit unseen until later frames wrap the ring.
+        if off == DMACRXDLAR {
+            self.eth.rx_next = 0;
+        }
     }
 
     /// Walk the TX descriptor ring from `tx_next`, emitting every descriptor the
@@ -1136,6 +1142,33 @@ impl Bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reprogramming the RX descriptor list (the driver's init after an SP
+    /// reset) restarts delivery at the first descriptor.
+    #[test]
+    fn rx_ring_restarts_with_a_new_descriptor_list() {
+        const RING: u32 = 0x2000_0000;
+        const OWN: u32 = 1 << 31;
+        let mut bus = Bus::new();
+        bus.log_unmapped = false;
+        bus.add_ram(RING, 0x1000);
+        let init = |bus: &mut Bus| {
+            bus.write32(ETH_BASE + DMACRXRLR, 3);
+            bus.write32(ETH_BASE + DMACRXDLAR, RING);
+            for i in 0..4 {
+                bus.write32(RING + i * 16, RING + 0x200 + i * 0x100);
+                bus.write32(RING + i * 16 + 12, OWN);
+            }
+        };
+        init(&mut bus);
+        assert!(bus.eth_rx_inject(&[0; 60]));
+        assert_eq!(bus.read32(RING + 12) & OWN, 0, "descriptor 0 filled");
+
+        init(&mut bus);
+        assert!(bus.eth_rx_inject(&[0; 60]));
+        assert_eq!(bus.read32(RING + 12) & OWN, 0, "descriptor 0 again");
+        assert_eq!(bus.read32(RING + 16 + 12) & OWN, OWN, "not descriptor 1");
+    }
 
     #[test]
     fn secure_alias_fold() {
